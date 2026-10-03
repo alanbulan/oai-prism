@@ -542,3 +542,48 @@ func TestBridgeInputItems_And_FoldInputHistory_MultiTurnToolExecution(t *testing
 	}
 }
 
+func TestExtractIncrementalInput(t *testing.T) {
+	// Case 1: 首轮单消息
+	turn1 := []prism.InputItem{
+		prism.NewSystemItem("sys"),
+		prism.NewUserItem("u1"),
+	}
+	inc1 := extractIncrementalInput(turn1)
+	if len(inc1) != 2 || inc1[1].Content[0].Text != "u1" {
+		t.Fatalf("Case 1 预期原样返回, got: %v", inc1)
+	}
+
+	// Case 2: 工具结果回传
+	turn2 := []prism.InputItem{
+		prism.NewSystemItem("sys"),
+		prism.NewUserItem("u1"),
+		prism.NewAssistantItem("tool-call"),
+		prism.NewUserItem("[CLIENT RESULT] ok"),
+	}
+	inc2 := extractIncrementalInput(turn2)
+	if len(inc2) != 2 {
+		t.Fatalf("Case 2 预期 2 项(sys + toolResult), got len: %d", len(inc2))
+	}
+	if inc2[0].Role != "system" || inc2[1].Content[0].Text != "[CLIENT RESULT] ok" {
+		t.Fatalf("Case 2 内容不匹配: %v", inc2)
+	}
+
+	// Case 3: 第二轮追问
+	turn3 := []prism.InputItem{
+		prism.NewSystemItem("sys"),
+		prism.NewUserItem("u1"),
+		prism.NewAssistantItem("tool-call"),
+		prism.NewUserItem("[CLIENT RESULT] ok"),
+		prism.NewAssistantItem("文件已生成"),
+		prism.NewUserItem("你知道我刚才让你干什么了吗？"),
+	}
+	inc3 := extractIncrementalInput(turn3)
+	if len(inc3) != 2 {
+		t.Fatalf("Case 3 预期 2 项(sys + u2), got len: %d", len(inc3))
+	}
+	if inc3[0].Role != "system" || inc3[1].Content[0].Text != "你知道我刚才让你干什么了吗？" {
+		t.Fatalf("Case 3 内容不匹配: %v", inc3)
+	}
+}
+
+

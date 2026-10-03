@@ -106,24 +106,13 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 提取稳定会话标识（必须在 foldInputHistory 之前计算，避免折叠历史导致哈希漂移！）
+	// 提取稳定会话标识（必须在消息加工之前计算，避免折叠或裁剪历史导致哈希漂移！）
 	stickyKey := responsesConversationKey(r, rawFields, input)
-
-	// 历史折叠：上游只认「首条 system + 最后一条消息」，中间条目全被
-	// 丢弃（见 foldInputHistory 注释）。Codex 每轮回传完整 input，
-	// 不折叠就是跨轮失忆 —— 这是 chat 工作台有记忆而 Codex 没有的
-	// 原因（chat 走 translateChatMessages 自带折叠）。
-	input = foldInputHistory(input)
-	if len(input) == 0 {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "input 不能为空")
-		return
-	}
 
 	runReq := &RunRequest{
 		Model:        model,
 		Effort:       effort,
 		UserID:       req.User,
-		Input:        input,
 		Metadata:     mergeMetadata(clientMetadata(rawFields), metadataWith("tools", toolsMetadata(req.Tools))),
 		StickyKey:    stickyKey,
 		AccountID:    accountID,
@@ -131,15 +120,14 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		API:          "responses",
 		ExtraHeaders: extractSentinelToken(r),
 	}
-	// 继承客户端显式传入的延续字段（若客户端显式指定则透传，但绝不从网关内部 sessionChain 隐式合成 previousResponseId）
-	runReq.PreviousResponseID = req.PreviousResponseID
-	runReq.ConversationID = conversationIDFrom(r, rawFields)
 
-	// 会话状态持久化继承：从 sessionChain 恢复上轮项目句柄、会话句柄与沙箱快照
-	chainProj, chainConv, _, _, chainSnap := sessionChainGet(stickyKey)
+	// 会话状态持久化继承：从 sessionChain 恢复上轮项目句柄、会话句柄、上轮真实 ResponseID 与沙箱快照
+	chainProj, chainConv, chainPrevResp, _, chainSnap := sessionChainGet(stickyKey)
+	h.log.Info("会话粘性判定", "stickyKey", stickyKey, "hasClientHistory", hasClientHistory, "chainProj", chainProj, "chainPrevResp", chainPrevResp)
 	if runReq.ProjectID == "" && chainProj != "" {
 		runReq.ProjectID = chainProj
 	}
+	runReq.ConversationID = conversationIDFrom(r, rawFields)
 	if runReq.ConversationID == "" && chainConv != "" {
 		runReq.ConversationID = chainConv
 	}
@@ -148,6 +136,14 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if runReq.ConversationID == "" {
 		runReq.ConversationID = "cdx1_" + uuid.NewString()
 	}
+
+	// 关键：继承上一轮的真实响应句柄（PreviousResponseID）
+	// 客户端显式指定时透传；未指定时从网关 sessionChain 继承上游下发的终态 resp_* 句柄。
+	runReq.PreviousResponseID = req.PreviousResponseID
+	if runReq.PreviousResponseID == "" && chainPrevResp != "" {
+		runReq.PreviousResponseID = chainPrevResp
+	}
+
 	if len(chainSnap) > 0 {
 		if runReq.Metadata == nil {
 			runReq.Metadata = make(map[string]any, 2)
@@ -155,14 +151,31 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		runReq.Metadata["codex_listen_snapshot"] = string(chainSnap)
 	}
 
-	// 历史注入：仅当客户端本身没有携带往轮历史（单条消息客户端）时，
-	// 才拼入链缓存的历史（上游不代管对话历史，见 session_chain.go 头注释）。
-	// Codex CLI / 标准 Responses 客户端会回传完整 input，命中 hasClientHistory 天然跳过。
-	if !hasClientHistory {
+	// 报文结构与历史保障：
+	// Codex CLI 每轮都会回传全量历史。上游后端发给大模型的 Context 取自首条 System，
+	// 因此无论是否存在 PreviousResponseID，均通过 foldInputHistory 将往轮问答折叠注入首条 System，
+	// 同时将上一轮的 PreviousResponseID 与 codex_listen_snapshot 完整带给上游，
+	// 实现「沙箱状态树接续 + Prompt 上下文历史」双重保障，彻底根治多轮失忆！
+	if hasClientHistory {
+		runReq.Input = foldInputHistory(input)
+	} else {
+		runReq.Input = input
 		if hist := sessionChainHistory(runReq.StickyKey); len(hist) > 0 {
 			runReq.Input = injectChainHistory(runReq.Input, hist)
-			runReq.PreviousResponseID = ""
 		}
+	}
+
+	for idx, it := range runReq.Input {
+		var preview string
+		if len(it.Content) > 0 {
+			preview = truncateRunes(it.Content[0].Text, 60)
+		}
+		h.log.Info("准备发送给上游的 InputItem", "index", idx, "role", it.Role, "preview", preview)
+	}
+
+	if len(runReq.Input) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "input 不能为空")
+		return
 	}
 	runReq.Extra = passthroughFields(rawFields, responsesKnownFields)
 
@@ -332,33 +345,8 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		if js0, ok := extractExecBlock(text); ok {
 			js = ensureExecJS(js0)
 		}
-		if js == "" && allowNudge {
-			// 模型没用桥格式（大概率在云端沙箱里执行后口头汇报）。
-			// 自动纠正一轮：明确告诉它"你的动作没到用户机器上"，
-			// 要求重新以 codex-exec 块输出。只重试一次，避免循环。
-			//
-			// 只在历史里还没有任何执行结果时纠错（首轮）：任务已经跑起来
-			// 之后模型输出纯文本是正常的收尾/追问，再指控它"什么都没执行"
-			// 会把它带偏，转而去要求用户重发原始内容。
-			retry := *runReq
-			retry.Input = append(append([]prism.InputItem{}, runReq.Input...),
-				prism.NewUserItem(bridgeRetryNudge(text)))
-			var sb2 strings.Builder
-			emit2 := func(d Delta) error {
-				sb2.WriteString(d.Text)
-				return nil
-			}
-			res2, runErr2 := h.runner.Run(r.Context(), &retry, emit2)
-			bindLogAccount(r, res2)
-			if runErr2 == nil && res2 != nil {
-				if js2, ok2 := extractExecBlock(sb2.String()); ok2 {
-					js = ensureExecJS(js2)
-					text = sb2.String()
-				} else if strings.TrimSpace(sb2.String()) != "" {
-					text = sb2.String()
-				}
-			}
-		}
+		h.log.Info("模型首轮生成文本完成", "text", truncateRunes(text, 100), "hasJS", js != "")
+
 
 		if js != "" {
 			callID := newID("ctc_")

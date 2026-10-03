@@ -400,6 +400,16 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	)
 	// 沙箱冷启动时上游会回 504 文案并提示 "Please submit prompt again"，
 	// 这是上游自己建议的处理方式 —— 照做即可，不要当成协议错误。
+	var snapLen int
+	if s, ok := meta["codex_listen_snapshot"].(string); ok {
+		snapLen = len(s)
+	}
+	r.log.Info("发给上游的请求参数",
+		"convID", req.ConversationID,
+		"prevRespID", req.PreviousResponseID,
+		"itemsCount", len(inputItems),
+		"snapshotLen", snapLen,
+	)
 	for attempt := 1; attempt <= sandboxStartRetries; attempt++ {
 		startResp, err = r.client.StartResponse(ctx, p, &prism.StartRequest{
 			Input:              inputItems,
@@ -477,7 +487,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		var tsMap map[string]any
 		if err := json.Unmarshal(turnState, &tsMap); err == nil {
 			if promptStr, ok := tsMap["prompt"].(string); ok && promptStr != "" {
-				r.log.Debug("上游组装 Prompt", "bytes", len(promptStr), "head", truncateRunes(promptStr, 80))
+				r.log.Info("上游组装 Prompt", "bytes", len(promptStr), "head", truncateRunes(promptStr, 500))
 			}
 		}
 	}

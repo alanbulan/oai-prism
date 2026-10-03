@@ -237,6 +237,44 @@ func foldInputHistory(items []prism.InputItem) []prism.InputItem {
 	return items
 }
 
+// extractIncrementalInput 从全量 input 中提取增量条目。
+// 当存在 previousResponseId 时，上游服务端会话已包含先前轮次全部上下文，
+// 只需要发送首条 system 规则指令与本轮自上次回复以来的增量消息，
+// 绝不重复堆砌 System 历史文本，对齐官方真实请求结构。
+func extractIncrementalInput(items []prism.InputItem) []prism.InputItem {
+	if len(items) <= 2 {
+		return items
+	}
+	var sysItem *prism.InputItem
+	if len(items) > 0 && strings.EqualFold(items[0].Role, "system") {
+		sysItem = &items[0]
+	}
+
+	lastAssistantIdx := -1
+	for i := len(items) - 1; i >= 0; i-- {
+		if strings.EqualFold(items[i].Role, "assistant") {
+			lastAssistantIdx = i
+			break
+		}
+	}
+
+	if lastAssistantIdx == -1 {
+		return items
+	}
+
+	incremental := items[lastAssistantIdx+1:]
+	if len(incremental) == 0 {
+		return items
+	}
+
+	out := make([]prism.InputItem, 0, len(incremental)+1)
+	if sysItem != nil {
+		out = append(out, *sysItem)
+	}
+	out = append(out, incremental...)
+	return out
+}
+
 // osDirective 从客户端 User-Agent 推断操作系统，生成一段写进桥
 // system 的**硬性事实声明**。
 //
@@ -352,7 +390,7 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 	// 预先提取并合并所有来自客户端的 developer/system 消息指令
 	var devSystem strings.Builder
 	for _, b := range blocks {
-		if b.Type == "message" {
+		if b.Type == "message" || (b.Type == "" && b.Role != "") {
 			role := strings.ToLower(strings.TrimSpace(b.Role))
 			if role == "developer" || role == "system" {
 				txt := contentText(b.Content)
@@ -377,10 +415,17 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 	}
 	// 关键：发给上游的 input 数组里有且仅有唯一一条位于 items[0] 的 System 消息，
 	// 避免上游后端在提取 Context 时因多条 System 覆盖而丢弃桥指令与多轮历史！
+	if rem := strings.TrimSpace(bridgeTailReminder()); rem != "" {
+		head = head + "\n\n" + rem
+	}
 	items = append(items, prism.NewSystemItem(head))
 
 	for _, b := range blocks {
-		switch b.Type {
+		typ := b.Type
+		if typ == "" && b.Role != "" {
+			typ = "message"
+		}
+		switch typ {
 		case "message":
 			role := strings.ToLower(strings.TrimSpace(b.Role))
 			if role == "developer" || role == "system" {
@@ -463,11 +508,6 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 			// additional_tools / reasoning / 其它非消息条目：跳过。
 		}
 	}
-	// 收尾强化指令。LLM 对序列末尾的指令服从度最高 ——
-	// 桥指令只放在开头会被 CLI 传入的 Codex 人设（4 条 developer
-	// 消息，要求"使用 exec 工具"）压过去：实测模型无视开头的桥指令，
-	// 直接在云端沙箱里执行并口头汇报"已创建"。末尾重申一次。
-	items = append(items, prism.NewSystemItem(bridgeTailReminder()))
 	return items
 }
 
