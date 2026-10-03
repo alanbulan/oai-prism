@@ -434,11 +434,16 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		r.log.Info("沙箱未就绪，稍后重试",
 			"attempt", attempt, "of", sandboxStartRetries, "reason", sandboxReason(startResp))
 		// 关键保护：仅在主请求且确实持有沙箱容器时才执行失效，绝不让伴生轻量请求误杀主会话的沙箱缓存！
+		// 注意：冷启动 504（"submit prompt again" 或 "gateway timeout"）时容器正在预热，
+		// 绝不能销毁容器重新申请，否则会导致每轮重试都创建新容器并反复冷启动！
+		// 仅在明确断连（sandbox_reconnecting）或在同一容器上连续重试 5 次以上才失效全局容器。
+		reasonText := strings.ToLower(sandboxReason(startResp))
 		if !req.IsAux && sb.Usable() && projectID != "" {
-			if strings.EqualFold(sandboxReason(startResp), "sandbox_reconnecting") || attempt >= 2 {
+			if strings.Contains(reasonText, "reconnecting") || attempt >= 5 {
 				r.sandboxes.Invalidate(acct.ID)
 				sb = nil // 必须置空本地指针，触发下方重新申请与装配崭新沙箱容器
 			} else {
+				// 普通冷启动或工作区未对齐，保留沙箱容器实例，仅重置项目工作区对齐标记
 				r.sandboxes.InvalidateProject(acct.ID, projectID)
 			}
 		}
@@ -913,17 +918,39 @@ func (r *Runner) syncSandboxWorkspace(ctx context.Context, acct *account.Account
 		return false
 	}
 
-	// 3) 取 Y-Sweet 协作文档凭证
-	ytk, err := r.client.AcquireYSweetToken(ctx, p, projectID)
-	if err != nil {
-		r.log.Warn("取 Y-Sweet 凭证失败", "account", acct.ID, "err", err)
-		r.app.SandboxOps.Inc("sync", "ysweet_error")
-		return false
+	// 3)+4) 取与交付 Y-Sweet 协作文档凭证（带风控 403 自动重试自愈）
+	var ytk *prism.YSweetToken
+	var ysweetErr error
+	var err error
+	for attempt := 1; attempt <= 5; attempt++ {
+		if attempt > 1 {
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(time.Duration(attempt-1) * 2000 * time.Millisecond):
+			}
+			r.log.Info("重试 Y-Sweet 凭证签发/交付", "account", acct.ID, "project", projectID, "attempt", attempt)
+		}
+		ytk, err = r.client.AcquireYSweetToken(ctx, p, projectID)
+		if err != nil {
+			ysweetErr = err
+			if isSentinelThrottle(err) {
+				continue
+			}
+			break
+		}
+		if err = r.client.DeliverYSweetToken(ctx, p, sb, ytk); err != nil {
+			ysweetErr = err
+			if isSentinelThrottle(err) {
+				continue
+			}
+			break
+		}
+		ysweetErr = nil
+		break
 	}
-
-	// 4) 原样交给沙箱 —— 之后由沙箱自行同步文档
-	if err := r.client.DeliverYSweetToken(ctx, p, sb, ytk); err != nil {
-		r.log.Warn("交付 Y-Sweet 凭证失败", "account", acct.ID, "err", err)
+	if ysweetErr != nil {
+		r.log.Warn("交付 Y-Sweet 凭证失败", "account", acct.ID, "err", ysweetErr)
 		r.app.SandboxOps.Inc("sync", "ysweet_deliver_error")
 		return false
 	}
@@ -986,6 +1013,9 @@ func isSandboxNotReady(resp *prism.StartResponse) bool {
 func sandboxReason(resp *prism.StartResponse) string {
 	if resp == nil || resp.Initial == nil {
 		return ""
+	}
+	if resp.Initial.ErrorReason != "" && resp.Initial.Error != "" {
+		return fmt.Sprintf("%s (%s)", resp.Initial.ErrorReason, resp.Initial.Error)
 	}
 	if resp.Initial.ErrorReason != "" {
 		return resp.Initial.ErrorReason
