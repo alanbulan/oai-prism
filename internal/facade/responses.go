@@ -5,16 +5,32 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/oai-prism/oaiprism/internal/creds"
 	"github.com/oai-prism/oaiprism/internal/middleware"
 	"github.com/oai-prism/oaiprism/internal/prism"
 	"github.com/oai-prism/oaiprism/internal/sse"
 )
+
+// responsesTurn 是一次 Responses 请求在 handler 内部流转的上下文。
+type responsesTurn struct {
+	id          string
+	created     int64
+	publicModel string
+
+	// chainKey 是会话链的记录键：强会话键直接用；弱键（首条消息指纹等）
+	// 改用"每条回复链一条"的内部键，避免撞键串话。
+	chainKey string
+
+	stream       bool
+	bridge       bool
+	execToolName string
+	execKind     string
+	isAux        bool
+}
 
 // handleResponses 实现 POST /v1/responses（OpenAI 新一代 Responses API）。
 //
@@ -49,64 +65,60 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	// （顶层 tools 为 null）。检测到它就切换到桥模式 —— 上游当大脑，
 	// 本地 CLI 当手脚，见 toolbridge.go 顶部注释。
 	bridge := BridgeEnabled(rawFields)
-	// 桥判定诊断：CLI 有两条工具声明路径（use_responses_lite 决定）——
-	// true 走 input 里的 additional_tools 条目（我们认得），
-	// false 走顶层 tools 字段（旧判据认不出，桥会静默失效，
-	// 表现为模型在上游沙箱里干活、用户本地拿不到文件）。
-	// 这行日志用于抓真实请求形状，排查后可按需降级为 Debug。
 	toolsStr := string(rawFields["tools"])
-	execToolName := ExecToolName(rawFields)
-	execKind := ExecToolKind(rawFields)
-	// 临时诊断：只要带 tools 就 dump（分析 CLI 实际注册的工具名）。
-	if len(toolsStr) > 200 {
-		_ = os.WriteFile(filepath.Join(os.TempDir(), "oaiprism_tools_dump.json"), []byte(toolsStr), 0o600)
+	hasTools := toolsStr != "" && toolsStr != "null" && toolsStr != "[]"
+	turn := &responsesTurn{
+		id:           newID("resp_"),
+		created:      time.Now().Unix(),
+		publicModel:  req.Model,
+		stream:       req.Stream,
+		bridge:       bridge,
+		execToolName: ExecToolName(rawFields),
+		execKind:     ExecToolKind(rawFields),
 	}
-	h.log.Info("桥判定",
+	// 桥判定诊断：CLI 有两条工具声明路径（use_responses_lite 决定）——
+	// true 走 input 里的 additional_tools 条目，false 走顶层 tools 字段。
+	h.log.Debug("桥判定",
 		"bridge", bridge,
-		"path", func() string {
-			if strings.Contains(string(rawFields["input"]), `"additional_tools"`) {
-				return "A/additional_tools"
-			}
-			if strings.Contains(string(rawFields["input"]), `"custom_tool_call"`) {
-				return "A/custom_tool_call"
-			}
-			if toolsStr != "" && toolsStr != "null" && toolsStr != "[]" {
-				return "B/tools_field"
-			}
-			return "none"
-		}(),
 		"tools_bytes", len(toolsStr),
 		"input_bytes", len(rawFields["input"]),
-		"exec_tool_name", execToolName,
+		"exec_tool_name", turn.execToolName,
 	)
+
+	// Codex 的任务标题请求：网关就地生成，不打上游（见 generateLocalTitle）。
+	if !bridge && !hasTools && len(rawFields["input"]) < 3000 &&
+		strings.Contains(string(rawFields["input"]), "Generate a concise, single-line task title") {
+		h.writeLocalTitle(w, req, rawFields, turn)
+		return
+	}
+
 	input := messagesFromResponsesInput(req.Input, "")
 	if bridge {
 		// UA 推断的 OS 事实声明随桥指令一起进首条 system（见 osDirective）。
 		input = bridgeInputItems(req.Input, osDirective(r.UserAgent()))
+	} else if req.Instructions != "" {
+		// instructions 就是 Responses API 的 system，保持 system 角色。
+		input = append([]prism.InputItem{prism.NewSystemItem(req.Instructions)}, input...)
+	} else if h.cfg.Facade.DefaultSystemPrompt != "" {
+		input = append([]prism.InputItem{prism.NewSystemItem(h.cfg.Facade.DefaultSystemPrompt)}, input...)
 	}
-	if !bridge {
-		if req.Instructions != "" {
-			// instructions 就是 Responses API 的 system，保持 system 角色。
-			input = append([]prism.InputItem{prism.NewSystemItem(req.Instructions)}, input...)
-		} else if h.cfg.Facade.DefaultSystemPrompt != "" {
-			input = append([]prism.InputItem{prism.NewSystemItem(h.cfg.Facade.DefaultSystemPrompt)}, input...)
-		}
+	if len(input) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "input 不能为空")
+		return
 	}
-	// 历史注入判据：必须在 foldInputHistory 之前检查客户端是否已经携带了多轮历史。
-	// foldInputHistory 会把中间的 assistant 和工具调用折叠进首条 system，
-	// 若在此之后检查，input 里的 assistant 条目已经被移出，会导致 hasAssistant 恒为 false，
-	// 进而误把 Codex 等完整多轮客户端当成"单条消息客户端"二次注入 sessionChain。
+	// 客户端是否自带多轮历史（必须在折叠之前判断，折叠后 assistant 条目已被并入 system）。
 	hasClientHistory := false
 	for _, it := range input {
-		r := strings.ToLower(strings.TrimSpace(it.Role))
-		if r == "assistant" || r == "tool" || r == "function" {
+		role := strings.ToLower(strings.TrimSpace(it.Role))
+		if role == "assistant" || role == "tool" || role == "function" {
 			hasClientHistory = true
 			break
 		}
 	}
 
-	// 提取稳定会话标识（必须在消息加工之前计算，避免折叠或裁剪历史导致哈希漂移！）
+	// 稳定会话标识（必须在消息加工之前计算，避免折叠或裁剪历史导致哈希漂移）。
 	stickyKey := responsesConversationKey(r, rawFields, input)
+	turn.isAux = isCodexAuxRequest(r, rawFields, bridge, hasTools)
 
 	runReq := &RunRequest{
 		Model:        model,
@@ -118,136 +130,226 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		ProjectID:    projectID,
 		API:          "responses",
 		ExtraHeaders: extractSentinelToken(r),
+		IsAux:        turn.isAux,
 	}
+	runReq.Extra = passthroughFields(rawFields, responsesKnownFields)
 
-	// 会话状态持久化继承：从 sessionChain 恢复上轮项目句柄、会话句柄、上轮真实 ResponseID 与沙箱快照
 	convIDFromReq := conversationIDFrom(r, rawFields)
-	chainProj, chainConv, chainPrevResp, _, chainSnap := sessionChainLookup(stickyKey, req.PreviousResponseID, convIDFromReq)
-	h.log.Info("会话粘性判定", "stickyKey", stickyKey, "hasClientHistory", hasClientHistory, "chainProj", chainProj, "chainPrevResp", chainPrevResp, "chainConv", chainConv)
-	if runReq.ProjectID == "" && chainProj != "" {
-		runReq.ProjectID = chainProj
-	}
-	runReq.ConversationID = convIDFromReq
-	if runReq.ConversationID == "" && chainConv != "" {
-		runReq.ConversationID = chainConv
-	}
-
-	// 关键：继承上一轮的真实响应句柄（PreviousResponseID）
-	// 客户端显式指定时透传；未指定时从网关 sessionChain 继承上游下发的终态 resp_* 句柄。
-	runReq.PreviousResponseID = req.PreviousResponseID
-	if runReq.PreviousResponseID == "" && chainPrevResp != "" {
-		runReq.PreviousResponseID = chainPrevResp
-	}
-
-	if len(chainSnap) > 0 {
-		if runReq.Metadata == nil {
-			runReq.Metadata = make(map[string]any, 2)
-		}
-		runReq.Metadata["codex_listen_snapshot"] = string(chainSnap)
-	}
-
-	// 提前将当前会话与会话 ID 和项目 ID 锁定关联，防止伴生并发请求（如标题生成）走漂
-	sessionChainBind(stickyKey, runReq.ConversationID, runReq.ProjectID)
-
-	// 多轮会话状态树承接与增量续传机制：
-	// 上游服务端自身具备完备的状态树与对话记录表（由 conversationId 与 previousResponseId 唯一确定）。
-	// 在客户端未主动发起上下文压缩（在压缩之前）的常规多轮中：
-	// 只要当前会话已持有上一轮响应句柄（PreviousResponseID != ""），
-	// 绝不可将往轮数十 KB 的全量日志拼成超大 System Prompt 发送！
-	// 必须仅发送首条纯净 System 指令与本轮自上次回复以来的增量消息（Incremental Input），
-	// 请求体永远保持在数 KB，彻底根除 16K/超大请求限制报错，同时实现远程项目/会话无缝承接。
-	if runReq.PreviousResponseID != "" {
-		runReq.Input = extractIncrementalInput(input)
-		h.log.Info("会话承接：启用增量续传模式",
-			"stickyKey", stickyKey,
-			"previousResponseId", runReq.PreviousResponseID,
-			"totalItems", len(input),
-			"incrementalItems", len(runReq.Input),
-			"projectID", runReq.ProjectID,
-			"conversationID", runReq.ConversationID,
-		)
-	} else if hasClientHistory {
-		// 首轮或断链重置时，才折叠历史作为初始上下文
-		runReq.Input = foldInputHistory(input)
-	} else {
+	if turn.isAux {
+		// 伴生请求：不继承、不记录会话链，在专用伴生项目里跑（见 Runner.resolveProject）。
+		runReq.ConversationID = convIDFromReq
 		runReq.Input = input
-		if hist := sessionChainHistory(runReq.StickyKey); len(hist) > 0 {
-			runReq.Input = injectChainHistory(runReq.Input, hist)
-		}
+		h.dispatchResponses(w, r, runReq, turn)
+		return
 	}
 
+	// 会话链：强会话键按键继承；任何请求都可凭客户端显式带回的
+	// previous_response_id / conversation_id 命中（按调用方隔离）。
+	// 弱键（首条消息指纹 / user 字段）绝不按键继承 —— 两段以同一句话开头的
+	// 对话会撞到同一个弱键，继承就是串话。
+	tenant := middleware.Tenant(r.Context())
+	strongKey := isStrongSessionKey(stickyKey)
+	lookupKey := ""
+	if strongKey {
+		lookupKey = stickyKey
+	}
+	hit, found := sessionChainFind(tenant, lookupKey, req.PreviousResponseID, convIDFromReq)
+	switch {
+	case strongKey:
+		turn.chainKey = stickyKey
+	case found:
+		turn.chainKey = hit.Key
+	default:
+		turn.chainKey = scopeKey(r, "r:"+turn.id)
+	}
+	h.log.Debug("会话粘性判定", "stickyKey", stickyKey, "chainKey", turn.chainKey,
+		"hasClientHistory", hasClientHistory, "chainProj", hit.ProjectID, "chainPrevResp", hit.ResponseID)
+
+	if runReq.ProjectID == "" && hit.ProjectID != "" {
+		runReq.ProjectID = hit.ProjectID
+		runReq.MarkProjectFromChain()
+	}
+	// 续接句柄：客户端显式带的照传（若是我们发出的本地 ID，换成上游真实 ID）；
+	// 会话链里的只在 upstream_continuation 开启时附带。
+	runReq.ConversationID = convIDFromReq
+	runReq.PreviousResponseID = req.PreviousResponseID
+	if found && req.PreviousResponseID != "" && hit.ResponseID != "" {
+		runReq.PreviousResponseID = hit.ResponseID
+	}
+	if h.cfg.Facade.UpstreamContinuation {
+		if runReq.ConversationID == "" {
+			runReq.ConversationID = hit.ConversationID
+		}
+		if runReq.PreviousResponseID == "" {
+			runReq.PreviousResponseID = hit.ResponseID
+		}
+		if len(hit.Snapshot) > 0 {
+			if runReq.Metadata == nil {
+				runReq.Metadata = make(map[string]any, 2)
+			}
+			runReq.Metadata["codex_listen_snapshot"] = string(hit.Snapshot)
+		}
+	}
+	if found && hit.AccountID != "" {
+		// 项目与续接句柄是账号私有的：租到别的账号时 Runner 会整体作废它们。
+		runReq.BoundAccountID = hit.AccountID
+	}
+	sessionChainBind(turn.chainKey, runReq.ConversationID, runReq.ProjectID)
+
+	// 上下文：每轮都发完整上下文。
+	//
+	// 2026-10-03 实测：只发"本轮增量 + previousResponseId"时第二轮必然失忆
+	// （上游不会替我们按句柄拼历史）。客户端自带历史的折叠进首条 system；
+	// 只发本轮消息的客户端，用本地会话链累积的历史注入。
+	switch {
+	case hasClientHistory:
+		runReq.Input = foldInputHistory(input)
+	default:
+		runReq.Input = input
+		if hist := sessionChainHistory(turn.chainKey); len(hist) > 0 {
+			runReq.Input = injectChainHistory(input, hist)
+		}
+	}
 	for idx, it := range runReq.Input {
 		var preview string
 		if len(it.Content) > 0 {
 			preview = truncateRunes(it.Content[0].Text, 60)
 		}
-		h.log.Info("准备发送给上游的 InputItem", "index", idx, "role", it.Role, "preview", preview)
+		h.log.Debug("准备发送给上游的 InputItem", "index", idx, "role", it.Role, "preview", preview)
 	}
 
-	if len(runReq.Input) == 0 {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "input 不能为空")
+	h.dispatchResponses(w, r, runReq, turn)
+}
+
+// dispatchResponses 按 stream 字段分派。
+func (h *Handler) dispatchResponses(w http.ResponseWriter, r *http.Request, runReq *RunRequest, turn *responsesTurn) {
+	if turn.stream {
+		h.streamResponses(w, r, runReq, turn)
 		return
 	}
-	runReq.Extra = passthroughFields(rawFields, responsesKnownFields)
+	h.syncResponses(w, r, runReq, turn)
+}
 
-	isAux := !bridge && len(rawFields["input"]) < 3000 && (toolsStr == "" || toolsStr == "null" || toolsStr == "[]")
-	runReq.IsAux = isAux
-	if isAux {
-		// 客户端标题生成：Codex CLI 会发起带有特定 prompt 的单行标题请求。
-		// 严禁向上游发起真实的重量级推理与创建独立项目！
-		// 否则会导致上游单账号并发冲突（Error while processing conversation (403 Forbidden)）、
-		// 浪费沙箱资源，且延迟长达数分钟。
-		// 这里直接由网关从任务上下文中就地提取并极速回包，0ms 响应，彻底杜绝并发踩踏！
-		if strings.Contains(string(rawFields["input"]), "Generate a concise, single-line task title") {
-			titleJSON := generateLocalTitle(rawFields["input"])
-			h.log.Info("客户端任务标题已本地秒级生成", "title", titleJSON)
+// isCodexAuxRequest 判断是否为 Codex 的伴生轻量请求（摘要、标题之类）。
+//
+// 只认带 Codex 特征的请求：早期判据只看"无工具 + 输入小于 3000 字节"，
+// 普通 SDK 的每一个短请求都会被当成伴生请求，跑进别人的项目、也不记录会话。
+func isCodexAuxRequest(r *http.Request, raw map[string]json.RawMessage, bridge, hasTools bool) bool {
+	if bridge || hasTools || len(raw["input"]) >= 3000 {
+		return false
+	}
+	ua := strings.ToLower(r.UserAgent())
+	if strings.Contains(ua, "codex") {
+		return true
+	}
+	_, hasCM := raw["client_metadata"]
+	return hasCM
+}
 
-			id := newID("resp_")
-			created := time.Now().Unix()
-			if req.Stream {
-				setConversationHeader(w, runReq.ConversationID)
-				sw, err := sse.New(w)
-				if err != nil {
-					writeError(w, http.StatusInternalServerError, "server_error", err.Error())
-					return
-				}
-				defer sw.Close()
-				buf := make([]byte, 0, 1024)
-				buf = AppendResponsesEvent(buf[:0], ResponsesEvent{Type: "response.created", ResponseID: id, Model: req.Model, CreatedAt: created})
-				_ = sw.WriteRaw(buf)
-				_ = emitTextResponseEvents(sw, &buf, id, req.Model, created, newID("msg_"), titleJSON, nil)
-				return
-			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"id": id, "object": "response", "created_at": created, "status": "completed", "model": req.Model,
-				"output": []any{
-					map[string]any{
-						"type": "message", "id": newID("msg_"), "role": "assistant", "status": "completed",
-						"content": []any{map[string]any{"type": "output_text", "text": titleJSON}},
-					},
-				},
-			})
+// writeLocalTitle 本地生成 Codex 任务标题并按请求形态（流式/同步）回包。
+//
+// 严禁为标题向上游发起真实推理与创建独立项目：会与主请求在同一账号上并发，
+// 触发 "Error while processing conversation (403 Forbidden)"，且延迟长达数分钟。
+func (h *Handler) writeLocalTitle(w http.ResponseWriter, req *ResponsesRequest, raw map[string]json.RawMessage, turn *responsesTurn) {
+	titleJSON := generateLocalTitle(raw["input"])
+	h.log.Info("客户端任务标题已本地生成", "title", titleJSON)
+	if req.Stream {
+		sw, err := sse.New(w)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "server_error", err.Error())
 			return
 		}
-
-		// 其它伴生轻量请求：优先复用活跃项目，绝不新建独立项目，亦不污染会话链
-		if runReq.ProjectID == "" {
-			if chainProj, _, _, _, _ := sessionChainGet(stickyKey); chainProj != "" {
-				runReq.ProjectID = chainProj
-			} else if actProj, ok := h.runner.ActiveProject(accountID); ok {
-				runReq.ProjectID = actProj
-			}
-		}
-	}
-
-	id := newID("resp_")
-	created := time.Now().Unix()
-
-	if req.Stream {
-		h.streamResponses(w, r, runReq, id, created, req.Model, bridge, execToolName, execKind)
+		defer sw.Close()
+		buf := make([]byte, 0, 1024)
+		buf = AppendResponsesEvent(buf[:0], ResponsesEvent{Type: "response.created", ResponseID: turn.id, Model: req.Model, CreatedAt: turn.created})
+		_ = sw.WriteRaw(buf)
+		_ = emitTextResponseEvents(sw, &buf, turn.id, req.Model, turn.created, newID("msg_"), titleJSON, nil)
 		return
 	}
-	h.syncResponses(w, r, runReq, id, created, req.Model, bridge, execToolName, execKind, isAux)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": turn.id, "object": "response", "created_at": turn.created, "status": "completed", "model": req.Model,
+		"output": []any{
+			map[string]any{
+				"type": "message", "id": newID("msg_"), "role": "assistant", "status": "completed",
+				"content": []any{map[string]any{"type": "output_text", "text": titleJSON}},
+			},
+		},
+	})
+}
+
+// isContinuationError 判断失败是否由"续接句柄失效"引起（值得丢弃句柄、用全量上下文重试）。
+//
+// 只认这一类：超时、限流、鉴权、风控、客户端断开都与句柄无关，
+// 拿它们重试只会让一个已经很慢的请求再慢一倍、白扣一次额度。
+func isContinuationError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, ErrPollTimeout) || creds.IsAuthError(err) || creds.IsRateLimited(err) || isSentinelThrottle(err) {
+		return false
+	}
+	var ae *creds.APIError
+	if errors.As(err, &ae) {
+		switch ae.Status {
+		case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusGone, http.StatusUnprocessableEntity:
+			return true
+		}
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, k := range []string{"previous", "conversation", "not found", "expired", "no longer", "snapshot", "transcript"} {
+		if strings.Contains(msg, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasContinuation 报告请求是否携带了续接句柄。
+func hasContinuation(req *RunRequest) bool {
+	if req.PreviousResponseID != "" || req.ConversationID != "" {
+		return true
+	}
+	_, ok := req.Metadata["codex_listen_snapshot"]
+	return ok
+}
+
+// runResponses 执行一轮，并在"续接句柄失效"时丢弃句柄、用完整上下文原地重试一次。
+//
+// canRetry 由调用方决定（流式路径只有在客户端还没收到任何正文时才能重试）。
+func (h *Handler) runResponses(r *http.Request, runReq *RunRequest, turn *responsesTurn, emit func(Delta) error, canRetry func() bool) (*RunResult, error) {
+	res, err := h.runner.Run(r.Context(), runReq, emit)
+	bindLogAccount(r, res)
+	if err == nil || turn.isAux || !hasContinuation(runReq) || !isContinuationError(err) {
+		return res, err
+	}
+	projectGone := strings.Contains(strings.ToLower(err.Error()), "project")
+	sessionChainResetSession(turn.chainKey, projectGone)
+	if canRetry != nil && !canRetry() {
+		return res, err
+	}
+	h.log.Warn("续接句柄失效，丢弃句柄并以完整上下文重试",
+		"err", err, "chainKey", turn.chainKey, "prevResp", runReq.PreviousResponseID, "conv", runReq.ConversationID)
+	runReq.dropContinuation()
+	if projectGone {
+		if runReq.ProjectID != "" && res != nil {
+			h.runner.ForgetProject(res.AccountID, runReq.StickyKey)
+		}
+		runReq.ProjectID = ""
+	}
+	res, err = h.runner.Run(r.Context(), runReq, emit)
+	bindLogAccount(r, res)
+	return res, err
+}
+
+// recordResponsesTurn 把成功的一轮写回会话链。
+func recordResponsesTurn(runReq *RunRequest, turn *responsesTurn, res *RunResult) {
+	if turn.isAux || res == nil {
+		return
+	}
+	sessionChainRecord(turn.chainKey, res, runReq.Model)
+	sessionChainRecordLocalID(turn.chainKey, turn.id)
+	if res.Text != "" {
+		sessionChainAppend(turn.chainKey, lastUserText(runReq.Input), res.Text)
+	}
 }
 
 var responsesKnownFields = map[string]struct{}{
@@ -265,6 +367,10 @@ var responsesKnownFields = map[string]struct{}{
 }
 
 func responsesConversationKey(r *http.Request, body map[string]json.RawMessage, items []prism.InputItem) string {
+	return scopeKey(r, responsesConversationKeyBase(r, body, items))
+}
+
+func responsesConversationKeyBase(r *http.Request, body map[string]json.RawMessage, items []prism.InputItem) string {
 	if v := strings.TrimSpace(r.Header.Get(HeaderSession)); v != "" {
 		return "h:" + v
 	}
@@ -293,10 +399,11 @@ func responsesConversationKey(r *http.Request, body map[string]json.RawMessage, 
 		}
 		conv = append(conv, ChatMessage{Role: it.Role, Content: stringContent(sb.String())})
 	}
-	return conversationKey(r, body, conv)
+	return conversationKeyBase(r, body, conv)
 }
 
-func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id string, created int64, publicModel string, bridge bool, execToolName, execKind string) {
+func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq *RunRequest, turn *responsesTurn) {
+	id, created, publicModel := turn.id, turn.created, turn.publicModel
 	// 流式头必须早于首帧，只能回显客户端带回来的会话 ID（见 streamChat 注释）。
 	setConversationHeader(w, runReq.ConversationID)
 
@@ -320,7 +427,9 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 			return
 		}
 	}
-	sessionChainRecordLocalID(runReq.StickyKey, id)
+	if !turn.isAux {
+		sessionChainRecordLocalID(turn.chainKey, id)
+	}
 
 	// 心跳：等待上游期间必须持续发事件保活。
 	//
@@ -360,71 +469,50 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		heartbeatWG.Wait()
 	}()
 
-	if bridge {
+	fail := func(runErr error) {
+		h.log.Error("responses 流式失败", "err", runErr, "chainKey", turn.chainKey)
+		middleware.RecordLogError(r, "responses 流式失败: %v", runErr)
+		buf = AppendResponsesEvent(buf[:0], ResponsesEvent{Type: "response.failed", ResponseID: id, Model: publicModel, CreatedAt: created, Text: runErr.Error()})
+		_ = sw.WriteRaw(buf)
+	}
+
+	if turn.bridge {
 		// 桥模式不能边收边发：必须先拿到完整回复才能判断它是
-		// 工具调用（```codex-exec 块）还是纯文本。缓冲后统一输出。
+		// 工具调用（```codex-exec 块）还是纯文本。缓冲后统一输出 ——
+		// 也因此续接失效时总能安全地原地重试（客户端还没收到任何正文）。
 		var sb strings.Builder
-		var usage *prism.Usage
 		emit := func(d Delta) error {
 			sb.WriteString(d.Text)
 			return nil
 		}
-		res, runErr := h.runner.Run(r.Context(), runReq, emit)
-		bindLogAccount(r, res)
-		sessionChainRecord(runReq.StickyKey, res, runReq.Model)
-		if res != nil && res.Text != "" {
-			sessionChainAppend(runReq.StickyKey, lastUserText(runReq.Input), res.Text)
-		}
-
-		if runErr != nil && !errors.Is(runErr, context.Canceled) {
-			if strings.Contains(runErr.Error(), "previousResponseId") || strings.Contains(runErr.Error(), "not found") {
-				sessionChainResetPrevious(runReq.StickyKey)
+		canRetry := func() bool { sb.Reset(); return true }
+		res, runErr := h.runResponses(r, runReq, turn, emit, canRetry)
+		if runErr != nil {
+			if !errors.Is(runErr, context.Canceled) {
+				fail(runErr)
 			}
-			middleware.RecordLogError(r, "responses 流式失败: %v", runErr)
-			buf = AppendResponsesEvent(buf[:0], ResponsesEvent{Type: "response.failed", ResponseID: id, Model: publicModel, CreatedAt: created, Text: runErr.Error()})
-			_ = sw.WriteRaw(buf)
 			return
 		}
+		recordResponsesTurn(runReq, turn, res)
+
+		var usage *prism.Usage
 		if res != nil {
 			usage = res.Usage
 		}
 		text := sb.String()
+		js := h.bridgeExecJS(r, turn, text, res)
 
-		var js string
-		if js0, ok := extractExecBlock(text); ok {
-			js = ensureExecJS(js0)
+		finalRespID := id
+		if res != nil && res.ResponseID != "" {
+			finalRespID = res.ResponseID
 		}
-		deltaCount := 0
-		if res != nil {
-			deltaCount = len(res.DeltaFiles)
-		}
-		h.log.Info("模型首轮生成文本完成", "text", truncateRunes(text, 100), "hasJS", js != "", "deltaFiles", deltaCount)
-
-		// 单轮沙箱产物无缝落地：
-		// 若模型未直接输出 codex-exec 围栏，但上游沙盒内产生了文件变更（DeltaFiles），
-		// 网关在当前轮次直接将上游 DeltaFiles 提取并合成为客户端本地 exec_command 执行命令，
-		// 确保输出产物 100% 写入用户本地电脑空间，绝不留在上游沙盒。
-		// 必须通过 sessionChainFilterNewDeltaFiles 过滤系统文件并记录哈希，防止重复合成导致无限死循环！
-		if js == "" && res != nil && len(res.DeltaFiles) > 0 {
-			newDeltaFiles := sessionChainFilterNewDeltaFiles(runReq.StickyKey, res.DeltaFiles)
-			if len(newDeltaFiles) > 0 {
-				isWin := strings.Contains(strings.ToLower(r.UserAgent()), "windows")
-				synth := SynthesizeDeltaFilesExecJS(newDeltaFiles, isWin)
-				if synth != "" {
-					js = synth
-					h.log.Info("已在当前轮次自动将上游沙盒内生成的 DeltaFiles 合成为本地执行命令", "files", len(newDeltaFiles), "isWin", isWin)
-				}
-			}
-		}
-
-
 		if js != "" {
 			callID := newID("ctc_")
 			var item string
-			if execKind == "function" {
-				item = functionCallItemJSON(callID, execToolName, toFunctionArguments(js))
+			if turn.execKind == "function" {
+				item = functionCallItemJSON(callID, turn.execToolName, toFunctionArguments(js))
 			} else {
-				item = customToolCallItemJSON(callID, js, execToolName)
+				item = customToolCallItemJSON(callID, js, turn.execToolName)
 			}
 			done := AppendResponsesEvent(buf[:0], ResponsesEvent{
 				Type: "response.output_item.added", ItemJSON: item,
@@ -432,7 +520,7 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 			if err := sw.WriteRaw(done); err != nil {
 				return
 			}
-			if execKind != "function" {
+			if turn.execKind != "function" {
 				// custom_tool_call 专用事件；function_call 没有这一段。
 				done = AppendResponsesEvent(buf[:0], ResponsesEvent{
 					Type: "response.custom_tool_call_input.done", ItemID: callID, Text: js,
@@ -447,10 +535,6 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 			if err := sw.WriteRaw(done); err != nil {
 				return
 			}
-			finalRespID := id
-			if res != nil && res.ResponseID != "" {
-				finalRespID = res.ResponseID
-			}
 			done = AppendResponsesEvent(buf[:0], ResponsesEvent{
 				Type:       "response.completed",
 				ResponseID: finalRespID, Model: publicModel, CreatedAt: created,
@@ -462,11 +546,7 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		}
 
 		// 纯文本：桥模式下一次性给出（模型已完整生成，无需伪增量）。
-		finalRespID := id
-		if res != nil && res.ResponseID != "" {
-			finalRespID = res.ResponseID
-		}
-		_ = emitTextResponseEvents(sw, &buf, finalRespID, publicModel, created, itemID, text, usage)
+		_ = emitTextResponseEvents(sw, &buf, finalRespID, publicModel, created, itemID, stripExecFence(text), usage)
 		return
 	}
 
@@ -483,43 +563,66 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		return
 	}
 
+	sentText := false
 	emit := func(d Delta) error {
 		if d.Text == "" {
 			return nil
 		}
+		sentText = true
 		buf = AppendResponsesEvent(buf[:0], ResponsesEvent{
 			Type: "response.output_text.delta", ItemID: itemID, Text: d.Text,
 		})
 		return sw.WriteRaw(buf)
 	}
-
-	res, runErr := h.runner.Run(r.Context(), runReq, emit)
-	bindLogAccount(r, res)
-	// 非桥流式路径同样要回写会话链，否则下一轮 fill 拿不到句柄。
-	sessionChainRecord(runReq.StickyKey, res, runReq.Model)
-	if res != nil && res.Text != "" {
-		sessionChainAppend(runReq.StickyKey, lastUserText(runReq.Input), res.Text)
+	// 已经吐过正文就不能重试：客户端会收到两段拼接的回答。
+	res, runErr := h.runResponses(r, runReq, turn, emit, func() bool { return !sentText })
+	if runErr != nil {
+		if !errors.Is(runErr, context.Canceled) {
+			fail(runErr)
+		}
+		return
 	}
+	recordResponsesTurn(runReq, turn, res)
+
 	text := ""
 	var usage *prism.Usage
 	if res != nil {
 		text = res.Text
 		usage = res.Usage
 	}
-
-	if runErr != nil && !errors.Is(runErr, context.Canceled) {
-		middleware.RecordLogError(r, "responses 流式失败: %v", runErr)
-		buf = AppendResponsesEvent(buf[:0], ResponsesEvent{Type: "response.failed", ResponseID: id, Model: publicModel, CreatedAt: created, Text: runErr.Error()})
-		_ = sw.WriteRaw(buf)
-		return
-	}
-
 	// 收尾事件必须逐个发全，否则 SDK 会一直等 response.completed。
 	finalRespID := id
 	if res != nil && res.ResponseID != "" {
 		finalRespID = res.ResponseID
 	}
 	_ = emitTextResponseEvents(sw, &buf, finalRespID, publicModel, created, itemID, text, usage)
+}
+
+// bridgeExecJS 从桥模式回复里取出要交给客户端执行的 JS。
+//
+// 优先用模型输出的 ```codex-exec 块；模型没输出、但上游沙箱里产生了文件变更时，
+// 把变更合成为本地落盘命令（经 sessionChainFilterNewDeltaFiles 去重，防止跨轮重复合成死循环）。
+func (h *Handler) bridgeExecJS(r *http.Request, turn *responsesTurn, text string, res *RunResult) string {
+	if js0, ok := extractExecBlock(text); ok {
+		return ensureExecJS(js0)
+	}
+	if res == nil || len(res.DeltaFiles) == 0 {
+		return ""
+	}
+	dedupKey := turn.chainKey
+	if dedupKey == "" {
+		dedupKey = scopeKey(r, "r:"+turn.id)
+	}
+	newDeltaFiles := sessionChainFilterNewDeltaFiles(dedupKey, res.DeltaFiles)
+	if len(newDeltaFiles) == 0 {
+		return ""
+	}
+	isWin := strings.Contains(strings.ToLower(r.UserAgent()), "windows")
+	js := SynthesizeDeltaFilesExecJS(newDeltaFiles, isWin)
+	if js != "" {
+		h.log.Info("已将上游沙箱内的文件变更合成为本地执行命令", "files", len(newDeltaFiles), "isWin", isWin)
+	}
+	return js
 }
 
 // emitTextResponseEvents 发文本型回复的收尾事件序列：
@@ -542,22 +645,16 @@ func emitTextResponseEvents(sw *sse.Writer, buf *[]byte, id, publicModel string,
 	return nil
 }
 
-func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id string, created int64, publicModel string, bridge bool, execToolName, execKind string, isAux bool) {
-	res, err := h.runner.Run(r.Context(), runReq, nil)
-	bindLogAccount(r, res)
-	if !isAux {
-		sessionChainRecord(runReq.StickyKey, res, runReq.Model)
-		sessionChainRecordLocalID(runReq.StickyKey, id)
-		if err == nil && res != nil && res.Text != "" {
-			sessionChainAppend(runReq.StickyKey, lastUserText(runReq.Input), res.Text)
-		}
-	}
+func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *RunRequest, turn *responsesTurn) {
+	res, err := h.runResponses(r, runReq, turn, nil, nil)
 	if err != nil {
+		h.log.Error("responses 同步失败", "err", err, "chainKey", turn.chainKey)
 		status, typ, msg := mapError(err)
 		middleware.RecordLogError(r, "responses 同步失败: %s", msg)
 		writeError(w, status, typ, msg)
 		return
 	}
+	recordResponsesTurn(runReq, turn, res)
 
 	text := ""
 	var usage *ResponsesUsage
@@ -574,54 +671,32 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 		}
 	}
 
-	finalRespID := id
+	finalRespID := turn.id
 	if res != nil && res.ResponseID != "" {
 		finalRespID = res.ResponseID
 	}
 
-	if bridge {
-		var js string
-		if js0, ok := extractExecBlock(text); ok {
-			js = ensureExecJS(js0)
-		}
-
-		// 单轮沙箱产物无缝落地：
-		// 若模型未直接输出 codex-exec 围栏，但上游沙盒内产生了文件变更（DeltaFiles），
-		// 网关在当前轮次直接将上游 DeltaFiles 提取并合成为客户端本地 exec_command 执行命令，
-		// 确保输出产物 100% 写入用户本地电脑空间，绝不留在上游沙盒。
-		// 必须通过 sessionChainFilterNewDeltaFiles 过滤系统文件并记录哈希，防止重复合成导致无限死循环！
-		if js == "" && res != nil && len(res.DeltaFiles) > 0 {
-			newDeltaFiles := sessionChainFilterNewDeltaFiles(runReq.StickyKey, res.DeltaFiles)
-			if len(newDeltaFiles) > 0 {
-				isWin := strings.Contains(strings.ToLower(r.UserAgent()), "windows")
-				synth := SynthesizeDeltaFilesExecJS(newDeltaFiles, isWin)
-				if synth != "" {
-					js = synth
-					h.log.Info("已在当前轮次自动将上游沙盒内生成的 DeltaFiles 合成为本地执行命令 (sync)", "files", len(newDeltaFiles), "isWin", isWin)
-				}
-			}
-		}
-
-		if js != "" {
+	if turn.bridge {
+		if js := h.bridgeExecJS(r, turn, text, res); js != "" {
 			callID := newID("ctc_")
 			setConversationHeader(w, conversationID)
 			var out any
-			if execKind == "function" {
+			if turn.execKind == "function" {
 				out = map[string]any{
 					"id": callID, "type": "function_call",
 					"status": "completed", "call_id": callID,
-					"name": execToolName, "arguments": toFunctionArguments(js),
+					"name": turn.execToolName, "arguments": toFunctionArguments(js),
 				}
 			} else {
 				out = map[string]any{
 					"id": callID, "type": "custom_tool_call",
 					"status": "completed", "call_id": callID,
-					"name": execToolName, "input": js,
+					"name": turn.execToolName, "input": js,
 				}
 			}
 			respMap := map[string]any{
-				"id": finalRespID, "object": "response", "created_at": created,
-				"status": "completed", "model": publicModel,
+				"id": finalRespID, "object": "response", "created_at": turn.created,
+				"status": "completed", "model": turn.publicModel,
 				"output": []any{out},
 			}
 			if usage != nil {
@@ -635,9 +710,9 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 	resp := ResponsesResponse{
 		ID:        finalRespID,
 		Object:    "response",
-		CreatedAt: created,
+		CreatedAt: turn.created,
 		Status:    "completed",
-		Model:     publicModel,
+		Model:     turn.publicModel,
 		Output: []ResponsesItem{{
 			Type:   "message",
 			ID:     newID("msg_"),
@@ -832,4 +907,3 @@ func generateLocalTitle(raw json.RawMessage) string {
 	cleaned, _ := json.Marshal(map[string]string{"title": firstLine})
 	return string(cleaned)
 }
-

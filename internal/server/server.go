@@ -40,6 +40,9 @@ type Server struct {
 	rec    *capture.Recorder
 	srv    *http.Server
 	gwPort string // 网关自身端口（OAuth 回调降级路由用）
+
+	keys   *dynamicKeys   // Dashboard 签发的 API Key（SQLite）
+	admins *adminSessions // /admin/login 签发的管理会话
 }
 
 // New 组装并返回服务器。
@@ -130,7 +133,12 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		store:  store,
 		sqlite: sqliteStore,
 		rec:    rec,
+		admins: newAdminSessions(),
 	}
+	if sqliteStore != nil {
+		s.keys = newDynamicKeys(sqliteStore)
+	}
+	s.warnInsecureDefaults()
 
 	// 5) 路由。
 	mux := http.NewServeMux()
@@ -148,7 +156,20 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		middleware.MetricsMiddleware(app),
 		// 限流在鉴权之前：拒绝无效流量越早越省资源。
 		middleware.NewRateLimiter(cfg.Facade.RateLimitPerSecond(), cfg.Facade.RateLimitBurst(), app).Middleware(),
-		middleware.APIKeyAuth(cfg.Facade.APIKeys, app, cfg.Facade.Enabled, cfg.Metrics.Health, cfg.Metrics.Ready, cfg.Metrics.Path),
+		middleware.Auth(middleware.AuthOptions{
+			StaticKeys:  cfg.Facade.APIKeys,
+			DynamicKeys: s.keys.Get,
+			AdminToken:  s.admins.Valid,
+			ExemptPaths: []string{
+				cfg.Metrics.Health, cfg.Metrics.Ready, cfg.Metrics.Path,
+				// 登录本身与 OAuth 浏览器回调（由 state 保护）不能要求已登录。
+				"/admin/login", "/admin/oauth/callback",
+			},
+			// Dashboard 只是静态资源，浏览器导航带不了 Bearer；数据接口另行鉴权。
+			ExemptPrefixes: []string{"/dashboard"},
+			CORSOrigin:     cfg.Server.CORSOrigin,
+			App:            app,
+		}),
 	)
 
 	// 网关自身端口：OAuth 导入的回调降级路由（/admin/oauth/callback）需要它
@@ -169,6 +190,53 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	}
 
 	return s, nil
+}
+
+// peekModel 从（可能被截断的）请求体前缀里取 model 字段。
+//
+// 完整 JSON 解析不了（超过窥视窗口）时退化为扫描 "model":"..."。
+func peekModel(head []byte) string {
+	var parsed struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(head, &parsed) == nil {
+		return parsed.Model
+	}
+	s := string(head)
+	i := strings.Index(s, `"model"`)
+	if i < 0 {
+		return ""
+	}
+	rest := strings.TrimLeft(s[i+len(`"model"`):], " \t\r\n:")
+	if !strings.HasPrefix(rest, `"`) {
+		return ""
+	}
+	if j := strings.IndexByte(rest[1:], '"'); j >= 0 {
+		return rest[1 : 1+j]
+	}
+	return ""
+}
+
+// warnInsecureDefaults 在启动时把危险配置喊出来。
+func (s *Server) warnInsecureDefaults() {
+	dyn := s.keys.Get()
+	if len(s.cfg.Facade.APIKeys) == 0 && len(dyn) == 0 {
+		s.log.Warn("未配置任何 API Key：仅允许本机访问（Dashboard 生成 Key 或配置 facade.api_keys 后转为全量校验）",
+			"listen", s.cfg.Server.Addr())
+	}
+	for _, k := range append(append([]string{}, s.cfg.Facade.APIKeys...), dyn...) {
+		if k == account.DefaultPublicAPIKey {
+			s.log.Warn("仍在使用源码内置的公开默认 Key（" + account.DefaultPublicAPIKey + "），任何人都能用它调用网关。" +
+				"请在 Dashboard 生成新 Key、更新客户端配置后注销它")
+			break
+		}
+	}
+	if s.cfg.RawProxy.PassthroughAuth {
+		s.log.Warn("raw_proxy.passthrough_auth 尚未实现，该配置不生效：原样反代始终使用账号池凭据")
+	}
+	if s.cfg.Facade.LocalWorkspaceWrite {
+		s.log.Warn("facade.local_workspace_write 已开启：本机请求可经 X-Local-Workspace 让网关直接写本机目录")
+	}
 }
 
 // mergeAccounts 合并配置内账号与文件账号，文件优先（同 ID 覆盖）。
@@ -341,12 +409,9 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 	// redirect_uri 若指向网关自身（http://<host>:<port>/admin/oauth/callback）
 	// 则走这个路由；指向独立本地端口时由临时监听器接（见 handleOAuthBegin）。
 	mux.HandleFunc("GET /admin/oauth/callback", func(w http.ResponseWriter, r *http.Request) {
+		// state 必须精确匹配（见 ensureOAuthCallbackListener 的说明）。
 		state := r.URL.Query().Get("state")
 		sess := oauthSessions.getByState(state)
-		if sess == nil {
-			// 兜底：网关重启清空内存会话时，认领唯一进行中的授权
-			sess = oauthSessions.solePending()
-		}
 		if sess == nil {
 			writeAdminErr(w, http.StatusBadRequest, "会话不存在或已过期")
 			return
@@ -646,8 +711,12 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 	mux.HandleFunc("POST /admin/apikeys", func(w http.ResponseWriter, r *http.Request) {
 		var item account.APIKeyItem
 		_ = json.NewDecoder(r.Body).Decode(&item)
+		item.Key = strings.TrimSpace(item.Key)
 		if item.Key == "" {
-			item.Key = fmt.Sprintf("sk-prism-%d", time.Now().UnixNano())
+			item.Key = account.NewAPIKey()
+		} else if len(item.Key) < 20 {
+			writeAdminErr(w, http.StatusBadRequest, "自定义 API Key 至少 20 个字符（留空则自动生成随机 Key）")
+			return
 		}
 		if item.Name == "" {
 			item.Name = "对外访问密钥"
@@ -660,6 +729,7 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 			writeAdminErr(w, http.StatusInternalServerError, "保存 API Key 失败: "+err.Error())
 			return
 		}
+		s.keys.Invalidate()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(item)
 	})
@@ -679,32 +749,15 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 			writeAdminErr(w, http.StatusInternalServerError, "删除 API Key 失败: "+err.Error())
 			return
 		}
+		s.keys.Invalidate()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "deleted": key})
 	})
 
-	// POST /admin/login: 管理员登录校验
-	mux.HandleFunc("POST /admin/login", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Username string `json:"username"`
-			Password string `json:"password"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		// 校验管理员账号
-		if req.Username == "admin" && (req.Password == "admin123" || req.Password == "admin" || req.Password == "") {
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status":   "ok",
-				"username": "admin",
-				"role":     "superadmin",
-				"token":    "tok_prism_admin_session",
-			})
-			return
-		}
-		writeAdminErr(w, http.StatusUnauthorized, "账号或密码错误 (默认 admin / admin123)")
-	})
+	// POST /admin/login: 管理员登录（密码来自配置，见 handleAdminLogin）
+	mux.HandleFunc("POST /admin/login", s.handleAdminLogin)
 
-	// GET /admin/me: 获取当前管理员信息
+	// GET /admin/me: 能走到这里说明已通过管理端鉴权（见 middleware.Auth）
 	mux.HandleFunc("GET /admin/me", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -811,15 +864,16 @@ func (s *Server) requestAuditMiddleware(next http.Handler) http.Handler {
 		r = r.WithContext(context.WithValue(r.Context(), middleware.CtxKeyLogError{}, logErrBox))
 
 		if r.Body != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) {
-			bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			// 只窥视前 1MB 取 model 字段，然后把窥视过的部分与剩余部分拼回去。
+			// 早期直接用这 1MB 替换了整个请求体：超过 1MB 的推理请求（Codex 长会话、
+			// 带图片的请求）被截断，handler 一律报"请求体不是合法 JSON"。
+			head, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 			if err == nil {
-				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-				var parsed map[string]any
-				if json.Unmarshal(bodyBytes, &parsed) == nil {
-					if m, ok := parsed["model"].(string); ok {
-						model = m
-					}
-				}
+				r.Body = struct {
+					io.Reader
+					io.Closer
+				}{io.MultiReader(bytes.NewReader(head), r.Body), r.Body}
+				model = peekModel(head)
 			}
 		}
 
@@ -827,17 +881,10 @@ func (s *Server) requestAuditMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(sw, r)
 
 		duration := time.Since(start).Milliseconds()
-		accountID := r.Header.Get("X-Oaiprism-Account")
+		// 实际路由到的账号由 facade 记进审计上下文；不读请求头 —— 那是客户端可控输入。
+		accountID := middleware.LogAccount(r.Context())
 		if hModel := r.Header.Get("X-Oaiprism-Model"); hModel != "" {
 			model = hModel
-		}
-
-		clientIP := r.Header.Get("X-Forwarded-For")
-		if clientIP == "" {
-			clientIP = r.Header.Get("X-Real-IP")
-		}
-		if clientIP == "" {
-			clientIP = r.RemoteAddr
 		}
 
 		item := account.RequestLogItem{
@@ -849,7 +896,7 @@ func (s *Server) requestAuditMiddleware(next http.Handler) http.Handler {
 			AccountID:  accountID,
 			StatusCode: sw.statusCode,
 			DurationMs: duration,
-			ClientIP:   clientIP,
+			ClientIP:   clientIP(r),
 			UserAgent:  r.UserAgent(),
 		}
 		// SSE 内部失败（response.failed / SSE error 事件）在这里补记 ——

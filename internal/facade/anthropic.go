@@ -116,17 +116,17 @@ func anthropicUserID(body map[string]json.RawMessage) string {
 
 func anthropicConversationKey(r *http.Request, body map[string]json.RawMessage, msgs []AnthropicMessage) string {
 	if v := strings.TrimSpace(r.Header.Get(HeaderSession)); v != "" {
-		return "h:" + v
+		return scopeKey(r, "h:"+v)
 	}
 	// Anthropic 没有 user 字段，用 metadata.user_id 兜底。
 	if uid := anthropicUserID(body); uid != "" {
-		return "u:" + uid
+		return scopeKey(r, "u:"+uid)
 	}
 	conv := make([]ChatMessage, 0, len(msgs))
 	for _, m := range msgs {
 		conv = append(conv, ChatMessage{Role: m.Role, Content: m.Content})
 	}
-	return conversationKey(r, nil, conv)
+	return scopeKey(r, conversationKeyBase(r, nil, conv))
 }
 
 func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id, publicModel string) {
@@ -165,13 +165,16 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 
 	res, runErr := h.runner.Run(r.Context(), runReq, emit)
 	bindLogAccount(r, res)
-	sessionChainPut(runReq.StickyKey, chainConv(res), resReqID(res), resAccount(res), runReq.Model)
 	// 成功回复才记历史（同 chat.go）。
-	if res != nil && res.Text != "" {
-		sessionChainAppend(runReq.StickyKey, lastUserText(runReq.Input), res.Text)
+	if runErr == nil {
+		sessionChainPut(runReq.StickyKey, chainConv(res), resReqID(res), resAccount(res), runReq.Model)
+		if res != nil && res.Text != "" {
+			sessionChainAppend(runReq.StickyKey, lastUserText(runReq.Input), res.Text)
+		}
 	}
 
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {
+		middleware.RecordLogError(r, "anthropic 流式失败: %v", runErr)
 		buf = AppendAnthropicEvent(buf[:0], AnthropicEvent{Type: "error", Text: runErr.Error()})
 		_ = sw.WriteRaw(buf)
 		return
@@ -196,10 +199,12 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 func (h *Handler) syncAnthropic(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id, publicModel string) {
 	res, err := h.runner.Run(r.Context(), runReq, nil)
 	bindLogAccount(r, res)
-	sessionChainPut(runReq.StickyKey, chainConv(res), resReqID(res), resAccount(res), runReq.Model)
 	// 成功回复才记历史（同 chat.go）。
-	if err == nil && res != nil && res.Text != "" {
-		sessionChainAppend(runReq.StickyKey, lastUserText(runReq.Input), res.Text)
+	if err == nil {
+		sessionChainPut(runReq.StickyKey, chainConv(res), resReqID(res), resAccount(res), runReq.Model)
+		if res != nil && res.Text != "" {
+			sessionChainAppend(runReq.StickyKey, lastUserText(runReq.Input), res.Text)
+		}
 	}
 	if err != nil {
 		status, typ, msg := mapError(err)

@@ -107,3 +107,37 @@ func TestAPIKeyAuth_ExemptProbes(t *testing.T) {
 		t.Errorf("带有效 key 的业务请求应返回 200，得到 %d", recBizAuth.Code)
 	}
 }
+
+// 鉴权通过后应写入调用方指纹（会话租户隔离依赖它），且指纹不含 Key 原文。
+func TestAuth_SetsTenant(t *testing.T) {
+	var got string
+	h := Auth(AuthOptions{StaticKeys: []string{"sk-tenant-key"}})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = Tenant(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("Authorization", "Bearer sk-tenant-key")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if !strings.HasPrefix(got, "k:") || strings.Contains(got, "sk-tenant-key") {
+		t.Fatalf("租户指纹异常: %q", got)
+	}
+}
+
+func TestIsLocalRequest(t *testing.T) {
+	cases := []struct {
+		remote, host string
+		want         bool
+	}{
+		{"127.0.0.1:1", "localhost:8787", true},
+		{"[::1]:1", "[::1]:8787", true},
+		{"127.0.0.1:1", "127.0.0.1:8787", true},
+		{"127.0.0.1:1", "evil.example:8787", false}, // DNS rebinding
+		{"192.0.2.1:1", "localhost:8787", false},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.RemoteAddr, r.Host = c.remote, c.host
+		if got := IsLocalRequest(r); got != c.want {
+			t.Errorf("IsLocalRequest(%s, %s) = %v, want %v", c.remote, c.host, got, c.want)
+		}
+	}
+}

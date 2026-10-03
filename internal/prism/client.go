@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -199,6 +200,7 @@ func (c *Client) Do(ctx context.Context, p Principal, method, path string, heade
 		resp    *http.Response
 		lastErr error
 	)
+	noReplay := isNoReplay(ctx)
 
 	for attempt := 0; attempt <= c.up.MaxRetries; attempt++ {
 		if attempt > 0 {
@@ -262,6 +264,10 @@ func (c *Client) Do(ctx context.Context, p Principal, method, path string, heade
 			if !httpc.IsNetworkError(lastErr) {
 				return nil, fmt.Errorf("%s %s: %w", method, path, lastErr)
 			}
+			// 非幂等请求：只有"连接都没建起来"才能确定上游没收到。
+			if noReplay && !isDialError(lastErr) {
+				return nil, fmt.Errorf("%s %s: %w", method, path, lastErr)
+			}
 			continue
 		}
 
@@ -291,7 +297,8 @@ func (c *Client) Do(ctx context.Context, p Principal, method, path string, heade
 		}
 
 		// 5xx 值得重试；4xx 是确定性错误，重试只会浪费配额。
-		if httpc.RetryableStatus(resp.StatusCode) && attempt < c.up.MaxRetries && bodyReader == nil {
+		// 非幂等请求的 500/502/504 可能已被上游处理，不能重放（429/503 已在上面处理）。
+		if httpc.RetryableStatus(resp.StatusCode) && attempt < c.up.MaxRetries && bodyReader == nil && !noReplay {
 			drainClose(resp)
 			continue
 		}
@@ -303,6 +310,25 @@ func (c *Client) Do(ctx context.Context, p Principal, method, path string, heade
 		lastErr = fmt.Errorf("%s %s 重试耗尽", method, path)
 	}
 	return nil, lastErr
+}
+
+type noReplayKey struct{}
+
+// withNoReplay 标记本次调用为非幂等：Do 只重试确定未送达的失败
+// （建连失败、429/503 这类上游明确拒收的响应）。
+func withNoReplay(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noReplayKey{}, true)
+}
+
+func isNoReplay(ctx context.Context) bool {
+	v, _ := ctx.Value(noReplayKey{}).(bool)
+	return v
+}
+
+// isDialError 判断错误是否发生在建连阶段（请求必然未送达）。
+func isDialError(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
 }
 
 // doJSON 发送 JSON 并解析响应。
@@ -498,7 +524,9 @@ func (c *Client) StartResponse(ctx context.Context, p Principal, req *StartReque
 	payload := c.buildStartPayload(req)
 
 	var raw json.RawMessage
-	if _, _, _, err := c.doJSON(ctx, p, http.MethodPost, c.schema.StartPath, payload, &raw, "application/json"); err != nil {
+	// start 不是幂等操作：请求一旦送达，上游就开始生成（扣额度、占用会话）。
+	// 只允许重试"确定没送达"的失败，否则会在同一会话上并发出两次生成。
+	if _, _, _, err := c.doJSON(withNoReplay(ctx), p, http.MethodPost, c.schema.StartPath, payload, &raw, "application/json"); err != nil {
 		return nil, err
 	}
 

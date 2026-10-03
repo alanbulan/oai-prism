@@ -352,7 +352,10 @@ func (h *Handler) allowed(path string) bool {
 		if a == "" {
 			continue
 		}
-		if strings.HasPrefix(p, a) {
+		// 按路径段匹配：条目 "/api/y" 只放行 /api/y 与 /api/y/...，
+		// 不能顺带放行 /api/yolo 这类恰好同前缀的其它端点。
+		base := strings.TrimSuffix(a, "/")
+		if p == a || p == base || strings.HasPrefix(p, base+"/") {
 			return true
 		}
 	}

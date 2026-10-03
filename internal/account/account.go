@@ -74,6 +74,17 @@ func (a *Account) Inflight() int64 { return a.inflight.Load() }
 func (a *Account) MaxConcurrency() int64 { return a.maxConc }
 
 // Available 判断账号当前是否可被调度。
+// Busy 报告账号是否"仅因并发已满而暂不可用"（未冷却且凭据可用）。
+func (a *Account) Busy(now time.Time) bool {
+	if a.maxConc <= 0 || a.inflight.Load() < a.maxConc {
+		return false
+	}
+	if until := a.cooldownUntil.Load(); until > 0 && now.UnixNano() < until {
+		return false
+	}
+	return a.cred.Load().Usable()
+}
+
 func (a *Account) Available(now time.Time) bool {
 	if a.maxConc > 0 && a.inflight.Load() >= a.maxConc {
 		return false
@@ -124,8 +135,12 @@ func (a *Account) Acquire(now time.Time) bool {
 
 // Release 归还并发额度。
 func (a *Account) Release() {
-	if a.inflight.Load() > 0 {
-		a.inflight.Add(-1)
+	// CAS 递减：先 Load 再 Add 的写法在并发释放时会把计数减成负数。
+	for {
+		cur := a.inflight.Load()
+		if cur <= 0 || a.inflight.CompareAndSwap(cur, cur-1) {
+			return
+		}
 	}
 }
 

@@ -120,16 +120,6 @@ func (p *projectCache) Put(accountID, conversation, projectID string, now time.T
 	p.mu.Unlock()
 }
 
-// PutActive 写入账号默认活跃项目。
-func (p *projectCache) PutActive(accountID, projectID string, now time.Time) {
-	p.Put(accountID, "__active__", projectID, now)
-}
-
-// GetActive 获取账号当前可复用的活跃项目。
-func (p *projectCache) GetActive(accountID string, now time.Time) (string, bool) {
-	return p.Get(accountID, "__active__", now)
-}
-
 // Invalidate 主动失效（项目被上游删除时）。
 func (p *projectCache) Invalidate(accountID, conversation string) {
 	p.mu.Lock()

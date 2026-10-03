@@ -86,9 +86,11 @@ func (c *sandboxCache) Synced(accountID, projectID string) bool {
 	if projectID == "" {
 		return false
 	}
+	// projects 由 MarkSynced / InvalidateProject 在写锁下修改，读也必须在锁内：
+	// 锁外读 map 与并发写撞上会直接 fatal（concurrent map read and map write）。
 	c.mu.RLock()
+	defer c.mu.RUnlock()
 	e, ok := c.items[accountID]
-	c.mu.RUnlock()
 	if !ok {
 		return false
 	}
@@ -115,6 +117,18 @@ func (c *sandboxCache) MarkSynced(accountID, projectID string, until time.Time) 
 func (c *sandboxCache) Invalidate(accountID string) {
 	c.mu.Lock()
 	delete(c.items, accountID)
+	c.mu.Unlock()
+}
+
+// InvalidateIf 仅当缓存里仍是 sb 这个沙箱时才失效。
+//
+// 沙箱按账号共享：会话 A 判定容器坏了的同时，会话 B 可能已经换上了新容器，
+// 无条件 Invalidate 会把 B 的新容器也踢掉，引发连环重建。
+func (c *sandboxCache) InvalidateIf(accountID string, sb *prism.Sandbox) {
+	c.mu.Lock()
+	if e, ok := c.items[accountID]; ok && (sb == nil || e.sb == sb || (e.sb != nil && e.sb.Token == sb.Token)) {
+		delete(c.items, accountID)
+	}
 	c.mu.Unlock()
 }
 

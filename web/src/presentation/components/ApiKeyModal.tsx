@@ -20,6 +20,8 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
   const [keys, setKeys] = useState<ApiKeyItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [newKeyName, setNewKeyName] = useState('');
+  const [manualKey, setManualKey] = useState('');
+  const [loadError, setLoadError] = useState('');
 
   const fetchKeys = async (): Promise<ApiKeyItem[]> => {
     setLoading(true);
@@ -27,9 +29,12 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
       const res = await httpClient.get<ApiKeyItem[]>('/admin/apikeys');
       const list = res.data || [];
       setKeys(list);
+      setLoadError('');
       return list;
-    } catch {
-      // 容灾
+    } catch (err: any) {
+      // 已启用鉴权且浏览器里还没有可用 Key：提示手动填入
+      setKeys([]);
+      setLoadError(err?.message || '加载失败');
       return [];
     } finally {
       setLoading(false);
@@ -64,6 +69,15 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
     } catch (err: any) {
       message.error(`删除失败: ${err.message}`);
     }
+  };
+
+  const handleUseManualKey = async () => {
+    const k = manualKey.trim();
+    if (!k) return;
+    setApiKey(k);
+    setManualKey('');
+    message.success('已保存到浏览器，之后的请求将携带此 Key');
+    await fetchKeys();
   };
 
   const handleCopy = (text: string) => {
@@ -140,7 +154,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
     },
   ];
 
-  const firstKey = keys[0]?.key || 'sk-prism-live-master';
+  const firstKey = getApiKey() || keys[0]?.key || '<你的 API Key>';
 
   const curlExample = `curl http://localhost:8787/v1/chat/completions \\
   -H "Content-Type: application/json" \\
@@ -196,6 +210,23 @@ codex "帮我分析代码"`;
             label: '密钥列表',
             children: (
               <div>
+                {loadError && (
+                  <Paragraph type="danger" style={{ marginBottom: 12 }}>
+                    无法读取密钥列表：{loadError}。网关已启用鉴权时，请在下方填入一个有效的 API Key
+                    （远程访问管理功能需配置文件中的 Key 或管理员登录）。
+                  </Paragraph>
+                )}
+                <div style={{ display: 'flex', gap: 12, marginBottom: 12 }}>
+                  <Input.Password
+                    placeholder="已有 API Key：粘贴后保存到本浏览器"
+                    value={manualKey}
+                    onChange={(e) => setManualKey(e.target.value)}
+                    onPressEnter={handleUseManualKey}
+                  />
+                  <Button icon={<KeyOutlined />} onClick={handleUseManualKey}>
+                    使用此 Key
+                  </Button>
+                </div>
                 <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
                   <Input
                     placeholder="输入新 Key 描述名称 (例如: 生产环境客户端 / 本地Codex)"

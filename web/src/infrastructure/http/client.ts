@@ -51,7 +51,13 @@ httpClient.interceptors.request.use((config) => {
 httpClient.interceptors.response.use(
   (response) => response,
   (error) => {
-    const msg = error.response?.data?.error?.message || error.message || '网络请求异常';
+    // 两种错误体：OpenAI 风格 {error:{message}} 与管理端 {error:"..."}
+    const data = error.response?.data;
+    const msg =
+      data?.error?.message ||
+      (typeof data?.error === 'string' ? data.error : '') ||
+      error.message ||
+      '网络请求异常';
     return Promise.reject(new Error(msg));
   }
 );

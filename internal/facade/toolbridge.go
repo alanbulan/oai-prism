@@ -3,8 +3,10 @@ package facade
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/oai-prism/oaiprism/internal/prism"
@@ -236,12 +238,20 @@ func foldInputHistory(items []prism.InputItem) []prism.InputItem {
 
 	history := "\n\n[Previous Conversation History]\n" + sb.String()
 
-	if strings.EqualFold(items[0].Role, "system") && len(items[0].Content) > 0 {
+	// 返回副本：InputItem.Content 是切片，原地拼接会改到调用方手里的 input ——
+	// 调用方同时用它构造增量输入时，增量的 system 会被悄悄塞进全量历史；
+	// 自愈重试再折叠一次，历史还会被拼两遍。
+	out := make([]prism.InputItem, len(items))
+	copy(out, items)
+	if strings.EqualFold(out[0].Role, "system") && len(out[0].Content) > 0 {
 		// 首条已是 system：历史追加进它的第一个文本块作为全局认知强化。
-		items[0].Content[0].Text += history
+		sys := out[0]
+		sys.Content = append([]prism.InputContent(nil), sys.Content...)
+		sys.Content[0].Text += history
+		out[0] = sys
 	}
 
-	return items
+	return out
 }
 
 // extractIncrementalInput 从全量 input 中提取增量条目。
@@ -317,8 +327,10 @@ func osDirective(ua string) string {
 		return "CLIENT OS FACT: the client machine is Windows. " +
 			"exec_command runs on the CLIENT in Windows PowerShell, which does NOT support bash syntax. " +
 			"NEVER use `cat > file`, `<<'EOF'` heredocs, or `printf >` — they fail instantly with " +
-			"\"重定向运算符后缺少文件规范\". To create/overwrite a file use exactly: " +
-			"`$c = @'...full content...'@; Set-Content -LiteralPath '<path>' -Value $c -NoNewline`. " +
+			"\"重定向运算符后缺少文件规范\". To create/overwrite a file use: " +
+			"`$c = @'...content...'@; Set-Content -LiteralPath '<path>' -Value $c -NoNewline`. " +
+			"CRITICAL WINDOWS LIMIT: Windows CreateProcess fails with 'os error 206 (文件名或扩展名太长)' if a single command line exceeds 32KB. " +
+			"For files larger than 20KB, NEVER put the entire content into one command; split into multiple chunks in the same ```codex-exec block (the 1st call uses `Set-Content`, subsequent calls use `Add-Content -LiteralPath '<path>' -Value $c -NoNewline`). " +
 			"To read a file use `Get-Content -LiteralPath '<path>' -Raw`. To list a directory use `Get-ChildItem`. " +
 			negateEnv + " " + strings.ReplaceAll(evidence, "<ua>", ua)
 	case strings.Contains(l, "mac os"), strings.Contains(l, "macos"), strings.Contains(l, "darwin"):
@@ -500,6 +512,22 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 				continue
 			}
 
+			// Windows 命令行超长（os error 206 / 文件名或扩展名太长）：
+			// Windows CreateProcess 命令行有 32,767 字符的内核硬限制，
+			// 必须立刻提示模型分块输出，避免它向用户求助或陷入死循环。
+			if isCommandTooLongError(out) {
+				items = append(items, prism.NewUserItem(
+					header+"\n"+truncateRunes(out, 300)+"\n"+
+						"CLIENT COMMAND LENGTH ERROR: Windows CreateProcess 命令行有 32,767 字符的内核限制，刚才的单条命令体积过大被操作系统拦截未执行（os error 206）。\n"+
+						"请立刻在同一个 ```codex-exec 块中，将大文件内容拆分为多个小于 15KB 的分块，连续调用 tools.exec_command 顺序写入：\n"+
+						"第 1 块用 Set-Content 创建文件，第 2、3... 块用 Add-Content 追加写入：\n"+
+						"  const out1 = await tools.exec_command({ cmd: \"$c = @'\\n<第1部分约12KB>\\n'@; Set-Content -LiteralPath '<路径>' -Value $c -NoNewline -Encoding UTF8\" });\n"+
+						"  const out2 = await tools.exec_command({ cmd: \"$c = @'\\n<第2部分约12KB>\\n'@; Add-Content -LiteralPath '<路径>' -Value $c -NoNewline -Encoding UTF8\" });\n"+
+						"请现在立刻输出完整的、分块拆分后的写入代码（不要省略内容、不要要求用户提供原始内容）！\n"+
+						"[/CLIENT RESULT]"))
+				continue
+			}
+
 			// bash 语法用在 PowerShell 客户端上（`cat > f <<'EOF'` 等）会直接
 			// 语法报错。它和"命令逻辑错"不同 —— 换个语法就能成功，所以必须
 			// 把这一点告诉模型；否则它会以为内容丢了，转而去要求用户
@@ -663,6 +691,7 @@ func extractExecBlock(text string) (string, bool) {
 // 换个姿势再错"的死循环。与其反复纠正模型，不如代理层兜底：
 // 不含 JS 特征的内容就视为一条 shell 命令，自动包上 exec_command。
 func ensureExecJS(candidate string) string {
+	candidate = splitOversizedPowerShellCommands(candidate)
 	if strings.Contains(candidate, "tools.") || strings.Contains(candidate, "await") {
 		return candidate // 已经是 JS
 	}
@@ -672,6 +701,135 @@ func ensureExecJS(candidate string) string {
 	sb.WriteString(` });
 text(__out);`)
 	return sb.String()
+}
+
+// isCommandTooLongError 判断客户端输出是否为 Windows 命令行超长（CreateProcess 32,767 字符上限）。
+//
+// 必须匹配完整特征串：早期用 strings.Contains(out, "206") 判断，任何含 "2026"
+// 日期、行号、文件大小的正常输出都会被误判，真实结果被替换成一条"命令过长"纠错。
+func isCommandTooLongError(out string) bool {
+	l := strings.ToLower(out)
+	return strings.Contains(l, "os error 206") ||
+		strings.Contains(out, "文件名或扩展名太长") ||
+		strings.Contains(l, "filename or extension is too long") ||
+		strings.Contains(l, "the command line is too long")
+}
+
+const (
+	// psCmdSplitThreshold：单条命令超过它就拆分（Windows 上限 32,767 个 UTF-16 单元，留足余量）。
+	psCmdSplitThreshold = 24000
+	// psChunkRunes：拆分后每块的字符数。
+	psChunkRunes = 12000
+)
+
+// rePSHereWrite 匹配"单文件 here-string 写入"这一种命令形态：
+//
+//	$c = @'
+//	<内容>
+//	'@; Set-Content -LiteralPath '<路径>' -Value $c [-NoNewline] [-Encoding X]
+//
+// 只认这一种：拆分会重写整条命令，形态稍有不同（多条语句、管道、其它变量）
+// 就可能丢掉其余操作，宁可不拆。
+var rePSHereWrite = regexp.MustCompile(`(?s)^\s*\$(\w+)\s*=\s*@'\r?\n(.*?)\r?\n'@\s*;?\s*Set-Content\s+-(?:LiteralPath|Path)\s+'((?:[^']|'')*)'\s+-Value\s+\$(\w+)((?:\s+-NoNewline|\s+-Encoding\s+[\w-]+)*)\s*;?\s*$`)
+
+// splitOversizedPowerShellCommands 把超出 Windows 命令行上限的单文件写入拆成多次调用
+// （首块 Set-Content、其余 Add-Content），根除 os error 206。
+//
+// 适用条件（不满足就原样返回）：块里只有一次 exec_command 调用（或本身就是裸命令），
+// 且命令恰好是 rePSHereWrite 描述的形态。拆分保证内容逐字节不变：
+// 每块都以 -NoNewline 写入，只有最后一块沿用原命令是否带 -NoNewline。
+func splitOversizedPowerShellCommands(js string) string {
+	if len(js) < psCmdSplitThreshold {
+		return js
+	}
+	cmd := js
+	if strings.Contains(js, "tools.") || strings.Contains(js, "await") {
+		c, ok := singleExecCmd(js)
+		if !ok {
+			return js
+		}
+		cmd = c
+	}
+	if len(cmd) < psCmdSplitThreshold {
+		return js
+	}
+	m := rePSHereWrite.FindStringSubmatch(cmd)
+	if m == nil || m[1] != m[4] {
+		return js
+	}
+	content, path, flags := m[2], m[3], m[5]
+	keepNewline := !strings.Contains(flags, "-NoNewline")
+	encoding := ""
+	if i := strings.Index(flags, "-Encoding"); i >= 0 {
+		encoding = " " + strings.TrimSpace(strings.ReplaceAll(flags[i:], "-NoNewline", ""))
+	}
+
+	chunks := splitHereStringChunks(content, psChunkRunes)
+	if len(chunks) <= 1 {
+		return js
+	}
+	var sb strings.Builder
+	for i, chunk := range chunks {
+		verb := "Add-Content"
+		if i == 0 {
+			verb = "Set-Content"
+		}
+		nl := " -NoNewline"
+		if i == len(chunks)-1 && keepNewline {
+			nl = ""
+		}
+		part := fmt.Sprintf("$c = @'\n%s\n'@; %s -LiteralPath '%s' -Value $c%s%s", chunk, verb, path, nl, encoding)
+		fmt.Fprintf(&sb, "const __out%d = await tools.exec_command({ cmd: ", i)
+		writeJSONString(&sb, part)
+		sb.WriteString(" });\n")
+	}
+	fmt.Fprintf(&sb, "text(__out%d);", len(chunks)-1)
+	return sb.String()
+}
+
+// splitHereStringChunks 按字符数切分 here-string 内容，并避开两个会改变内容的切点：
+//   - 切在 \r 与 \n 之间：块尾的 \r 会被当成结束符前的换行吞掉；
+//   - 下一块以 '@ 开头：它会被解析成 here-string 结束符。
+func splitHereStringChunks(content string, size int) []string {
+	runes := []rune(content)
+	var chunks []string
+	for start := 0; start < len(runes); {
+		end := start + size
+		if end >= len(runes) {
+			chunks = append(chunks, string(runes[start:]))
+			break
+		}
+		for end > start+1 && (runes[end-1] == '\r' || (runes[end] == '\'' && end+1 < len(runes) && runes[end+1] == '@')) {
+			end--
+		}
+		chunks = append(chunks, string(runes[start:end]))
+		start = end
+	}
+	return chunks
+}
+
+// singleExecCmd 在"块里只有一次 exec_command 调用"时取出它的 cmd 字面量（已反转义）。
+func singleExecCmd(js string) (string, bool) {
+	if strings.Count(js, "exec_command(") != 1 {
+		return "", false
+	}
+	call := js[strings.Index(js, "exec_command("):]
+	i := strings.Index(call, "cmd")
+	if i < 0 {
+		return "", false
+	}
+	rest := strings.TrimLeft(call[i+3:], " \t\"'")
+	if !strings.HasPrefix(rest, ":") {
+		return "", false
+	}
+	rest = strings.TrimSpace(rest[1:])
+	if rest == "" || !strings.ContainsRune("\"'`", rune(rest[0])) {
+		return "", false
+	}
+	if strings.HasPrefix(rest, "`") && strings.Contains(rest, "${") {
+		return "", false // 模板插值无法静态求值
+	}
+	return extractQuotedString(rest)
 }
 
 // ExecToolName 从请求里提取客户端实际注册的 custom 工具名。
@@ -1055,55 +1213,179 @@ func IsFauxSandboxCompletion(text string) bool {
 }
 
 // SynthesizeDeltaFilesExecJS 把上游沙箱内的 DeltaFiles 合成为由客户端在本地终端执行的 exec_command JS。
-// 使用 Base64 编码方式写入本地文件，绝对杜绝任何引号转义、换行符破坏或 shell 语法报错。
-// 必须严格过滤掉系统级文件（如 AGENTS.md / README.md / .git 等），防止死循环。
+//
+// 安全与正确性约束（逐条对应过去的事故）：
+//   - 路径经 safeRelPath 校验（拒绝绝对路径、盘符、".."），并按目标 shell 的规则转义 ——
+//     早期直接拼进单引号字符串，文件名里的一个 ' 就能让模型在用户机器上执行任意命令；
+//   - 新增文件才整体写入，内容以 Base64 传递，杜绝引号/换行/编码问题；
+//   - 修改只做"带上下文校验的替换"：先在本地文件里定位原文，定位不到就报错、不落盘
+//     —— 早期把 diff 片段当完整内容覆盖，用户文件被截成几行甚至清空；
+//   - Windows 单条命令行上限 32,767 字符：大文件按块分多次写入。
+//
+// 处理不了的文件不会静默丢弃：以 text() 输出原因，模型与用户都能看到。
 func SynthesizeDeltaFilesExecJS(files []prism.CodexDeltaFile, isWindows bool) string {
 	if len(files) == 0 {
 		return ""
 	}
 	var sb strings.Builder
 	idx := 0
-	for _, f := range files {
-		if isSystemIgnoredFile(f.FilePath) {
-			continue
-		}
-		cleanPath := filepath.Clean(f.FilePath)
-		if f.Status == "deleted" {
-			var cmd string
-			if isWindows {
-				cmd = fmt.Sprintf(`if (Test-Path -LiteralPath '%s') { Remove-Item -LiteralPath '%s' -Force }`, cleanPath, cleanPath)
-			} else {
-				cmd = fmt.Sprintf(`rm -f '%s'`, cleanPath)
-			}
-			var jsPart strings.Builder
-			jsPart.WriteString(fmt.Sprintf(`const out%d = await tools.exec_command({ cmd: `, idx))
-			writeJSONString(&jsPart, cmd)
-			jsPart.WriteString(` });` + "\n" + fmt.Sprintf(`text(out%d);`, idx))
-			sb.WriteString(jsPart.String())
-			sb.WriteString("\n")
-			idx++
-			continue
-		}
-
-		content := ExtractContentFromDiff(f.DiffString())
-		b64 := base64.StdEncoding.EncodeToString([]byte(content))
-		var cmd string
-		if isWindows {
-			// PowerShell 7 / Windows: 确保父目录存在，然后通过 .NET API 原样写入字节流
-			cmd = fmt.Sprintf(`$d = Split-Path -Parent '%s'; if ($d -and -not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }; [System.IO.File]::WriteAllBytes('%s', [System.Convert]::FromBase64String('%s'))`,
-				cleanPath, cleanPath, b64)
-		} else {
-			// POSIX bash: 确保父目录存在，然后通过 base64 -d 还原落盘
-			cmd = fmt.Sprintf(`mkdir -p "$(dirname '%s')" && echo '%s' | base64 -d > '%s'`,
-				cleanPath, b64, cleanPath)
-		}
-		var jsPart strings.Builder
-		jsPart.WriteString(fmt.Sprintf(`const out%d = await tools.exec_command({ cmd: `, idx))
-		writeJSONString(&jsPart, cmd)
-		jsPart.WriteString(` });` + "\n" + fmt.Sprintf(`text(out%d);`, idx))
-		sb.WriteString(jsPart.String())
-		sb.WriteString("\n")
+	emit := func(cmd string) {
+		fmt.Fprintf(&sb, "const out%d = await tools.exec_command({ cmd: ", idx)
+		writeJSONString(&sb, cmd)
+		fmt.Fprintf(&sb, " });\ntext(out%d);\n", idx)
 		idx++
 	}
+	note := func(msg string) {
+		sb.WriteString("text(")
+		writeJSONString(&sb, msg)
+		sb.WriteString(");\n")
+	}
+	emitted := 0
+	for _, f := range files {
+		plan, err := planDeltaFile(f)
+		if errors.Is(err, errIgnoredFile) {
+			continue
+		}
+		if err != nil {
+			note("[oaiprism] 跳过上游文件变更 " + f.FilePath + "：" + err.Error())
+			continue
+		}
+		var cmds []string
+		switch plan.Kind {
+		case editDelete:
+			cmds = []string{deleteFileCmd(plan.Path, isWindows)}
+		case editWrite:
+			cmds = writeFileCmds(plan.Path, plan.Content, isWindows)
+		case editPatch:
+			c := patchFileCmd(plan.Path, plan.Hunks, isWindows)
+			if isWindows && len(c) > psCmdSplitThreshold {
+				note("[oaiprism] 跳过上游文件变更 " + plan.Path + "：补丁过大，超出 Windows 命令行长度上限，请让模型分步修改")
+				continue
+			}
+			cmds = []string{c}
+		}
+		for _, c := range cmds {
+			emit(c)
+		}
+		emitted++
+	}
+	if emitted == 0 && sb.Len() == 0 {
+		return ""
+	}
 	return strings.TrimSpace(sb.String())
+}
+
+// psQuote 生成 PowerShell 单引号字面量（单引号内只有 ' 需要转义为 ”）。
+func psQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+
+// shQuote 生成 POSIX shell 单引号字面量（' 转为 '\”）。
+func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+
+// psFullPath 把相对路径解析到 PowerShell 当前目录。
+//
+// 必须显式拼：.NET 的 [IO.File] 按进程工作目录解析相对路径，
+// 它与 PowerShell 的 Get-Location 并不总是一致。
+func psFullPath(rel string) string {
+	return "$p=[IO.Path]::Combine((Get-Location).ProviderPath," + psQuote(filepath.FromSlash(rel)) + ")"
+}
+
+func deleteFileCmd(rel string, isWindows bool) string {
+	if isWindows {
+		return psFullPath(rel) + "; if ([IO.File]::Exists($p)) { [IO.File]::Delete($p); 'deleted " + strings.ReplaceAll(rel, "'", "''") + "' }"
+	}
+	return "rm -f -- " + shQuote(rel)
+}
+
+// writeFileCmds 生成整体写入命令（Windows 按块追加，规避命令行长度上限）。
+func writeFileCmds(rel, content string, isWindows bool) []string {
+	data := []byte(content)
+	if !isWindows {
+		return []string{"mkdir -p -- \"$(dirname -- " + shQuote(rel) + ")\" && printf '%s' " +
+			shQuote(base64.StdEncoding.EncodeToString(data)) + " | base64 --decode > " + shQuote(rel) + " && echo " + shQuote("wrote "+rel)}
+	}
+	const chunk = 15000 // 原始字节；Base64 后约 20,000 字符
+	var cmds []string
+	for off := 0; off == 0 || off < len(data); off += chunk {
+		end := off + chunk
+		if end > len(data) {
+			end = len(data)
+		}
+		b64 := base64.StdEncoding.EncodeToString(data[off:end])
+		if off == 0 {
+			cmds = append(cmds, psFullPath(rel)+"; $d=[IO.Path]::GetDirectoryName($p); if (-not [IO.Directory]::Exists($d)) { [void][IO.Directory]::CreateDirectory($d) }; "+
+				"[IO.File]::WriteAllBytes($p,[Convert]::FromBase64String('"+b64+"')); 'wrote "+strings.ReplaceAll(rel, "'", "''")+"'")
+		} else {
+			cmds = append(cmds, psFullPath(rel)+"; $x=[Convert]::FromBase64String('"+b64+"'); $f=[IO.File]::Open($p,'Append'); try { $f.Write($x,0,$x.Length) } finally { $f.Close() }")
+		}
+		if end >= len(data) {
+			break
+		}
+	}
+	return cmds
+}
+
+// patchFileCmd 生成"定位原文 → 替换"的补丁命令。算法与 applyHunks 完全一致：
+// Old 的所有出现位置里取起始行最接近预期行的一处；找不到就报错退出、不写文件。
+// 保留原文件的换行风格与 UTF-8 BOM。
+func patchFileCmd(rel string, hunks []editHunk, isWindows bool) string {
+	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+	if isWindows {
+		var sb strings.Builder
+		sb.WriteString("$ErrorActionPreference='Stop'; " + psFullPath(rel) + "; ")
+		sb.WriteString("$b=[IO.File]::ReadAllBytes($p); $bom=($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF); ")
+		sb.WriteString("$t=(New-Object Text.UTF8Encoding($false)).GetString($b); if ($bom) { $t=$t.Substring(1) }; ")
+		sb.WriteString("$crlf=$t.Contains(\"`r`n\"); $t=$t.Replace(\"`r`n\",\"`n\"); ")
+		sb.WriteString("function D([string]$s) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)).Replace(\"`r`n\",\"`n\") }; ")
+		sb.WriteString("$H=@(); ")
+		for _, h := range hunks {
+			fmt.Fprintf(&sb, "$H+=,@('%s','%s',%d); ", b64(h.Old), b64(h.New), h.Line)
+		}
+		sb.WriteString("$shift=0; foreach ($h in $H) { $o=D $h[0]; $n=D $h[1]; $want=[int]$h[2]+$shift; ")
+		sb.WriteString("if ($o.Length -eq 0) { $pos=0; for ($k=0; $k -lt $want; $k++) { $nx=$t.IndexOf(\"`n\",$pos); if ($nx -lt 0) { $pos=$t.Length; break }; $pos=$nx+1 }; $t=$t.Insert($pos,$n) } ")
+		sb.WriteString("else { $best=-1; $bd=[int]::MaxValue; $i=$t.IndexOf($o,[StringComparison]::Ordinal); ")
+		sb.WriteString("while ($i -ge 0) { $ln=$t.Substring(0,$i).Split(\"`n\").Count; $dd=[Math]::Abs($ln-$want); if ($dd -lt $bd) { $bd=$dd; $best=$i }; $i=$t.IndexOf($o,$i+1,[StringComparison]::Ordinal) }; ")
+		sb.WriteString("if ($best -lt 0) { throw ('patch context not found, file left unchanged: ' + $p) }; $t=$t.Substring(0,$best)+$n+$t.Substring($best+$o.Length) }; ")
+		sb.WriteString("$shift+=($n.Split(\"`n\").Count-1)-($o.Split(\"`n\").Count-1) }; ")
+		sb.WriteString("if ($crlf) { $t=$t.Replace(\"`n\",\"`r`n\") }; [IO.File]::WriteAllText($p,$t,(New-Object Text.UTF8Encoding($bom))); 'patched " + strings.ReplaceAll(rel, "'", "''") + "'")
+		return sb.String()
+	}
+
+	var hs strings.Builder
+	for _, h := range hunks {
+		fmt.Fprintf(&hs, "('%s','%s',%d),", b64(h.Old), b64(h.New), h.Line)
+	}
+	return "python3 - " + shQuote(rel) + " <<'OAIPRISM_PATCH'\n" +
+		"import sys,base64\n" +
+		"p=sys.argv[1]\n" +
+		"H=[" + hs.String() + "]\n" +
+		"raw=open(p,'rb').read()\n" +
+		"bom=raw.startswith(b'\\xef\\xbb\\xbf')\n" +
+		"t=(raw[3:] if bom else raw).decode('utf-8')\n" +
+		"crlf='\\r\\n' in t\n" +
+		"t=t.replace('\\r\\n','\\n')\n" +
+		"D=lambda s: base64.b64decode(s).decode('utf-8').replace('\\r\\n','\\n')\n" +
+		"shift=0\n" +
+		"for o,n,line in H:\n" +
+		"    o=D(o); n=D(n); want=line+shift\n" +
+		"    if not o:\n" +
+		"        pos=0\n" +
+		"        for _ in range(want):\n" +
+		"            nx=t.find('\\n',pos)\n" +
+		"            if nx<0:\n" +
+		"                pos=len(t); break\n" +
+		"            pos=nx+1\n" +
+		"        t=t[:pos]+n+t[pos:]\n" +
+		"    else:\n" +
+		"        best=-1; bd=None; i=t.find(o)\n" +
+		"        while i>=0:\n" +
+		"            d=abs(t.count('\\n',0,i)+1-want)\n" +
+		"            if bd is None or d<bd: bd=d; best=i\n" +
+		"            i=t.find(o,i+1)\n" +
+		"        if best<0: sys.exit('patch context not found, file left unchanged: '+p)\n" +
+		"        t=t[:best]+n+t[best+len(o):]\n" +
+		"    shift+=n.count('\\n')-o.count('\\n')\n" +
+		"if crlf: t=t.replace('\\n','\\r\\n')\n" +
+		"open(p,'wb').write((b'\\xef\\xbb\\xbf' if bom else b'')+t.encode('utf-8'))\n" +
+		"print('patched',p)\n" +
+		"OAIPRISM_PATCH"
 }

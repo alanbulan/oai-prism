@@ -2,6 +2,7 @@ package facade
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -682,17 +683,17 @@ func TestSynthesizeDeltaFilesExecJS(t *testing.T) {
 
 	// Windows 测试
 	winJS := SynthesizeDeltaFilesExecJS(files, true)
-	if !strings.Contains(winJS, "WriteAllBytes") || !strings.Contains(winJS, "Split-Path") {
-		t.Errorf("Windows JS 应当包含 WriteAllBytes 和 Split-Path: %s", winJS)
+	if !strings.Contains(winJS, "WriteAllBytes") || !strings.Contains(winJS, "CreateDirectory") {
+		t.Errorf("Windows JS 应当包含 WriteAllBytes 和 CreateDirectory: %s", winJS)
 	}
-	if !strings.Contains(winJS, "Remove-Item") {
+	if !strings.Contains(winJS, "[IO.File]::Delete") {
 		t.Errorf("Windows JS 应当处理删除文件: %s", winJS)
 	}
 
 	// POSIX 测试
 	posixJS := SynthesizeDeltaFilesExecJS(files, false)
-	if !strings.Contains(posixJS, "base64 -d") || !strings.Contains(posixJS, "mkdir -p") {
-		t.Errorf("POSIX JS 应当包含 base64 -d 和 mkdir -p: %s", posixJS)
+	if !strings.Contains(posixJS, "base64 --decode") || !strings.Contains(posixJS, "mkdir -p") {
+		t.Errorf("POSIX JS 应当包含 base64 --decode 和 mkdir -p: %s", posixJS)
 	}
 	if !strings.Contains(posixJS, "rm -f") {
 		t.Errorf("POSIX JS 应当处理删除文件: %s", posixJS)
@@ -767,5 +768,24 @@ func TestGenerateLocalTitle(t *testing.T) {
 	}
 }
 
+func TestSplitOversizedPowerShellCommands(t *testing.T) {
+	// 1. 小内容不拆分
+	shortJS := `const out = await tools.exec_command({ cmd: "$c = @'\nsmall\n'@; Set-Content -LiteralPath 'test.html' -Value $c -NoNewline" });`
+	if got := splitOversizedPowerShellCommands(shortJS); got != shortJS {
+		t.Fatalf("短脚本不应被修改: %s", got)
+	}
 
-
+	// 2. 超长（>25KB）自动分块
+	hugeContent := strings.Repeat("<div>SVG content</div>\n", 2000) // ~46,000 字符
+	longJS := fmt.Sprintf("const out = await tools.exec_command({ cmd: `$c = @'\n%s\n'@; Set-Content -LiteralPath 'pelican-bicycle.html' -Value $c -NoNewline -Encoding UTF8` });", hugeContent)
+	got := splitOversizedPowerShellCommands(longJS)
+	if !strings.Contains(got, "Set-Content") || !strings.Contains(got, "Add-Content") {
+		t.Fatalf("超长脚本必须被拆分为 Set-Content + Add-Content: %s", got[:200])
+	}
+	if !strings.Contains(got, "pelican-bicycle.html") {
+		t.Fatalf("拆分后应保留目标路径: %s", got[:200])
+	}
+	if strings.Count(got, "await tools.exec_command") < 2 {
+		t.Fatalf("超长脚本应被拆分为多个 exec_command: %s", got)
+	}
+}

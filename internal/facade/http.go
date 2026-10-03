@@ -16,6 +16,7 @@ import (
 
 	"github.com/oai-prism/oaiprism/internal/config"
 	"github.com/oai-prism/oaiprism/internal/metrics"
+	"github.com/oai-prism/oaiprism/internal/middleware"
 )
 
 // Handler 是兼容门面的 HTTP 层。
@@ -145,15 +146,14 @@ func applyHeaderOverrides(r *http.Request, model, effort *string) (accountID, pr
 	return
 }
 
-// bindLogAccount 把本次运行实际使用的账号写回请求头。
+// bindLogAccount 把本次运行实际使用的账号记进审计上下文。
 //
-// 请求日志中间件在 ServeHTTP 返回后才读取 X-Oaiprism-Account ——
-// 而账号是 Runner 在租约阶段才确定的，外层事先不知道。
-// 在这里写回，明细流水里的"处理账号"才是真实路由结果，而不是 "-"。
+// 账号是 Runner 在租约阶段才确定的，外层事先不知道。不能写回请求头：
+// X-Oaiprism-Account 是客户端可控输入，失败时流水会记下调用方伪造的值。
 // res 可能为 nil（启动即失败，连账号都没租到），此时不写。
 func bindLogAccount(r *http.Request, res *RunResult) {
 	if res != nil && res.AccountID != "" {
-		r.Header.Set(HeaderAccount, res.AccountID)
+		middleware.RecordLogAccount(r, res.AccountID)
 	}
 }
 
@@ -169,6 +169,24 @@ func bindLogAccount(r *http.Request, res *RunResult) {
 // 即使都不带，首条 user 消息（首问）在多轮中也是绝对不变的，取指纹就能让后续轮次
 // 100% 命中同一个账号与项目，彻底杜绝每轮新建 Project 与沙箱重新申请。
 func conversationKey(r *http.Request, body map[string]json.RawMessage, msgs []ChatMessage) string {
+	return scopeKey(r, conversationKeyBase(r, body, msgs))
+}
+
+// scopeKey 给会话键加上调用方（API Key 指纹）前缀，实现租户隔离：
+// 不同 Key 的调用方即使会话标识或首条消息相同，也落在不同的会话链上。
+// 未经鉴权（本机免 Key）时不加前缀。
+func scopeKey(r *http.Request, key string) string {
+	if key == "" {
+		return ""
+	}
+	if t := middleware.Tenant(r.Context()); t != "" {
+		return t + "|" + key
+	}
+	return key
+}
+
+// conversationKeyBase 是未加租户前缀的会话键推导（规则见 conversationKey）。
+func conversationKeyBase(r *http.Request, body map[string]json.RawMessage, msgs []ChatMessage) string {
 	if v := strings.TrimSpace(r.Header.Get(HeaderSession)); v != "" {
 		return "h:" + v
 	}

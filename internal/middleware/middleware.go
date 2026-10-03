@@ -10,10 +10,15 @@ package middleware
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -54,8 +59,31 @@ type CtxKeyLogError struct{}
 // LogErrorBox 是并发安全的错误收集器 —— handler 可能在多个
 // goroutine 里写（流式主流程、心跳、桥回调），落库在另一个 goroutine 读。
 type LogErrorBox struct {
-	mu   sync.Mutex
-	msgs []string
+	mu      sync.Mutex
+	msgs    []string
+	account string
+}
+
+// RecordLogAccount 记录本次请求实际路由到的账号。
+//
+// 不能靠请求头回写：X-Oaiprism-Account 是客户端可控的输入，
+// 失败时流水里就会出现调用方伪造的账号。
+func RecordLogAccount(r *http.Request, accountID string) {
+	if box, ok := r.Context().Value(CtxKeyLogError{}).(*LogErrorBox); ok && accountID != "" {
+		box.mu.Lock()
+		box.account = accountID
+		box.mu.Unlock()
+	}
+}
+
+// LogAccount 取出 RecordLogAccount 记录的账号。
+func LogAccount(ctx context.Context) string {
+	if box, ok := ctx.Value(CtxKeyLogError{}).(*LogErrorBox); ok {
+		box.mu.Lock()
+		defer box.mu.Unlock()
+		return box.account
+	}
+	return ""
 }
 
 func (b *LogErrorBox) append(msg string) {
@@ -342,63 +370,230 @@ func looksLikeUUID(s string) bool {
 
 // ---------------------------- Auth ----------------------------
 
-// APIKeyAuth 校验调用方的 API Key。
+// Tenant 返回本次请求的调用方身份（API Key 指纹）。
 //
-// 细节：用 constant-time 比较。虽然 API Key 不是密码，
-// 但把"比较耗时随前缀匹配长度变化"这种信道留着没有任何好处。
-func APIKeyAuth(keys []string, app *metrics.App, enabled bool, exemptPaths ...string) Middleware {
-	// 预先把 key 存成 []byte，避免每请求分配。
-	valid := make([][]byte, 0, len(keys))
-	for _, k := range keys {
-		if k = strings.TrimSpace(k); k != "" {
-			valid = append(valid, []byte(k))
-		}
+// 用于会话状态的租户隔离：两个不同 Key 的调用方即便发出完全相同的
+// 首条消息，也绝不能共享会话链（上一轮句柄 / 项目 / 历史）。
+// 未经鉴权中间件（或本机免 Key 访问）时返回空串。
+func Tenant(ctx context.Context) string {
+	if v, ok := ctx.Value(ctxKeyPrincipal).(string); ok {
+		return v
 	}
+	return ""
+}
 
-	exempt := map[string]struct{}{
-		"/healthz": {},
-		"/readyz":  {},
-		"/metrics": {},
-	}
-	for _, p := range exemptPaths {
+// WithTenant 写入调用方身份（测试与内部调用用）。
+func WithTenant(ctx context.Context, tenant string) context.Context {
+	return context.WithValue(ctx, ctxKeyPrincipal, tenant)
+}
+
+// tenantOf 把 Key 压成不可逆的短指纹：会话键与日志里只出现指纹，不出现 Key 本身。
+func tenantOf(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return "k:" + hex.EncodeToString(sum[:8])
+}
+
+// AuthOptions 描述鉴权策略。
+type AuthOptions struct {
+	// StaticKeys 来自配置文件（facade.api_keys）。持有者同时具备管理权限 ——
+	// 它们是运维显式下发的，与 Dashboard 签发的普通调用 Key 区分开。
+	StaticKeys []string
+	// DynamicKeys 返回 Dashboard 签发并持久化在 SQLite 里的 Key（可为 nil）。
+	// 每请求调用一次，实现方需自行缓存。
+	DynamicKeys func() []string
+	// AdminToken 校验 /admin/login 签发的会话令牌（可为 nil）。
+	AdminToken func(token string) bool
+	// ExemptPaths 精确豁免（探针端点）。
+	ExemptPaths []string
+	// ExemptPrefixes 前缀豁免（Dashboard 静态资源、OAuth 浏览器回调等）。
+	ExemptPrefixes []string
+	// AdminPrefix 管理端前缀（默认 /admin/）。
+	AdminPrefix string
+	// CORSOrigin 是额外允许的跨域来源（管理端写操作的 Origin 校验用）。
+	CORSOrigin string
+
+	App *metrics.App
+}
+
+// Auth 是统一鉴权中间件。
+//
+// 规则（安全默认值优先）：
+//  1. 没有任何可用 Key（配置与 Dashboard 都为空）时，只放行本机请求 ——
+//     监听 0.0.0.0 却完全不设防，等于把账号池与管理端交给整个局域网；
+//  2. 存在 Key 时，所有非豁免路由都必须带有效 Key（或管理会话令牌）；
+//  3. 管理端（/admin/*）要求更高权限：管理会话令牌、配置文件里的 Key，
+//     或"本机 + 有效 Key"。Dashboard 签发的普通 Key 从远端不能管理账号；
+//  4. 管理端写操作做 Origin 校验，挡住浏览器跨站请求（CSRF / DNS rebinding）。
+//
+// 比较一律 constant-time。
+func Auth(o AuthOptions) Middleware {
+	exempt := map[string]struct{}{"/healthz": {}, "/readyz": {}, "/metrics": {}}
+	for _, p := range o.ExemptPaths {
 		if p = strings.TrimSpace(p); p != "" {
 			exempt[p] = struct{}{}
 		}
 	}
+	static := toByteKeys(o.StaticKeys)
+	adminPrefix := o.AdminPrefix
+	if adminPrefix == "" {
+		adminPrefix = "/admin/"
+	}
+	corsOrigin := strings.TrimRight(strings.TrimSpace(o.CORSOrigin), "/")
 
 	return func(next http.Handler) http.Handler {
-		if !enabled || len(valid) == 0 {
-			return next
-		}
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// 探针端点豁免鉴权：k8s / Docker / 监控系统探针拿 401 会导致容器被反复重启。
 			if _, ok := exempt[r.URL.Path]; ok {
 				next.ServeHTTP(w, r)
 				return
 			}
-
-			// 兼容三种常见携带方式。
-			key := bearerToken(r.Header.Get("Authorization"))
-			if key == "" {
-				key = strings.TrimSpace(r.Header.Get("x-api-key"))
-			}
-			if key == "" {
-				key = strings.TrimSpace(r.Header.Get("api-key"))
-			}
-
-			if !matchAny(valid, key) {
-				if app != nil {
-					app.AuthFailed.Inc()
+			for _, p := range o.ExemptPrefixes {
+				if p != "" && strings.HasPrefix(r.URL.Path, p) {
+					next.ServeHTTP(w, r)
+					return
 				}
-				w.Header().Set("WWW-Authenticate", `Bearer realm="oaiprism"`)
-				w.Header().Set("Content-Type", "application/json; charset=utf-8")
-				w.WriteHeader(http.StatusUnauthorized)
-				_, _ = w.Write([]byte(`{"error":{"message":"API Key 无效或缺失","type":"invalid_request_error","code":"invalid_api_key"}}`))
+			}
+
+			key := requestKey(r)
+			var dynamic [][]byte
+			if o.DynamicKeys != nil {
+				dynamic = toByteKeys(o.DynamicKeys())
+			}
+			isStatic := matchAny(static, key)
+			isAdminToken := key != "" && o.AdminToken != nil && o.AdminToken(key)
+			valid := isStatic || isAdminToken || matchAny(dynamic, key)
+			local := IsLocalRequest(r)
+			anyKeys := len(static) > 0 || len(dynamic) > 0
+
+			switch {
+			case valid:
+			case !anyKeys && local:
+				// 尚未配置任何 Key 的本机单用户场景：放行。
+			default:
+				if o.App != nil {
+					o.App.AuthFailed.Inc()
+				}
+				msg := "API Key 无效或缺失"
+				if !anyKeys {
+					msg = "尚未配置任何 API Key：仅允许本机访问。请在 Dashboard 生成 Key 或配置 facade.api_keys"
+				}
+				writeAuthError(w, http.StatusUnauthorized, "invalid_api_key", msg)
 				return
 			}
-			next.ServeHTTP(w, r)
+
+			if strings.HasPrefix(r.URL.Path, adminPrefix) {
+				if !(isAdminToken || isStatic || local) {
+					writeAuthError(w, http.StatusForbidden, "admin_forbidden",
+						"管理接口仅允许本机、管理员会话或配置文件中的 API Key 访问")
+					return
+				}
+				if !safeAdminOrigin(r, corsOrigin) {
+					writeAuthError(w, http.StatusForbidden, "cross_origin_forbidden", "拒绝跨站管理请求")
+					return
+				}
+			}
+
+			tenant := ""
+			if key != "" && valid {
+				tenant = tenantOf(key)
+			}
+			next.ServeHTTP(w, r.WithContext(WithTenant(r.Context(), tenant)))
 		})
 	}
+}
+
+// APIKeyAuth 是 Auth 的静态 Key 简化版（兼容老调用点与测试）。
+func APIKeyAuth(keys []string, app *metrics.App, enabled bool, exemptPaths ...string) Middleware {
+	if !enabled {
+		return func(next http.Handler) http.Handler { return next }
+	}
+	return Auth(AuthOptions{StaticKeys: keys, ExemptPaths: exemptPaths, App: app})
+}
+
+// requestKey 兼容三种常见携带方式。
+func requestKey(r *http.Request) string {
+	key := bearerToken(r.Header.Get("Authorization"))
+	if key == "" {
+		key = strings.TrimSpace(r.Header.Get("x-api-key"))
+	}
+	if key == "" {
+		key = strings.TrimSpace(r.Header.Get("api-key"))
+	}
+	return key
+}
+
+func toByteKeys(keys []string) [][]byte {
+	out := make([][]byte, 0, len(keys))
+	for _, k := range keys {
+		if k = strings.TrimSpace(k); k != "" {
+			out = append(out, []byte(k))
+		}
+	}
+	return out
+}
+
+func writeAuthError(w http.ResponseWriter, status int, code, msg string) {
+	if status == http.StatusUnauthorized {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="oaiprism"`)
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	body, _ := json.Marshal(map[string]any{"error": map[string]string{
+		"message": msg, "type": "invalid_request_error", "code": code,
+	}})
+	_, _ = w.Write(body)
+}
+
+// IsLocalRequest 判断请求是否来自本机。
+//
+// 两个条件缺一不可：
+//   - 对端地址是回环地址；
+//   - Host 头是 localhost 或 IP 字面量 —— 防 DNS rebinding：恶意网页把
+//     自己的域名解析到 127.0.0.1 后，浏览器发来的 Host 仍是那个域名。
+func IsLocalRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return false
+	}
+	h := r.Host
+	if hh, _, err := net.SplitHostPort(h); err == nil {
+		h = hh
+	}
+	h = strings.Trim(h, "[]")
+	if h == "" || strings.EqualFold(h, "localhost") || strings.HasSuffix(strings.ToLower(h), ".localhost") {
+		return true
+	}
+	return net.ParseIP(h) != nil
+}
+
+// safeAdminOrigin 对管理端写操作做 Origin 校验。
+//
+// 浏览器对跨站请求必带 Origin；非浏览器客户端（curl/脚本）不带，放行。
+// Origin 必须与 Host 同源，或等于配置的 CORS 来源。
+func safeAdminOrigin(r *http.Request, corsOrigin string) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		// 不带 Origin 的跨站请求只可能来自非浏览器；Sec-Fetch-Site 再兜一层。
+		site := r.Header.Get("Sec-Fetch-Site")
+		return site == "" || site == "same-origin" || site == "none"
+	}
+	origin = strings.TrimRight(origin, "/")
+	if corsOrigin != "" && strings.EqualFold(origin, corsOrigin) {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
 }
 
 func bearerToken(h string) string {

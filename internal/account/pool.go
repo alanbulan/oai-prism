@@ -189,9 +189,26 @@ func (p *Pool) Acquire(ctx context.Context, stickyKey string) (*Lease, error) {
 	if stickyKey != "" {
 		if id, ok := p.sticky.Get(stickyKey, now); ok {
 			for _, a := range all {
-				if a.ID == id && a.Available(now) && a.Acquire(now) {
+				if a.ID != id {
+					continue
+				}
+				if a.Available(now) && a.Acquire(now) {
+					// 命中即续期：粘性 TTL 必须按"最后一次使用"计，
+					// 否则活跃会话满 TTL 后照样被换号（项目/会话是账号私有的）。
+					p.sticky.Put(stickyKey, a.ID, now)
 					return &Lease{Account: a, pool: p, key: stickyKey}, nil
 				}
+				// 粘性账号只是并发满了（未冷却、凭据可用）：等它腾出槽位，
+				// 而不是立刻改绑到别的账号 —— 改绑会让会话的项目/沙箱全部作废。
+				if a.Busy(now) {
+					if l := p.waitSticky(ctx, a, stickyKey); l != nil {
+						return l, nil
+					}
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
+				break
 			}
 		}
 	}
@@ -256,6 +273,37 @@ func (p *Pool) Acquire(ctx context.Context, stickyKey string) (*Lease, error) {
 		return nil, fmt.Errorf("%w: 全部 %d 个账号已达并发上限", ErrNoAccount, len(all))
 	}
 	return nil, ErrNoAccount
+}
+
+// waitSticky 在粘性账号满并发时短暂等待其空出槽位。
+//
+// 上限取 pool.max_wait（未配置时 10 秒）：等不到再按常规策略改绑，
+// 门面层会据 BoundAccountID 把续接状态降级为全量上下文，不会拿着
+// 旧账号的项目 ID 去打新账号。
+func (p *Pool) waitSticky(ctx context.Context, a *Account, stickyKey string) *Lease {
+	limit := p.cfg.MaxWait
+	if limit <= 0 {
+		limit = 10 * time.Second
+	}
+	deadline := time.Now().Add(limit)
+	t := time.NewTicker(50 * time.Millisecond)
+	defer t.Stop()
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+		}
+		now := time.Now()
+		if a.Available(now) && a.Acquire(now) {
+			p.sticky.Put(stickyKey, a.ID, now)
+			return &Lease{Account: a, pool: p, key: stickyKey}
+		}
+		if !a.Busy(now) {
+			return nil // 进入冷却或凭据失效：不值得再等
+		}
+	}
+	return nil
 }
 
 // pick 依据策略选一个可用账号。

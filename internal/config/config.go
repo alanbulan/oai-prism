@@ -62,6 +62,13 @@ type ServerConfig struct {
 	// 留空即完全不发 Access-Control-* 头，避免在不需要的场景
 	// 给响应平白增加头部开销。
 	CORSOrigin string `yaml:"cors_origin"`
+
+	// AdminUser / AdminPassword 是 Dashboard 管理员登录凭据。
+	//
+	// 留空表示不开放密码登录：管理端只接受本机请求或配置文件里的 API Key
+	// （见 middleware.Auth）。绝不内置默认密码 —— 内置口令等于没有口令。
+	AdminUser     string `yaml:"admin_user"`
+	AdminPassword string `yaml:"admin_password"`
 }
 
 // TLSConfig 可选服务端 TLS。
@@ -226,6 +233,21 @@ type FacadeConfig struct {
 	APIKeys []string `yaml:"api_keys"` // 空 = 不校验（仅建议本地）
 
 	DefaultModel string `yaml:"default_model"`
+
+	// LocalWorkspaceWrite 允许 chat 接口按 X-Local-Workspace 请求头把上游
+	// 沙箱产物直接写到**网关所在机器**的目录里。
+	//
+	// 默认关闭：这等于让调用方指定网关主机上的任意写入位置。只在网关与
+	// 客户端同机、且调用方可信时开启；开启后也仅接受本机请求。
+	LocalWorkspaceWrite bool `yaml:"local_workspace_write"`
+
+	// UpstreamContinuation 控制是否把会话链里的续接句柄（conversationId /
+	// previousResponseId / codex_listen_snapshot）发给上游。
+	//
+	// 无论开关如何，每轮都发送完整上下文（客户端历史折叠或本地会话链历史注入）——
+	// 实测（2026-10-03）上游不会凭 previousResponseId 替我们拼历史：只发增量时
+	// 第二轮必然失忆。这个开关只决定是否额外附带句柄（沙箱会话延续）。
+	UpstreamContinuation bool `yaml:"upstream_continuation"`
 
 	// Models 把对外模型名映射到 Prism 内部的 model / reasoning effort。
 	// 例：gpt-5-codex-fast -> {model: gpt-5, effort: high}
@@ -851,8 +873,9 @@ func (c *Config) normalize() error {
 		return fmt.Errorf("pool.strategy 非法 %q（可选 round_robin|least_inflight|random|sticky_hash|weighted）", c.Pool.Strategy)
 	}
 
-	if c.Facade.Enabled && len(c.Facade.APIKeys) == 0 {
-		// 不阻断启动，但要明确告警——暴露公网时这是很危险的默认值。
+	if len(c.Facade.APIKeys) == 0 {
+		// 不阻断启动：此时鉴权中间件只放行本机请求（Dashboard 签发 Key 后
+		// 自动转为全量校验）。启动告警由 server.New 输出（这里没有 logger）。
 		c.Facade.APIKeys = nil
 	}
 	return nil
@@ -907,6 +930,13 @@ func applyEnv(c *Config) {
 		c.Facade.APIKeys = splitCSV(v)
 	} else if v := os.Getenv("PROXY_API_KEY"); v != "" {
 		c.Facade.APIKeys = splitCSV(v)
+	}
+
+	if v := os.Getenv(EnvPrefix + "ADMIN_USER"); v != "" {
+		c.Server.AdminUser = strings.TrimSpace(v)
+	}
+	if v := os.Getenv(EnvPrefix + "ADMIN_PASSWORD"); v != "" {
+		c.Server.AdminPassword = v
 	}
 
 	if v := os.Getenv(EnvPrefix + "CORS_ORIGIN"); v != "" {

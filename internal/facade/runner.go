@@ -70,8 +70,34 @@ type RunRequest struct {
 	// 挂 15 分钟才返回是不可接受的，客户端早就超时了。
 	Deadline time.Duration
 
-	// IsAux 标识是否为伴生轻量请求（标题/摘要生成），伴生请求优先复用活跃项目，绝不新建独立项目。
+	// IsAux 标识是否为伴生轻量请求（Codex 标题/摘要生成等），走专用的伴生项目，
+	// 不占用、也不污染会话项目。
 	IsAux bool
+
+	// BoundAccountID 是 ProjectID / ConversationID / PreviousResponseID / 沙箱快照
+	// 这组续接句柄所属的账号（来自会话链）。项目与会话是账号私有资源：
+	// 实际租到的账号与它不同（粘性过期、原账号冷却、换号重试）时，
+	// 这些句柄在新账号上必然 403/404，必须整体作废（Input 本身已是完整上下文）。
+	BoundAccountID string
+	// projectFromChain 标记 ProjectID 来自会话链（而不是调用方显式指定）。
+	projectFromChain bool
+}
+
+// MarkProjectFromChain 标记 ProjectID 来自会话链：作废续接句柄时一并清除。
+func (req *RunRequest) MarkProjectFromChain() { req.projectFromChain = true }
+
+// dropContinuation 作废续接句柄（项目仅在来自会话链时清除）。
+func (req *RunRequest) dropContinuation() {
+	if req.projectFromChain {
+		req.ProjectID = ""
+		req.projectFromChain = false
+	}
+	req.ConversationID = ""
+	req.PreviousResponseID = ""
+	if req.Metadata != nil {
+		delete(req.Metadata, "codex_listen_snapshot")
+	}
+	req.BoundAccountID = ""
 }
 
 // Delta 是一次增量。
@@ -134,8 +160,10 @@ type Runner struct {
 	// sandboxes 按账号缓存沙箱。沙箱令牌不绑定项目，按账号缓存即可，
 	// 省掉每次请求都去 POST /api/backend/1/new 的往返与冷启动。
 	sandboxes *sandboxCache
-	journal   *PendingJournal
-	app       *metrics.App
+	// uploads 记录已上传到项目的图片，避免每轮把历史里的图片重传一遍。
+	uploads *uploadCache
+	journal *PendingJournal
+	app     *metrics.App
 
 	bucketSeq atomic.Uint64
 
@@ -151,6 +179,7 @@ func NewRunner(cfg *config.Config, log *slog.Logger, pool *account.Pool, client 
 		client:         client,
 		projects:       newProjectCache(cfg.Facade.ProjectTTL, cfg.Facade.ProjectPoolSize),
 		sandboxes:      newSandboxCache(cfg.Facade.SandboxTTL),
+		uploads:        newUploadCache(cfg.Facade.ProjectTTL),
 		journal:        NewPendingJournal(),
 		app:            app,
 		accountRetries: 2,
@@ -290,6 +319,14 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 
 	result := &RunResult{AccountID: acct.ID, Started: started}
 
+	// 续接句柄属于别的账号（粘性过期 / 原账号冷却后改绑 / 换号重试）：
+	// 在本账号上它们必然 403/404，整体作废（Input 已是完整上下文）。
+	if req.BoundAccountID != "" && req.BoundAccountID != acct.ID {
+		r.log.Info("续接句柄属于其他账号，已作废",
+			"bound", req.BoundAccountID, "account", acct.ID, "stickyKey", req.StickyKey)
+		req.dropContinuation()
+	}
+
 	// 1) 项目：会话内复用，建工程比推理本身还慢。
 	projectID := req.ProjectID
 	if projectID == "" {
@@ -315,8 +352,10 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	// 调用方身份：真实 Web 每轮都带 metadata.userId
 	//（user-Wx7p... 形态，来自 access_token JWT 的 chatgpt_user_id claim，
 	// playwright 抓包实证）。字段名由 buildStartPayload 的 schema 处理。
-	if req.UserID == "" && acct.Credential().UserID != "" {
-		req.UserID = acct.Credential().UserID
+	// 用局部变量：写回 req 会让换号重试时沿用上一个账号的 userId。
+	userID := req.UserID
+	if userID == "" {
+		userID = cred.UserID
 	}
 
 	// 2) 沙箱：Prism 的 AI 跑在沙箱容器里，start 必须告诉它用哪个沙箱。
@@ -342,7 +381,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	inputItems := req.Input
 	var hasNewUpload bool
 	if projectID != "" {
-		inputItems, hasNewUpload = preprocessInputImages(ctx, r.client, p, projectID, inputItems)
+		inputItems, hasNewUpload = preprocessInputImages(ctx, r.client, p, r.uploads, acct.ID, projectID, inputItems)
 	}
 
 	// 2.5) 工作区同步：若上传了新文件，强制失效同步状态，触发沙箱拉取最新文件
@@ -413,7 +452,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			Metadata:           meta,
 			Model:              req.Model,
 			ReasoningEffort:    req.Effort,
-			UserID:             req.UserID,
+			UserID:             userID,
 			Extra:              req.Extra,
 		})
 		if err != nil {
@@ -424,6 +463,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 				}
 				continue
 			}
+			r.log.Error("start 请求上游失败", "attempt", attempt, "err", err, "convID", req.ConversationID, "prevRespID", req.PreviousResponseID)
 			r.app.ConversationOps.Inc("start", "error")
 			return result, err
 		}
@@ -435,17 +475,26 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			"attempt", attempt, "of", sandboxStartRetries, "reason", sandboxReason(startResp))
 		// 关键保护：仅在主请求且确实持有沙箱容器时才执行失效，绝不让伴生轻量请求误杀主会话的沙箱缓存！
 		// 注意：冷启动 504（"submit prompt again" 或 "gateway timeout"）时容器正在预热，
-		// 绝不能销毁容器重新申请，否则会导致每轮重试都创建新容器并反复冷启动！
-		// 仅在明确断连（sandbox_reconnecting）或在同一容器上连续重试 5 次以上才失效全局容器。
+		// 绝不能销毁容器重新申请，否则会导致每轮重试都创建新容器并反复冷启动
+		//（94d5511 修过一次：阈值 2 会在冷启动期间反复重建容器，必须保持 5）。
+		// 仅在明确断连（sandbox_reconnecting / unable to confirm / disconnected）或在同一容器上连续重试 5 次以上才失效容器。
 		reasonText := strings.ToLower(sandboxReason(startResp))
 		if !req.IsAux && sb.Usable() && projectID != "" {
-			if strings.Contains(reasonText, "reconnecting") || attempt >= 5 {
-				r.sandboxes.Invalidate(acct.ID)
+			if strings.Contains(reasonText, "reconnecting") ||
+				strings.Contains(reasonText, "unable to confirm") ||
+				strings.Contains(reasonText, "disconnected") ||
+				attempt >= 5 {
+				// 只失效"我们正在用的那一个"：沙箱按账号共享，若别的会话已经
+				// 换上了新容器，不能把它也一起踢掉。
+				r.sandboxes.InvalidateIf(acct.ID, sb)
 				sb = nil // 必须置空本地指针，触发下方重新申请与装配崭新沙箱容器
 			} else {
 				// 普通冷启动或工作区未对齐，保留沙箱容器实例，仅重置项目工作区对齐标记
 				r.sandboxes.InvalidateProject(acct.ID, projectID)
 			}
+		}
+		if attempt == sandboxStartRetries {
+			break // 最后一次仍未就绪：直接报错，不再白等一轮退避和重新装配沙箱
 		}
 		// 线性退避：上游限流窗口是分钟级，固定短间隔只会打在限流上。
 		if serr := sleepCtx(ctx, time.Duration(attempt)*sandboxRetryDelay); serr != nil {
@@ -487,7 +536,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		var tsMap map[string]any
 		if err := json.Unmarshal(turnState, &tsMap); err == nil {
 			if promptStr, ok := tsMap["prompt"].(string); ok && promptStr != "" {
-				r.log.Info("上游组装 Prompt", "bytes", len(promptStr), "head", truncateRunes(promptStr, 500))
+				r.log.Debug("上游组装 Prompt", "bytes", len(promptStr), "head", truncateRunes(promptStr, 500))
 			}
 		}
 	}
@@ -506,6 +555,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		if st.Fail {
 			r.app.ConversationOps.Inc("start", "failed")
 			err := upstreamError(st)
+			r.log.Error("start 初始状态返回失败", "err", err, "reason", st.ErrorReason, "convID", convID, "prevRespID", req.PreviousResponseID)
 			r.journal.MarkTerminal(requestID, "failed", "", err)
 			return result, err
 		}
@@ -1004,7 +1054,11 @@ func isSandboxNotReady(resp *prism.StartResponse) bool {
 		strings.Contains(msg, "submit prompt again"),
 		strings.Contains(msg, "reconnecting to sandbox"),
 		strings.Contains(msg, "synchronization timed out"),
-		strings.Contains(msg, "gateway timeout"):
+		strings.Contains(msg, "gateway timeout"),
+		strings.Contains(msg, "unable to confirm"),
+		strings.Contains(msg, "environment disconnected"),
+		strings.Contains(reason, "unable to confirm"),
+		strings.Contains(reason, "disconnected"):
 		return true
 	}
 	return false
@@ -1042,30 +1096,29 @@ func pollWaitMs(f *config.FacadeConfig) int {
 	return f.PollWaitMs
 }
 
-// ActiveProject 返回当前账号最近活跃的 ProjectID（供伴生轻量请求无缝复用）。
-func (r *Runner) ActiveProject(accountID string) (string, bool) {
-	if r == nil || r.projects == nil {
-		return "", false
+// ForgetProject 丢弃"会话 -> 项目"的缓存绑定（项目在上游已失效时）。
+func (r *Runner) ForgetProject(accountID, stickyKey string) {
+	if r == nil || r.projects == nil || accountID == "" || stickyKey == "" {
+		return
 	}
-	return r.projects.GetActive(accountID, time.Now())
+	r.projects.Invalidate(accountID, stickyKey)
 }
 
 // resolveProject 取（或创建）本轮使用的项目。
 func (r *Runner) resolveProject(ctx context.Context, acct *account.Account, req *RunRequest) (string, error) {
 	f := &r.cfg.Facade
 
-	// 伴生轻量请求（标题/摘要生成）：优先复用活跃项目与沙箱
+	// 伴生轻量请求（标题/摘要生成）：走账号级专用伴生项目。
+	// 绝不借用"最近活跃项目" —— 那是别人会话的工作区，借用等于跨会话读写文件。
 	if req.IsAux {
-		if actProj, ok := r.ActiveProject(acct.ID); ok && actProj != "" {
-			return actProj, nil
-		}
+		unlock := r.projects.Lock(acct.ID, "aux_bucket")
+		defer unlock()
 		if id, ok := r.projects.Get(acct.ID, "aux_bucket", time.Now()); ok {
 			return id, nil
 		}
 		id, err := r.createProject(ctx, acct)
 		if err == nil && id != "" {
 			r.projects.Put(acct.ID, "aux_bucket", id, time.Now())
-			r.projects.PutActive(acct.ID, id, time.Now())
 		}
 		return id, err
 	}
@@ -1086,7 +1139,6 @@ func (r *Runner) resolveProject(ctx context.Context, acct *account.Account, req 
 	}
 
 	if id, ok := r.projects.Get(acct.ID, bucketKey, time.Now()); ok {
-		r.projects.PutActive(acct.ID, id, time.Now())
 		r.app.ProjectOps.Inc("reuse", "hit")
 		return id, nil
 	}
@@ -1095,7 +1147,6 @@ func (r *Runner) resolveProject(ctx context.Context, acct *account.Account, req 
 	defer unlock()
 
 	if id, ok := r.projects.Get(acct.ID, bucketKey, time.Now()); ok {
-		r.projects.PutActive(acct.ID, id, time.Now())
 		r.app.ProjectOps.Inc("reuse", "hit")
 		return id, nil
 	}
@@ -1106,7 +1157,6 @@ func (r *Runner) resolveProject(ctx context.Context, acct *account.Account, req 
 		return "", err
 	}
 	r.projects.Put(acct.ID, bucketKey, id, time.Now())
-	r.projects.PutActive(acct.ID, id, time.Now())
 	r.app.ProjectOps.Inc("create", "ok")
 	return id, nil
 }

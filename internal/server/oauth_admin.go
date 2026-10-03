@@ -90,24 +90,6 @@ func (s *oauthSessionStore) put(sess *oauthSession) {
 	s.byID[sess.ID] = sess
 }
 
-// solePending 返回唯一未完成的会话（没有则 nil，多个则 nil）。
-// 回调 state 对不上时的兜底：管理台单用户场景，恰好一个 pending 即可信。
-func (s *oauthSessionStore) solePending() *oauthSession {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var found *oauthSession
-	for _, old := range s.byState {
-		if old.done {
-			continue
-		}
-		if found != nil {
-			return nil
-		}
-		found = old
-	}
-	return found
-}
-
 func (s *oauthSessionStore) getByState(state string) *oauthSession {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -267,12 +249,9 @@ func (s *Server) ensureOAuthCallbackListener() (string, error) {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			state := r.URL.Query().Get("state")
+			// state 必须精确匹配：它是 OAuth 回调防 CSRF 的唯一凭据。
+			// 早期在匹配不上时"认领唯一进行中的会话"，等于让任意回调绕过 state 校验。
 			sess := oauthSessions.getByState(state)
-			if sess == nil {
-				// 兜底：网关重启会清空内存会话（用户授权期间服务重启的场景），
-				// 此时若恰好只有一个进行中的会话，直接认领它。
-				sess = oauthSessions.solePending()
-			}
 			if sess == nil {
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				_, _ = w.Write([]byte(oauthResultHTML("state 校验失败",

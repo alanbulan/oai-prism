@@ -1,7 +1,9 @@
 package account
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -135,14 +137,9 @@ func (s *SQLiteStore) initSchema() error {
 		return fmt.Errorf("初始化 sqlite 表结构失败: %w", err)
 	}
 
-	// 初始化默认主密钥
-	var keyCount int
-	_ = s.db.QueryRow("SELECT COUNT(*) FROM api_keys").Scan(&keyCount)
-	if keyCount == 0 {
-		_, _ = s.db.Exec("INSERT INTO api_keys (key, name, created_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-			"sk-prism-live-master", "系统默认主调用密钥")
-	}
-
+	// 不再内置默认密钥：写死在源码里的 Key 对所有人公开，等于没有鉴权。
+	// 没有任何 Key 时鉴权中间件只放行本机请求，用户在 Dashboard 生成
+	// 第一把 Key 后自动转为全量校验。
 	return nil
 }
 
@@ -862,6 +859,21 @@ type APIKeyItem struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// DefaultPublicAPIKey 是早期版本自动种入的默认 Key。它写死在源码里，
+// 等于公开；启动时若发现仍在使用会告警，提示轮换。
+const DefaultPublicAPIKey = "sk-prism-live-master"
+
+// NewAPIKey 生成密码学随机的 API Key（128 bit）。
+//
+// 早期用纳秒时间戳拼 Key，能被枚举猜中。
+func NewAPIKey() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("crypto/rand 不可用: " + err.Error())
+	}
+	return "sk-prism-" + hex.EncodeToString(b[:])
+}
+
 // ListAPIKeys 列出所有已授权的 API Keys。
 func (s *SQLiteStore) ListAPIKeys() ([]APIKeyItem, error) {
 	if s == nil {
@@ -918,7 +930,7 @@ func (s *SQLiteStore) SaveAPIKey(item APIKeyItem) error {
 	}
 
 	if item.Key == "" {
-		item.Key = fmt.Sprintf("sk-prism-%d", time.Now().UnixNano())
+		item.Key = NewAPIKey()
 	}
 	if item.Name == "" {
 		item.Name = "新建访问令牌"

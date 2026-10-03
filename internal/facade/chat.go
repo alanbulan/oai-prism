@@ -186,10 +186,12 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 
 	res, runErr := h.runner.Run(r.Context(), runReq, emit)
 	bindLogAccount(r, res)
-	sessionChainPut(runReq.StickyKey, chainConv(res), resReqID(res), resAccount(res), runReq.Model)
-	// 成功回复才记历史：失败的轮次进历史会把"空回答"教给模型。
-	if res != nil && res.Text != "" {
-		sessionChainAppend(runReq.StickyKey, lastUserText(runReq.Input), res.Text)
+	// 成功回复才记历史：失败（含吐了一半就断）的轮次进历史会把残缺回答教给模型。
+	if runErr == nil {
+		sessionChainPut(runReq.StickyKey, chainConv(res), resReqID(res), resAccount(res), runReq.Model)
+		if res != nil && res.Text != "" {
+			sessionChainAppend(runReq.StickyKey, lastUserText(runReq.Input), res.Text)
+		}
 	}
 
 	if runErr != nil {
@@ -217,13 +219,7 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 	var toolCalls []ToolCall
 	if res != nil && len(res.DeltaFiles) > 0 {
 		toolCalls = MapDeltaFilesToToolCalls(res.DeltaFiles, declaredTools)
-		if localWorkspace := r.Header.Get("X-Local-Workspace"); localWorkspace != "" {
-			if err := ApplyLocalWorkspaceFiles(localWorkspace, res.DeltaFiles); err != nil {
-				h.log.Warn("本地工作区文件写入异常", "path", localWorkspace, "err", err)
-			} else {
-				h.log.Info("已成功将文件变更同步写入本地工作区", "path", localWorkspace, "files", len(res.DeltaFiles))
-			}
-		}
+		h.applyLocalWorkspace(r, res.DeltaFiles)
 	}
 
 	fin := finishReason(res)
@@ -268,10 +264,12 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 func (h *Handler) syncChat(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id string, created int64, publicModel string, declaredTools []ChatTool) {
 	res, err := h.runner.Run(r.Context(), runReq, nil)
 	bindLogAccount(r, res)
-	sessionChainPut(runReq.StickyKey, chainConv(res), resReqID(res), resAccount(res), runReq.Model)
 	// 成功回复才记历史：失败的轮次进历史会把"空回答"教给模型。
-	if err == nil && res != nil && res.Text != "" {
-		sessionChainAppend(runReq.StickyKey, lastUserText(runReq.Input), res.Text)
+	if err == nil {
+		sessionChainPut(runReq.StickyKey, chainConv(res), resReqID(res), resAccount(res), runReq.Model)
+		if res != nil && res.Text != "" {
+			sessionChainAppend(runReq.StickyKey, lastUserText(runReq.Input), res.Text)
+		}
 	}
 	if err != nil {
 		status, typ, msg := mapError(err)
@@ -283,13 +281,7 @@ func (h *Handler) syncChat(w http.ResponseWriter, r *http.Request, runReq *RunRe
 	var toolCalls []ToolCall
 	if res != nil && len(res.DeltaFiles) > 0 {
 		toolCalls = MapDeltaFilesToToolCalls(res.DeltaFiles, declaredTools)
-		if localWorkspace := r.Header.Get("X-Local-Workspace"); localWorkspace != "" {
-			if err := ApplyLocalWorkspaceFiles(localWorkspace, res.DeltaFiles); err != nil {
-				h.log.Warn("本地工作区文件写入异常", "path", localWorkspace, "err", err)
-			} else {
-				h.log.Info("已成功将文件变更同步写入本地工作区", "path", localWorkspace, "files", len(res.DeltaFiles))
-			}
-		}
+		h.applyLocalWorkspace(r, res.DeltaFiles)
 	}
 
 	fin := finishReason(res)
@@ -327,6 +319,27 @@ func (h *Handler) syncChat(w http.ResponseWriter, r *http.Request, runReq *RunRe
 		resp.Usage = &ChatUsage{PromptTokens: 0, CompletionTokens: est, TotalTokens: est}
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// applyLocalWorkspace 按 X-Local-Workspace 把上游产物写到**网关所在机器**的目录。
+//
+// 这等于让调用方指定网关主机上的写入位置，所以三重门槛：
+// 配置显式开启（facade.local_workspace_write）、请求来自本机、路径逐个校验。
+func (h *Handler) applyLocalWorkspace(r *http.Request, files []prism.CodexDeltaFile) {
+	localWorkspace := strings.TrimSpace(r.Header.Get("X-Local-Workspace"))
+	if localWorkspace == "" {
+		return
+	}
+	if !h.cfg.Facade.LocalWorkspaceWrite || !middleware.IsLocalRequest(r) {
+		h.log.Warn("忽略 X-Local-Workspace：未开启 facade.local_workspace_write 或请求不是来自本机",
+			"remote", r.RemoteAddr)
+		return
+	}
+	if err := ApplyLocalWorkspaceFiles(localWorkspace, files); err != nil {
+		h.log.Warn("本地工作区文件写入异常", "path", localWorkspace, "err", err)
+		return
+	}
+	h.log.Info("已将文件变更同步写入本地工作区", "path", localWorkspace, "files", len(files))
 }
 
 // stringContent 把纯文本包成 StringOrArray。
