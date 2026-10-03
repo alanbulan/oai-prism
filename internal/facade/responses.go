@@ -122,12 +122,13 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 会话状态持久化继承：从 sessionChain 恢复上轮项目句柄、会话句柄、上轮真实 ResponseID 与沙箱快照
-	chainProj, chainConv, chainPrevResp, _, chainSnap := sessionChainGet(stickyKey)
-	h.log.Info("会话粘性判定", "stickyKey", stickyKey, "hasClientHistory", hasClientHistory, "chainProj", chainProj, "chainPrevResp", chainPrevResp)
+	convIDFromReq := conversationIDFrom(r, rawFields)
+	chainProj, chainConv, chainPrevResp, _, chainSnap := sessionChainLookup(stickyKey, req.PreviousResponseID, convIDFromReq)
+	h.log.Info("会话粘性判定", "stickyKey", stickyKey, "hasClientHistory", hasClientHistory, "chainProj", chainProj, "chainPrevResp", chainPrevResp, "chainConv", chainConv)
 	if runReq.ProjectID == "" && chainProj != "" {
 		runReq.ProjectID = chainProj
 	}
-	runReq.ConversationID = conversationIDFrom(r, rawFields)
+	runReq.ConversationID = convIDFromReq
 	if runReq.ConversationID == "" && chainConv != "" {
 		runReq.ConversationID = chainConv
 	}
@@ -151,12 +152,28 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		runReq.Metadata["codex_listen_snapshot"] = string(chainSnap)
 	}
 
-	// 报文结构与历史保障：
-	// Codex CLI 每轮都会回传全量历史。上游后端发给大模型的 Context 取自首条 System，
-	// 因此无论是否存在 PreviousResponseID，均通过 foldInputHistory 将往轮问答折叠注入首条 System，
-	// 同时将上一轮的 PreviousResponseID 与 codex_listen_snapshot 完整带给上游，
-	// 实现「沙箱状态树接续 + Prompt 上下文历史」双重保障，彻底根治多轮失忆！
-	if hasClientHistory {
+	// 提前将当前会话与会话 ID 和项目 ID 锁定关联，防止伴生并发请求（如标题生成）走漂
+	sessionChainBind(stickyKey, runReq.ConversationID, runReq.ProjectID)
+
+	// 多轮会话状态树承接与增量续传机制：
+	// 上游服务端自身具备完备的状态树与对话记录表（由 conversationId 与 previousResponseId 唯一确定）。
+	// 在客户端未主动发起上下文压缩（在压缩之前）的常规多轮中：
+	// 只要当前会话已持有上一轮响应句柄（PreviousResponseID != ""），
+	// 绝不可将往轮数十 KB 的全量日志拼成超大 System Prompt 发送！
+	// 必须仅发送首条纯净 System 指令与本轮自上次回复以来的增量消息（Incremental Input），
+	// 请求体永远保持在数 KB，彻底根除 16K/超大请求限制报错，同时实现远程项目/会话无缝承接。
+	if runReq.PreviousResponseID != "" {
+		runReq.Input = extractIncrementalInput(input)
+		h.log.Info("会话承接：启用增量续传模式",
+			"stickyKey", stickyKey,
+			"previousResponseId", runReq.PreviousResponseID,
+			"totalItems", len(input),
+			"incrementalItems", len(runReq.Input),
+			"projectID", runReq.ProjectID,
+			"conversationID", runReq.ConversationID,
+		)
+	} else if hasClientHistory {
+		// 首轮或断链重置时，才折叠历史作为初始上下文
 		runReq.Input = foldInputHistory(input)
 	} else {
 		runReq.Input = input
@@ -317,6 +334,7 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 			return
 		}
 	}
+	sessionChainRecordLocalID(runReq.StickyKey, id)
 
 	// 心跳：等待上游期间必须持续发事件保活。
 	//
@@ -373,9 +391,9 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		}
 
 		if runErr != nil && !errors.Is(runErr, context.Canceled) {
-			// HTTP 200 已经发出（SSE 序言），失败只能靠这条事件与
-			// 请求日志的错误摘要体现 —— 不记的话流水里就是一条
-			// "200 + 2ms + 无错误"的迷惑记录。
+			if strings.Contains(runErr.Error(), "previousResponseId") || strings.Contains(runErr.Error(), "not found") {
+				sessionChainResetPrevious(runReq.StickyKey)
+			}
 			middleware.RecordLogError(r, "responses 流式失败: %v", runErr)
 			buf = AppendResponsesEvent(buf[:0], ResponsesEvent{Type: "response.failed", ResponseID: id, Model: publicModel, CreatedAt: created, Text: runErr.Error()})
 			_ = sw.WriteRaw(buf)
@@ -536,6 +554,7 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 	bindLogAccount(r, res)
 	if !isAux {
 		sessionChainRecord(runReq.StickyKey, res, runReq.Model)
+		sessionChainRecordLocalID(runReq.StickyKey, id)
 		if err == nil && res != nil && res.Text != "" {
 			sessionChainAppend(runReq.StickyKey, lastUserText(runReq.Input), res.Text)
 		}

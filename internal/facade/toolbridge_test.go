@@ -654,4 +654,53 @@ func TestSynthesizeDeltaFilesExecJS(t *testing.T) {
 	}
 }
 
+func TestSafeTruncateOutput(t *testing.T) {
+	shortStr := "hello world"
+	if got := safeTruncateOutput(shortStr, 100); got != shortStr {
+		t.Errorf("短文本不应截断: %s", got)
+	}
+
+	longStr := strings.Repeat("A", 1000) + strings.Repeat("B", 1000)
+	got := safeTruncateOutput(longStr, 200)
+	if len([]rune(got)) >= 2000 {
+		t.Errorf("超长文本未被成功截断")
+	}
+	if !strings.Contains(got, "输出过长，已智能保留首尾") {
+		t.Errorf("截断提示缺失: %s", got)
+	}
+	if !strings.HasPrefix(got, strings.Repeat("A", 100)) {
+		t.Errorf("未正确保留首部")
+	}
+	if !strings.HasSuffix(got, strings.Repeat("B", 100)) {
+		t.Errorf("未正确保留尾部")
+	}
+}
+
+func TestSessionChainLookup(t *testing.T) {
+	sessionChainBind("test-sess-key", "conv-uuid-1", "proj-uuid-1")
+	sessionChainRecord("test-sess-key", &RunResult{
+		ProjectID:      "proj-uuid-1",
+		ConversationID: "conv-uuid-1",
+		ResponseID:     "resp_12345",
+	}, "test-model")
+
+	// 1. 通过原始 key 查找
+	proj, conv, prev, _, _ := sessionChainLookup("test-sess-key", "", "")
+	if proj != "proj-uuid-1" || conv != "conv-uuid-1" || prev != "resp_12345" {
+		t.Fatalf("通过 key 查找失败: proj=%s conv=%s prev=%s", proj, conv, prev)
+	}
+
+	// 2. 通过 previousResponseId 穿透查找（key 改变时）
+	proj2, conv2, prev2, _, _ := sessionChainLookup("different-key", "resp_12345", "")
+	if proj2 != "proj-uuid-1" || conv2 != "conv-uuid-1" || prev2 != "resp_12345" {
+		t.Fatalf("通过 previousResponseId 穿透查找失败: proj=%s conv=%s prev=%s", proj2, conv2, prev2)
+	}
+
+	// 3. 通过 conversationId 查找
+	proj3, conv3, prev3, _, _ := sessionChainLookup("", "", "conv-uuid-1")
+	if proj3 != "proj-uuid-1" || conv3 != "conv-uuid-1" || prev3 != "resp_12345" {
+		t.Fatalf("通过 conversationId 查找失败: proj=%s conv=%s prev=%s", proj3, conv3, prev3)
+	}
+}
+
 

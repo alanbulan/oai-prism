@@ -459,6 +459,7 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 			if strings.TrimSpace(call) == "" {
 				call = textOf(b.Arguments)
 			}
+			call = safeTruncateOutput(call, 6000)
 			items = append(items, prism.NewAssistantItem(
 				"```codex-exec\n"+replayCallText(call)+"\n```"))
 		case "custom_tool_call_output", "function_call_output":
@@ -474,6 +475,7 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 				header += "]"
 			}
 			out := textOf(b.Output)
+			out = safeTruncateOutput(out, 6000)
 
 			// 客户端拒绝执行（工具名与它注册的不一致）。原样回放会让模型
 			// 认定"我的工具不被支持"，于是反复要求用户重发任务 —— 表现得
@@ -552,6 +554,18 @@ func truncateRunes(s string, n int) string {
 		return s
 	}
 	return string(r[:n]) + "..."
+}
+
+// safeTruncateOutput 对工具执行结果进行安全截断，防止单次请求输入过大触发上游限制。
+// 超过上限时智能保留首尾各一半，中间明确提示省略字符数。
+func safeTruncateOutput(out string, maxRunes int) string {
+	runes := []rune(out)
+	if len(runes) <= maxRunes {
+		return out
+	}
+	half := maxRunes / 2
+	omitted := len(runes) - maxRunes
+	return string(runes[:half]) + fmt.Sprintf("\n\n... [输出过长，已智能保留首尾，截断省略中间 %d 字符] ...\n\n", omitted) + string(runes[len(runes)-half:])
 }
 
 // replayCallText 把上一轮的工具调用参数渲染成桥约定的 JS 片段。

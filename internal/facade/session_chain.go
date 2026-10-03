@@ -202,6 +202,29 @@ func lastUserText(input []prism.InputItem) string {
 	return ""
 }
 
+// sessionChainBind 在请求开始前预先将 stickyKey 与会话 ID、项目 ID 关联，
+// 确保同一客户端会话在整个生命周期内严格锁定同一个上游会话与项目句柄。
+func sessionChainBind(key, convID, projectID string) {
+	if strings.TrimSpace(key) == "" {
+		return
+	}
+	sessionChain.mu.Lock()
+	defer sessionChain.mu.Unlock()
+	e, ok := sessionChain.entries[key]
+	if !ok {
+		e = &sessionChainEntry{}
+		sessionChain.entries[key] = e
+	}
+	if convID != "" {
+		e.ConversationID = convID
+		sessionChain.entries["cid:"+convID] = e
+	}
+	if projectID != "" {
+		e.ProjectID = projectID
+	}
+	e.UpdatedAt = time.Now()
+}
+
 // sessionChainRecord 统一记录本轮的上游会话句柄、快照与项目。
 func sessionChainRecord(key string, res *RunResult, model string) {
 	if strings.TrimSpace(key) == "" || res == nil {
@@ -232,6 +255,7 @@ func sessionChainRecord(key string, res *RunResult, model string) {
 		sessionChain.entries["prev:"+res.ResponseID] = e
 	} else if res.RequestID != "" && e.ResponseID == "" {
 		e.ResponseID = res.RequestID
+		sessionChain.entries["prev:"+res.RequestID] = e
 	}
 	if res.AccountID != "" {
 		e.AccountID = res.AccountID
@@ -245,18 +269,63 @@ func sessionChainRecord(key string, res *RunResult, model string) {
 	e.UpdatedAt = time.Now()
 }
 
-// sessionChainGet 取本会话已绑定的项目 ID、会话 ID、上轮响应 ID 与沙箱会话快照。
-func sessionChainGet(key string) (projectID, convID, prevRespID, acctID string, snapshot json.RawMessage) {
-	if strings.TrimSpace(key) == "" {
-		return "", "", "", "", nil
+// sessionChainRecordLocalID 将本地生成的临时 response id（如序言 response.created 中下发给下游的 ID）
+// 也关联到当前会话 entry，确保客户端无论下一轮带回临时 ID 还是上游真实终态 ID 都能 100% 续接！
+func sessionChainRecordLocalID(key, localRespID string) {
+	if strings.TrimSpace(key) == "" || strings.TrimSpace(localRespID) == "" {
+		return
 	}
+	sessionChain.mu.Lock()
+	defer sessionChain.mu.Unlock()
+	if e, ok := sessionChain.entries[key]; ok {
+		sessionChain.entries["prev:"+localRespID] = e
+	}
+}
+
+// sessionChainResetPrevious 重置会话的上一轮响应句柄（在断链或重试自愈时使用）
+func sessionChainResetPrevious(key string) {
+	if strings.TrimSpace(key) == "" {
+		return
+	}
+	sessionChain.mu.Lock()
+	defer sessionChain.mu.Unlock()
+	if e, ok := sessionChain.entries[key]; ok {
+		e.ResponseID = ""
+		e.ListenSnapshot = nil
+	}
+}
+
+// sessionChainLookup 取本会话已绑定的项目 ID、会话 ID、上轮响应 ID 与沙箱会话快照。
+// 支持通过 key、previousResponseId 以及 conversationId 多路命中，杜绝换 ID 断链！
+func sessionChainLookup(key, prevRespID, convID string) (projectID, foundConvID, prevResp, acctID string, snapshot json.RawMessage) {
 	sessionChain.mu.RLock()
 	defer sessionChain.mu.RUnlock()
-	e, ok := sessionChain.entries[key]
-	if !ok || time.Since(e.UpdatedAt) > sessionChainTTL {
+
+	var e *sessionChainEntry
+	if key != "" {
+		if entry, ok := sessionChain.entries[key]; ok && time.Since(entry.UpdatedAt) <= sessionChainTTL {
+			e = entry
+		}
+	}
+	if e == nil && prevRespID != "" {
+		if entry, ok := sessionChain.entries["prev:"+prevRespID]; ok && time.Since(entry.UpdatedAt) <= sessionChainTTL {
+			e = entry
+		}
+	}
+	if e == nil && convID != "" {
+		if entry, ok := sessionChain.entries["cid:"+convID]; ok && time.Since(entry.UpdatedAt) <= sessionChainTTL {
+			e = entry
+		}
+	}
+	if e == nil {
 		return "", "", "", "", nil
 	}
 	return e.ProjectID, e.ConversationID, e.ResponseID, e.AccountID, e.ListenSnapshot
+}
+
+// sessionChainGet 取本会话已绑定的项目 ID、会话 ID、上轮响应 ID 与沙箱会话快照。
+func sessionChainGet(key string) (projectID, convID, prevRespID, acctID string, snapshot json.RawMessage) {
+	return sessionChainLookup(key, "", "")
 }
 
 // sessionChainPut 记录本轮的上游会话句柄（兼容老调用点）。

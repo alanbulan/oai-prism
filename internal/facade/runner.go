@@ -518,6 +518,12 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		if st.Usage != nil {
 			result.Usage = st.Usage
 		}
+		if st.ResponseID != "" {
+			result.ResponseID = st.ResponseID
+		}
+		if st.ConversationID != "" {
+			result.ConversationID = st.ConversationID
+		}
 		if len(st.DeltaFiles) > 0 {
 			result.DeltaFiles = st.DeltaFiles
 		}

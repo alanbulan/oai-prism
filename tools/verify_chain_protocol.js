@@ -124,13 +124,22 @@ async function sleep(ms) {
     process.exit(1);
   }
 
-  const respId1 = completed1.response.payload.id;
-  const snap1 = completed1.response.payload.codexListenSnapshot;
-  const text1 = completed1.response.payload.output[0].content[0].text;
+  console.log("Completed 1 原始结构键:", Object.keys(completed1));
+  const payload = completed1.response?.payload || completed1;
+  const respId1 = payload.id || completed1.response_id || completed1.initial?.response_id;
+  const snap1 = payload.codexListenSnapshot || completed1.initial?.codex_listen_snapshot || completed1.codex_listen_snapshot;
+  let text1 = "";
+  if (payload.output && payload.output[0]?.content && payload.output[0].content[0]) {
+    text1 = payload.output[0].content[0].text;
+  } else if (completed1.initial?.text) {
+    text1 = completed1.initial.text;
+  } else if (payload.text) {
+    text1 = payload.text;
+  }
   console.log("第一轮完成！");
   console.log("RespId 1:", respId1);
   console.log("Output 1:", text1);
-  console.log("Snapshot 1:", typeof snap1 === "string" ? snap1.slice(0, 100) : JSON.stringify(snap1).slice(0, 100));
+  console.log("Snapshot 1:", typeof snap1 === "string" ? snap1.slice(0, 100) : JSON.stringify(snap1)?.slice(0, 100));
 
   // ---------- 轮次 2 (增量 input 测试) ----------
   console.log("\n=== 3. 发起第二轮请求 (使用 previousResponseId + 增量 input) ===");
@@ -181,7 +190,15 @@ async function sleep(ms) {
     process.exit(1);
   }
 
-  const text2 = completed2.response.payload.output[0].content[0].text;
+  const p2 = completed2.response?.payload || completed2;
+  let text2 = "";
+  if (p2.output && p2.output[0]?.content && p2.output[0].content[0]) {
+    text2 = p2.output[0].content[0].text;
+  } else if (completed2.initial?.text) {
+    text2 = completed2.initial.text;
+  } else if (p2.text) {
+    text2 = p2.text;
+  }
   console.log("第二轮完成！");
   console.log("Output 2:", text2);
 
