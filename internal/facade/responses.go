@@ -199,22 +199,14 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	isAux := !bridge && len(rawFields["input"]) < 3000 && (toolsStr == "" || toolsStr == "null" || toolsStr == "[]")
 	runReq.IsAux = isAux
 	if isAux {
-		// 客户端标题生成：Codex CLI 会发起带有特定 prompt 的单行标题请求，
-		// 请求上游真实模型生成标题，并将结果规范化包裹为客户端期望的结构化 JSON。
+		// 客户端标题生成：Codex CLI 会发起带有特定 prompt 的单行标题请求。
+		// 严禁向上游发起真实的重量级推理与创建独立项目！
+		// 否则会导致上游单账号并发冲突（Error while processing conversation (403 Forbidden)）、
+		// 浪费沙箱资源，且延迟长达数分钟。
+		// 这里直接由网关从任务上下文中就地提取并极速回包，0ms 响应，彻底杜绝并发踩踏！
 		if strings.Contains(string(rawFields["input"]), "Generate a concise, single-line task title") {
-			if runReq.ProjectID == "" {
-				if chainProj, _, _, _, _ := sessionChainGet(stickyKey); chainProj != "" {
-					runReq.ProjectID = chainProj
-				} else if actProj, ok := h.runner.ActiveProject(accountID); ok {
-					runReq.ProjectID = actProj
-				}
-			}
-			res, err := h.runner.Run(r.Context(), runReq, nil)
-			rawTitle := ""
-			if err == nil && res != nil {
-				rawTitle = res.Text
-			}
-			titleJSON := extractTitleJSON(rawTitle)
+			titleJSON := generateLocalTitle(rawFields["input"])
+			h.log.Info("客户端任务标题已本地秒级生成", "title", titleJSON)
 
 			id := newID("resp_")
 			created := time.Now().Unix()
@@ -763,3 +755,83 @@ func extractTitleJSON(raw string) string {
 	cleaned, _ := json.Marshal(map[string]string{"title": title})
 	return string(cleaned)
 }
+
+// generateLocalTitle 从客户端发送的 input 中提取核心任务文本，本地快速生成简短单行标题，杜绝向上游发请求引发 403 并发冲突。
+func generateLocalTitle(raw json.RawMessage) string {
+	var blocks []struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	_ = json.Unmarshal(raw, &blocks)
+
+	extractText := func(r json.RawMessage) string {
+		if len(r) == 0 {
+			return ""
+		}
+		var s string
+		if json.Unmarshal(r, &s) == nil {
+			return s
+		}
+		var parts []struct {
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(r, &parts) == nil {
+			var sb strings.Builder
+			for _, p := range parts {
+				sb.WriteString(p.Text)
+			}
+			return sb.String()
+		}
+		return string(r)
+	}
+
+	candidate := ""
+	for _, b := range blocks {
+		txt := strings.TrimSpace(extractText(b.Content))
+		if txt == "" {
+			continue
+		}
+		if strings.HasPrefix(txt, "# AGENTS.md") ||
+			strings.HasPrefix(txt, "<permissions") ||
+			strings.HasPrefix(txt, "You are a coding agent") {
+			continue
+		}
+		if strings.Contains(txt, "Generate a concise, single-line task title") {
+			lines := strings.Split(txt, "\n")
+			for _, l := range lines {
+				l = strings.TrimSpace(l)
+				if l != "" && !strings.Contains(l, "Generate a concise") &&
+					!strings.HasPrefix(l, "#") && !strings.HasPrefix(l, "<") {
+					candidate = l
+					break
+				}
+			}
+			continue
+		}
+		candidate = txt
+	}
+
+	if candidate == "" {
+		return `{"title": "任务对话"}`
+	}
+
+	lines := strings.Split(candidate, "\n")
+	firstLine := strings.TrimSpace(lines[0])
+	firstLine = strings.TrimPrefix(firstLine, "- ")
+	firstLine = strings.TrimPrefix(firstLine, "* ")
+	firstLine = strings.TrimSpace(firstLine)
+
+	if idx := strings.Index(firstLine, "[LOCAL_EXECUTION"); idx != -1 {
+		firstLine = strings.TrimSpace(firstLine[:idx])
+	}
+	runes := []rune(firstLine)
+	if len(runes) > 36 {
+		firstLine = string(runes[:33]) + "..."
+	}
+	if firstLine == "" {
+		firstLine = "任务对话"
+	}
+	cleaned, _ := json.Marshal(map[string]string{"title": firstLine})
+	return string(cleaned)
+}
+

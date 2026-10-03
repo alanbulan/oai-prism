@@ -748,4 +748,24 @@ func TestSessionChainLookup(t *testing.T) {
 	}
 }
 
+func TestGenerateLocalTitle(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"role":"system","content":"You are a coding agent"},
+		{"role":"user","content":"# AGENTS.md instructions\n\n<INSTRUCTIONS>..."},
+		{"role":"user","content":"用 HTML 实现一个 SVG，绘制鹈鹕骑自行车的场景，输出到本地文件空间\n\n[LOCAL_EXECUTION_REMINDER]..."},
+		{"role":"user","content":"Generate a concise, single-line task title of at most 36 characters for the following task:"}
+	]`)
+	got := generateLocalTitle(raw)
+	if !strings.Contains(got, "鹈鹕骑自行车") {
+		t.Fatalf("预期从用户任务提取标题，实际得到: %s", got)
+	}
+	var parsed struct {
+		Title string `json:"title"`
+	}
+	if err := json.Unmarshal([]byte(got), &parsed); err != nil || parsed.Title == "" {
+		t.Fatalf("生成的标题必须是合法 JSON 且包含 title 字段: %s", got)
+	}
+}
+
+
 
