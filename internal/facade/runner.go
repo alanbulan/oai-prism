@@ -619,6 +619,13 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		result.Polls++
 		result.PollWait += elapsed
 		r.app.PollRounds.Inc("ok")
+		if result.Polls%10 == 0 {
+			r.log.Info("模型深度思考推理中...",
+				"polls", result.Polls,
+				"elapsed", time.Since(started).Round(time.Second).String(),
+				"model", req.Model,
+			)
+		}
 
 		if st.RequestID != "" {
 			requestID = st.RequestID
