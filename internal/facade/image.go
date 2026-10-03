@@ -17,9 +17,9 @@ var httpClientForImage = &http.Client{
 	Timeout: 15 * time.Second,
 }
 
-// preprocessInputImages 将输入中客户端传入的 base64 或外部图片转存为项目文件，使得上游 Codex 能够正常读取和分析。
+// preprocessInputImages 确保输入中的图片为上游原生支持的 Base64 Data URI input_image 格式。
 func preprocessInputImages(ctx context.Context, client *prism.Client, p prism.Principal, projectID string, items []prism.InputItem) []prism.InputItem {
-	if projectID == "" || len(items) == 0 {
+	if len(items) == 0 {
 		return items
 	}
 
@@ -37,39 +37,40 @@ func preprocessInputImages(ctx context.Context, client *prism.Client, p prism.Pr
 			continue
 		}
 
-		newContents := make([]prism.InputContent, 0, len(item.Content)+1)
+		newContents := make([]prism.InputContent, 0, len(item.Content))
 		for _, c := range item.Content {
 			if c.Type != "input_image" || c.ImageURL == "" {
 				newContents = append(newContents, c)
 				continue
 			}
 
-			// 判断是否是 base64 或外部 HTTP
+			// 如果已经是 Base64 Data URI，直接原样保留原生 input_image
+			if strings.HasPrefix(c.ImageURL, "data:image/") {
+				newContents = append(newContents, c)
+				continue
+			}
+
+			// 外部 HTTP 图片：下载并转为 Base64 Data URI
 			data, ext, ok := extractImageData(ctx, c.ImageURL)
 			if !ok || len(data) == 0 {
 				newContents = append(newContents, c)
 				continue
 			}
 
-			filename := "image_" + randHex(6) + ext
-			// 代上传到项目存储
-			_, err := client.UploadFile(ctx, p, prism.FileUpload{
-				ProjectID: projectID,
-				Path:      filename,
-				Filename:  filename,
-				Data:      data,
-			})
-			if err != nil {
-				// 上传失败时保留原样
-				newContents = append(newContents, c)
-				continue
+			mime := "image/png"
+			switch ext {
+			case ".jpg", ".jpeg":
+				mime = "image/jpeg"
+			case ".webp":
+				mime = "image/webp"
+			case ".gif":
+				mime = "image/gif"
 			}
-
-			// 上传成功：转换为上游原生识别的 input_file
+			b64 := base64.StdEncoding.EncodeToString(data)
 			newContents = append(newContents, prism.InputContent{
-				Type:        "input_file",
-				Filename:    filename,
-				ProjectPath: filename,
+				Type:     "input_image",
+				ImageURL: "data:" + mime + ";base64," + b64,
+				Detail:   c.Detail,
 			})
 		}
 		outItems[i].Content = newContents

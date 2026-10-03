@@ -182,7 +182,39 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	isAux := !bridge && len(rawFields["input"]) < 3000 && (toolsStr == "" || toolsStr == "null" || toolsStr == "[]")
 	runReq.IsAux = isAux
 	if isAux {
-		// 伴生轻量请求（标题/摘要生成）：优先复用活跃项目，绝不新建独立项目，亦不污染会话链
+		// 客户端标题生成专用拦截：Codex CLI 会并发发起带有特定 prompt 的单行标题请求，
+		// 本地毫秒级直接响应合法结构化 JSON，免除上游资源消耗与沙箱并发冲突。
+		if strings.Contains(string(rawFields["input"]), "Generate a concise, single-line task title") {
+			id := newID("resp_")
+			created := time.Now().Unix()
+			titleJSON := `{"title": "Codex Task"}`
+			if req.Stream {
+				setConversationHeader(w, runReq.ConversationID)
+				sw, err := sse.New(w)
+				if err != nil {
+					writeError(w, http.StatusInternalServerError, "server_error", err.Error())
+					return
+				}
+				defer sw.Close()
+				buf := make([]byte, 0, 1024)
+				buf = AppendResponsesEvent(buf[:0], ResponsesEvent{Type: "response.created", ResponseID: id, Model: req.Model, CreatedAt: created})
+				_ = sw.WriteRaw(buf)
+				_ = emitTextResponseEvents(sw, &buf, id, req.Model, created, newID("msg_"), titleJSON, nil)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"id": id, "object": "response", "created_at": created, "status": "completed", "model": req.Model,
+				"output": []any{
+					map[string]any{
+						"type": "message", "id": newID("msg_"), "role": "assistant", "status": "completed",
+						"content": []any{map[string]any{"type": "output_text", "text": titleJSON}},
+					},
+				},
+			})
+			return
+		}
+
+		// 其它伴生轻量请求：优先复用活跃项目，绝不新建独立项目，亦不污染会话链
 		if runReq.ProjectID == "" {
 			if chainProj, _, _, _, _ := sessionChainGet(stickyKey); chainProj != "" {
 				runReq.ProjectID = chainProj

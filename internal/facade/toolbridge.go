@@ -432,11 +432,15 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 				// 已集中合并进首条 System 消息，跳过
 				continue
 			}
-			text := contentText(b.Content)
 			if role == "assistant" {
-				items = append(items, prism.NewAssistantItem(text))
+				items = append(items, prism.NewAssistantItem(contentText(b.Content)))
 			} else {
-				items = append(items, prism.NewUserItem(text))
+				content := toInputContent(StringOrArray{raw: b.Content}, true)
+				items = append(items, prism.InputItem{
+					Type:    "message",
+					Role:    "user",
+					Content: content,
+				})
 			}
 		case "custom_tool_call", "function_call":
 			// 上游"上一轮"发出的调用：以它原始的样子回放，
