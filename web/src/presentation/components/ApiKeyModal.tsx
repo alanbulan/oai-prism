@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Modal, Table, Button, Space, Typography, message, Input, Tabs, Popconfirm } from 'antd';
+import { Modal, Table, Button, Space, Typography, message, Input, Tabs, Popconfirm, theme } from 'antd';
 import { KeyOutlined, CopyOutlined, PlusOutlined, DeleteOutlined, CodeOutlined } from '@ant-design/icons';
 import { getApiKey, setApiKey, httpClient } from '../../infrastructure/http/client';
 
@@ -17,6 +17,7 @@ interface ApiKeyItem {
 }
 
 export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
+  const { token } = theme.useToken();
   const [keys, setKeys] = useState<ApiKeyItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [newKeyName, setNewKeyName] = useState('');
@@ -90,7 +91,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
       title: '密钥名称',
       dataIndex: 'name',
       key: 'name',
-      render: (name: string) => <strong style={{ color: '#1677ff' }}>{name}</strong>,
+      render: (name: string) => <Text strong>{name}</Text>,
     },
     {
       title: 'API Key (Bearer Token)',
@@ -177,18 +178,33 @@ resp = client.chat.completions.create(
 )
 print(resp.choices[0].message.content)`;
 
-  const codexExample = `# 本地 Codex CLI 环境变量接入配置：
-export OPENAI_BASE_URL="http://localhost:8787/v1"
-export OPENAI_API_KEY="${firstKey}"
-export PRISM_MODEL="gpt-6.1-sol"
+  const codexExample = `# ~/.codex/config.toml
+model_provider = "oaiprism"
+model = "gpt-6.1-sol"
+model_context_window = 16384
 
-codex "帮我分析代码"`;
+[model_providers.oaiprism]
+name = "oaiprism"
+wire_api = "responses"
+requires_openai_auth = false
+base_url = "http://localhost:8787/v1"
+experimental_bearer_token = "${firstKey}"`;
+
+  const preStyle: React.CSSProperties = {
+    background: 'var(--op-code-bg)',
+    border: `1px solid ${token.colorBorderSecondary}`,
+    padding: 12,
+    borderRadius: 8,
+    fontSize: 12,
+    marginTop: 6,
+    overflowX: 'auto',
+  };
 
   return (
     <Modal
       title={
         <Space>
-          <KeyOutlined style={{ color: '#1677ff' }} />
+          <KeyOutlined style={{ color: token.colorPrimary }} />
           <span>对外 API Key 管理与接入指引</span>
         </Space>
       }
@@ -261,7 +277,7 @@ codex "帮我分析代码"`;
 
                 <div style={{ marginTop: 12 }}>
                   <Text strong><CodeOutlined /> 1. cURL 命令行调用示例：</Text>
-                  <pre style={{ background: '#f5f5f5', padding: 12, borderRadius: 6, fontSize: 12, marginTop: 6, position: 'relative' }}>
+                  <pre style={preStyle}>
                     {curlExample}
                   </pre>
                   <Button size="small" icon={<CopyOutlined />} onClick={() => handleCopy(curlExample)}>
@@ -271,14 +287,14 @@ codex "帮我分析代码"`;
 
                 <div style={{ marginTop: 16 }}>
                   <Text strong><CodeOutlined /> 2. Python (openai-python) 接入：</Text>
-                  <pre style={{ background: '#f5f5f5', padding: 12, borderRadius: 6, fontSize: 12, marginTop: 6 }}>
+                  <pre style={preStyle}>
                     {pythonExample}
                   </pre>
                 </div>
 
                 <div style={{ marginTop: 16 }}>
-                  <Text strong><CodeOutlined /> 3. Codex CLI / Cursor / VSCode 接入：</Text>
-                  <pre style={{ background: '#f5f5f5', padding: 12, borderRadius: 6, fontSize: 12, marginTop: 6 }}>
+                  <Text strong><CodeOutlined /> 3. Codex CLI 接入（config.toml）：</Text>
+                  <pre style={preStyle}>
                     {codexExample}
                   </pre>
                 </div>

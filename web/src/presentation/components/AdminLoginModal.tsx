@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { Modal, Form, Input, Button, message, Space, Tag } from 'antd';
-import { LockOutlined, UserOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
+import { Modal, Form, Input, Button, message, theme } from 'antd';
+import { LockOutlined, UserOutlined } from '@ant-design/icons';
 import { httpClient, setApiKey } from '../../infrastructure/http/client';
+import { BrandLogo } from './BrandLogo';
 
 interface AdminLoginModalProps {
   open: boolean;
@@ -10,6 +11,7 @@ interface AdminLoginModalProps {
 }
 
 export const AdminLoginModal: React.FC<AdminLoginModalProps> = ({ open, onClose, onSuccess }) => {
+  const { token } = theme.useToken();
   const [loading, setLoading] = useState(false);
   const [form] = Form.useForm();
 
@@ -35,26 +37,15 @@ export const AdminLoginModal: React.FC<AdminLoginModalProps> = ({ open, onClose,
   };
 
   return (
-    <Modal
-      title={
-        <Space>
-          <SafetyCertificateOutlined style={{ color: '#52c41a' }} />
-          <span>管理人登录认证</span>
-        </Space>
-      }
-      open={open}
-      onCancel={onClose}
-      footer={null}
-      width={420}
-      destroyOnHidden
-    >
-      <div style={{ margin: '16px 0 20px', textAlign: 'center' }}>
-        <div style={{ fontSize: 13, color: '#666' }}>
-          请输入超级管理员凭据以进行配置与安全操作
+    <Modal open={open} onCancel={onClose} footer={null} width={400} destroyOnHidden>
+      <div style={{ margin: '12px 0 24px', textAlign: 'center' }}>
+        <BrandLogo size={48} style={{ margin: '0 auto 14px' }} />
+        <div style={{ fontSize: 18, fontWeight: 600, color: token.colorTextHeading }}>管理员登录</div>
+        <div style={{ fontSize: 13, color: token.colorTextSecondary, marginTop: 6, lineHeight: 1.6 }}>
+          密码由网关配置 <code>server.admin_password</code> 设定
+          <br />
+          本机访问使用 API Key 即可管理，无需登录
         </div>
-        <Tag color="blue" style={{ marginTop: 6 }}>
-          密码由网关配置 server.admin_password 设定；本机用 API Key 即可管理
-        </Tag>
       </div>
 
       <Form
@@ -68,7 +59,7 @@ export const AdminLoginModal: React.FC<AdminLoginModalProps> = ({ open, onClose,
           name="username"
           rules={[{ required: true, message: '请输入管理员账号' }]}
         >
-          <Input prefix={<UserOutlined style={{ color: '#aaa' }} />} placeholder="admin" />
+          <Input prefix={<UserOutlined style={{ color: token.colorTextQuaternary }} />} placeholder="admin" />
         </Form.Item>
 
         <Form.Item
@@ -77,14 +68,14 @@ export const AdminLoginModal: React.FC<AdminLoginModalProps> = ({ open, onClose,
           rules={[{ required: true, message: '请输入管理密码' }]}
         >
           <Input.Password
-            prefix={<LockOutlined style={{ color: '#aaa' }} />}
+            prefix={<LockOutlined style={{ color: token.colorTextQuaternary }} />}
             placeholder="server.admin_password"
           />
         </Form.Item>
 
         <Form.Item style={{ marginTop: 24, marginBottom: 8 }}>
           <Button type="primary" htmlType="submit" loading={loading} block style={{ height: 40 }}>
-            立即登录认证
+            登录
           </Button>
         </Form.Item>
       </Form>

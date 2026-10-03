@@ -1,10 +1,25 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>web</title>
+    <meta name="description" content="OAIprism 网关控制台：账号池、API 密钥、调用统计与对话调试" />
+    <meta name="theme-color" content="#4f46e5" />
+    <title>OAIprism · 网关控制台</title>
+    <script>
+      // 首帧前应用主题，避免深色模式下先闪一屏白底
+      (function () {
+        try {
+          var m = localStorage.getItem('oaiprism_theme') || 'system';
+          var dark = m === 'dark' || (m === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
+          var r = document.documentElement;
+          r.dataset.theme = dark ? 'dark' : 'light';
+          r.style.colorScheme = dark ? 'dark' : 'light';
+          r.style.background = dark ? '#0b0d12' : '#f5f6fa';
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

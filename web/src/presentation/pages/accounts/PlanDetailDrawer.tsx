@@ -33,7 +33,7 @@ export const PlanDetailDrawer: React.FC = () => {
       open={detailDrawerOpen}
       onClose={closeDetailDrawer}
     >
-      <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+      <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
         <Descriptions title="账号信息" bordered column={1} size="small">
           <Descriptions.Item label="账号 ID">{selectedAccount.id}</Descriptions.Item>
           <Descriptions.Item label="绑定邮箱">
@@ -92,7 +92,7 @@ export const PlanDetailDrawer: React.FC = () => {
 
         <Descriptions title="运行统计" bordered column={2} size="small">
           <Descriptions.Item label="在途请求">
-            <Text strong style={{ color: selectedAccount.inflight > 0 ? '#1677ff' : '#666' }}>
+            <Text strong type={selectedAccount.inflight > 0 ? 'success' : 'secondary'}>
               {selectedAccount.inflight}
             </Text>
           </Descriptions.Item>

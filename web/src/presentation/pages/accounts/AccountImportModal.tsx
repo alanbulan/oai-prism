@@ -131,7 +131,7 @@ const OAuthImportPane: React.FC<{ onDone: () => void }> = ({ onDone }) => {
           </Text>
           <Space.Compact style={{ width: '100%', marginTop: 6 }}>
             <Input
-              prefix={<LinkOutlined style={{ color: '#aaa' }} />}
+              prefix={<LinkOutlined />}
               placeholder="http://localhost:1455/auth/callback?code=...&state=..."
               value={callbackUrl}
               onChange={(e) => setCallbackUrl(e.target.value)}
@@ -230,7 +230,7 @@ export const AccountImportModal: React.FC = () => {
           }}
         >
           <p className="ant-upload-drag-icon">
-            <InboxOutlined style={{ fontSize: 48, color: '#1677ff' }} />
+            <InboxOutlined />
           </p>
           <p className="ant-upload-text">点击或拖拽 accounts.json 或 cookie.txt 文件到此区域</p>
           <p className="ant-upload-hint">支持单个或批量账号 JSON 配置文件直接解析</p>

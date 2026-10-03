@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Avatar, Button, Card, Dropdown, Input, List, Modal, Popconfirm, Space, Typography, Upload, message } from 'antd';
+import { Avatar, Button, Card, Dropdown, Input, List, Modal, Popconfirm, Space, Typography, Upload, message, theme } from 'antd';
 import {
   RobotOutlined,
   UserOutlined,
@@ -24,6 +24,8 @@ import { Bubble, Sender, ThoughtChain, Prompts } from '@ant-design/x';
 import type { ReasoningEffort } from '../../../domain/chat/entity';
 import { effortsForModel } from '../../../domain/modelFilter';
 import { useChatStore } from '../../../application/chat/store';
+import { BrandLogo } from '../../components/BrandLogo';
+import { SPECTRUM } from '../../theme/tokens';
 
 const { Text } = Typography;
 
@@ -39,14 +41,15 @@ const EFFORT_ORDER: ReasoningEffort[] = ['low', 'medium', 'high', 'xhigh'];
 
 /** HTML/SVG 代码块的渲染预览：iframe 直出 + 源码切换 + 新窗口打开 */
 const HtmlPreview: React.FC<{ code: string; lang: string }> = ({ code, lang }) => {
+  const { token } = theme.useToken();
   const [showSource, setShowSource] = useState(false);
   const blobUrl = useMemo(() => URL.createObjectURL(new Blob([code], { type: 'text/html' })), [code]);
   useEffect(() => () => URL.revokeObjectURL(blobUrl), [blobUrl]);
 
   return (
-    <div style={{ border: '1px solid #e5e7eb', borderRadius: 8, overflow: 'hidden', margin: '8px 0', background: '#fff' }}>
-      <div style={{ background: '#f6f8fa', padding: '4px 10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid #e5e7eb' }}>
-        <span style={{ fontSize: 12, color: '#666' }}>{lang === 'svg' ? 'SVG 渲染预览' : 'HTML 渲染预览'}</span>
+    <div style={{ border: `1px solid ${token.colorBorderSecondary}`, borderRadius: 10, overflow: 'hidden', margin: '8px 0', background: token.colorBgContainer }}>
+      <div style={{ background: token.colorFillQuaternary, padding: '4px 10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: `1px solid ${token.colorBorderSecondary}` }}>
+        <span style={{ fontSize: 12, color: token.colorTextSecondary }}>{lang === 'svg' ? 'SVG 渲染预览' : 'HTML 渲染预览'}</span>
         <Space size={0}>
           <Button type="text" size="small" onClick={() => setShowSource(!showSource)}>
             {showSource ? '渲染结果' : '查看源码'}
@@ -55,7 +58,7 @@ const HtmlPreview: React.FC<{ code: string; lang: string }> = ({ code, lang }) =
         </Space>
       </div>
       {showSource ? (
-        <pre style={{ background: '#f6f8fa', margin: 0, padding: '10px 12px', overflowX: 'auto', fontSize: 12 }}>
+        <pre style={{ background: 'var(--op-code-bg)', margin: 0, padding: '10px 12px', overflowX: 'auto', fontSize: 12 }}>
           <code>{code}</code>
         </pre>
       ) : (
@@ -71,6 +74,7 @@ const HtmlPreview: React.FC<{ code: string; lang: string }> = ({ code, lang }) =
 };
 
 export const ChatPlaygroundPage: React.FC = () => {
+  const { token } = theme.useToken();
   const {
     models,
     allModelIds,
@@ -143,17 +147,17 @@ export const ChatPlaygroundPage: React.FC = () => {
   const promptItems = [
     {
       key: 'p1',
-      icon: <CodeOutlined style={{ color: '#1677ff' }} />,
+      icon: <CodeOutlined style={{ color: SPECTRUM[0] }} />,
       description: '生成一个鹈鹕骑自行车的 SVG，用 HTML 实现',
     },
     {
       key: 'p2',
-      icon: <FileSearchOutlined style={{ color: '#52c41a' }} />,
+      icon: <FileSearchOutlined style={{ color: SPECTRUM[2] }} />,
       description: '测试本地文件修改，查看 Unified Diff 工具调用',
     },
     {
       key: 'p3',
-      icon: <PictureOutlined style={{ color: '#faad14' }} />,
+      icon: <PictureOutlined style={{ color: SPECTRUM[3] }} />,
       description: '上传并分析图片附件，测试多模态输入能力',
     },
   ];
@@ -169,11 +173,10 @@ export const ChatPlaygroundPage: React.FC = () => {
       key: m.id,
       role: m.role,
       placement: (isUser ? 'end' : 'start') as 'end' | 'start',
-      avatar: (
-        <Avatar
-          icon={isUser ? <UserOutlined /> : <RobotOutlined />}
-          style={{ backgroundColor: isUser ? '#1677ff' : '#52c41a' }}
-        />
+      avatar: isUser ? (
+        <Avatar icon={<UserOutlined />} style={{ background: `linear-gradient(135deg, ${token.colorPrimary}, #a855f7)` }} />
+      ) : (
+        <BrandLogo size={32} />
       ),
       content: (
         <div>
@@ -185,7 +188,7 @@ export const ChatPlaygroundPage: React.FC = () => {
                   key={i}
                   src={a.dataUrl}
                   alt={a.name}
-                  style={{ maxWidth: 200, maxHeight: 150, borderRadius: 8, border: '1px solid #eee', objectFit: 'cover' }}
+                  style={{ maxWidth: 200, maxHeight: 150, borderRadius: 8, border: `1px solid ${token.colorBorderSecondary}`, objectFit: 'cover' }}
                 />
               ))}
             </div>
@@ -250,7 +253,7 @@ export const ChatPlaygroundPage: React.FC = () => {
       label: (
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, minWidth: 160 }}>
           <span>{m.name}</span>
-          {m.id === selectedModel && <CheckOutlined style={{ color: '#1677ff' }} />}
+          {m.id === selectedModel && <CheckOutlined style={{ color: token.colorPrimary }} />}
         </div>
       ),
     })),
@@ -265,7 +268,7 @@ export const ChatPlaygroundPage: React.FC = () => {
       label: (
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, minWidth: 120 }}>
           <span>{EFFORT_LABELS[e]}</span>
-          {e === reasoningEffort && <CheckOutlined style={{ color: '#1677ff' }} />}
+          {e === reasoningEffort && <CheckOutlined style={{ color: token.colorPrimary }} />}
         </div>
       ),
     })),
@@ -279,10 +282,11 @@ export const ChatPlaygroundPage: React.FC = () => {
         // 卡片撑满 Content 容器；body 为纵向 flex：会话区撑满、输入区贴底
         body: { padding: 0, flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' },
       }}
-      style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', width: '100%', background: '#fff' }}
+      className="page-fill"
+      style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', width: '100%', boxShadow: token.boxShadowTertiary }}
       title={
         <Space size="small">
-          <RobotOutlined style={{ color: '#1677ff' }} />
+          <RobotOutlined style={{ color: token.colorPrimary }} />
           <span style={{ fontWeight: 600 }}>调试控制台</span>
         </Space>
       }
@@ -298,15 +302,14 @@ export const ChatPlaygroundPage: React.FC = () => {
           style={{
             width: 240,
             flexShrink: 0,
-            borderRight: '1px solid #f0f0f0',
+            borderRight: `1px solid ${token.colorBorderSecondary}`,
             padding: 12,
             display: 'flex',
             flexDirection: 'column',
-            background: '#fff',
             minHeight: 0,
           }}
         >
-          <div style={{ marginBottom: 12, fontWeight: 600, color: '#555', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div style={{ marginBottom: 12, fontWeight: 600, color: token.colorTextSecondary, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <span><BulbOutlined /> 会话列表</span>
             <Text type="secondary" style={{ fontSize: 12 }}>共 {sessions.length} 个</Text>
           </div>
@@ -327,14 +330,14 @@ export const ChatPlaygroundPage: React.FC = () => {
                   padding: '6px 10px',
                   borderRadius: 6,
                   marginBottom: 2,
-                  background: s.id === currentSessionId ? '#e6f4ff' : 'transparent',
+                  background: s.id === currentSessionId ? token.colorPrimaryBg : 'transparent',
                 }}
                 actions={[
                   <Button
                     key="rename"
                     type="text"
                     size="small"
-                    icon={<EditOutlined style={{ color: '#1677ff' }} />}
+                    icon={<EditOutlined />}
                     onClick={(e) => {
                       e.stopPropagation();
                       setRenaming({ id: s.id, title: s.title });
@@ -373,14 +376,14 @@ export const ChatPlaygroundPage: React.FC = () => {
         </div>
 
         {/* 右侧对话主体区（官方 Bubble.List + Sender） */}
-        <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', background: '#fff' }}>
+        <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
           {/* 消息展示区：撑满剩余高度、内部滚动、自动跟随到底 */}
           <div ref={msgListRef} style={{ flex: 1, minHeight: 0, padding: 20, overflowY: 'auto' }}>
             {messages.length === 0 ? (
               <div style={{ textAlign: 'center', marginTop: 60 }}>
-                <RobotOutlined style={{ fontSize: 48, color: '#1677ff' }} />
-                <h3 style={{ marginTop: 16 }}>欢迎体验 OAIprism 交互式调试终端</h3>
-                <p style={{ color: '#888', maxWidth: 500, margin: '0 auto' }}>
+                <BrandLogo size={56} style={{ margin: '0 auto' }} />
+                <h3 style={{ marginTop: 16, color: token.colorTextHeading }}>欢迎体验 OAIprism 交互式调试终端</h3>
+                <p style={{ color: token.colorTextSecondary, maxWidth: 500, margin: '0 auto' }}>
                   直连上游 Prism 代理，模型清单实时来自后端 /v1/models，支持工具调用落盘测试、多模态图片输入与滑动窗口压缩。
                 </p>
                 <div style={{ marginTop: 24, display: 'inline-block', textAlign: 'left' }}>
@@ -410,7 +413,7 @@ export const ChatPlaygroundPage: React.FC = () => {
           )}
 
           {/* 底部输入框（官方 Sender）：模型/强度切换与附件按钮都在输入框内，ChatGPT 式交互 */}
-          <div style={{ padding: '12px 20px 16px', borderTop: '1px solid #f0f0f0', background: '#fff' }}>
+          <div style={{ padding: '12px 20px 16px', borderTop: `1px solid ${token.colorBorderSecondary}` }}>
             <Sender
               value={input}
               onChange={setInput}
@@ -425,7 +428,7 @@ export const ChatPlaygroundPage: React.FC = () => {
                         <img
                           src={a.dataUrl}
                           alt={a.name}
-                          style={{ width: 56, height: 56, objectFit: 'cover', borderRadius: 8, border: '1px solid #eee', display: 'block' }}
+                          style={{ width: 56, height: 56, objectFit: 'cover', borderRadius: 8, border: `1px solid ${token.colorBorderSecondary}`, display: 'block' }}
                         />
                         <Button
                           size="small"
@@ -442,19 +445,19 @@ export const ChatPlaygroundPage: React.FC = () => {
               prefix={
                 <Space size={2} wrap>
                   <Dropdown menu={modelMenu} trigger={['click']} placement="topLeft">
-                    <Button type="text" shape="round" icon={<RobotOutlined style={{ color: '#1677ff' }} />}>
+                    <Button type="text" shape="round" icon={<RobotOutlined style={{ color: token.colorPrimary }} />}>
                       {currentModel?.name || selectedModel}
-                      <DownOutlined style={{ fontSize: 10, color: '#999' }} />
+                      <DownOutlined style={{ fontSize: 10, color: token.colorTextTertiary }} />
                     </Button>
                   </Dropdown>
                   <Dropdown menu={effortMenu} trigger={['click']} placement="topLeft">
-                    <Button type="text" shape="round" icon={<ThunderboltOutlined style={{ color: '#faad14' }} />}>
+                    <Button type="text" shape="round" icon={<ThunderboltOutlined style={{ color: token.colorWarning }} />}>
                       {effortLabel}
-                      <DownOutlined style={{ fontSize: 10, color: '#999' }} />
+                      <DownOutlined style={{ fontSize: 10, color: token.colorTextTertiary }} />
                     </Button>
                   </Dropdown>
                   <Upload accept="image/*" showUploadList={false} beforeUpload={handleAttach}>
-                    <Button type="text" shape="round" icon={<PaperClipOutlined style={{ color: '#1677ff' }} />} title="附加图片（多模态输入）" />
+                    <Button type="text" shape="round" icon={<PaperClipOutlined style={{ color: token.colorPrimary }} />} title="附加图片（多模态输入）" />
                   </Upload>
                 </Space>
               }

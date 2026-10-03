@@ -1,7 +1,8 @@
-import React, { Suspense, lazy, useState } from 'react';
-import { ConfigProvider, App as AntdApp, Spin } from 'antd';
-import zhCN from 'antd/locale/zh_CN';
+import React, { Suspense, lazy, useEffect, useState } from 'react';
+import { Spin } from 'antd';
 import { MainLayout } from './presentation/layouts/MainLayout';
+import { NAV_KEYS, type NavKey } from './presentation/layouts/navKeys';
+import { ThemeProvider } from './presentation/theme/ThemeProvider';
 
 // 按页代码分割：antd + @ant-design/x + plots 体积大，
 // 单 chunk 2.86MB 会让首屏白白等全量下载。lazy 后每页独立分包。
@@ -21,30 +22,36 @@ const PageFallback: React.FC = () => (
   </div>
 );
 
+/** 当前页记录在 URL hash（#/statistics），刷新与分享链接都能回到同一页 */
+function readHash(): NavKey {
+  const k = window.location.hash.replace(/^#\/?/, '');
+  return (NAV_KEYS as readonly string[]).includes(k) ? (k as NavKey) : 'accounts';
+}
+
 export const App: React.FC = () => {
-  const [currentTab, setCurrentTab] = useState('accounts');
+  const [currentTab, setCurrentTab] = useState<NavKey>(readHash);
+
+  useEffect(() => {
+    const onHash = () => setCurrentTab(readHash());
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+
+  const navigate = (k: NavKey) => {
+    if (k === currentTab) return;
+    window.location.hash = `/${k}`;
+  };
 
   return (
-    <ConfigProvider
-      locale={zhCN}
-      theme={{
-        token: {
-          colorPrimary: '#1677ff',
-          borderRadius: 8,
-          fontFamily: `-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial`,
-        },
-      }}
-    >
-      <AntdApp>
-        <MainLayout currentKey={currentTab} onKeyChange={setCurrentTab}>
-          <Suspense fallback={<PageFallback />}>
-            {currentTab === 'accounts' && <AccountsPage />}
-            {currentTab === 'statistics' && <StatisticsPage />}
-            {currentTab === 'chat' && <ChatPlaygroundPage />}
-          </Suspense>
-        </MainLayout>
-      </AntdApp>
-    </ConfigProvider>
+    <ThemeProvider>
+      <MainLayout currentKey={currentTab} onKeyChange={navigate}>
+        <Suspense fallback={<PageFallback />}>
+          {currentTab === 'accounts' && <AccountsPage />}
+          {currentTab === 'statistics' && <StatisticsPage />}
+          {currentTab === 'chat' && <ChatPlaygroundPage />}
+        </Suspense>
+      </MainLayout>
+    </ThemeProvider>
   );
 };
 

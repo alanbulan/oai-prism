@@ -1,256 +1,304 @@
-import React, { useState } from 'react';
-import {
-  Layout,
-  Menu,
-  Typography,
-  Space,
-  Tag,
-  Badge,
-  Button,
-  Breadcrumb,
-  Tooltip,
-  message,
-  Dropdown,
-  Avatar,
-} from 'antd';
+import React, { useEffect, useState } from 'react';
+import { Layout, Menu, Space, Button, Tooltip, message, Dropdown, Avatar, Grid, theme } from 'antd';
+import type { MenuProps } from 'antd';
 import {
   TeamOutlined,
   BarChartOutlined,
   CommentOutlined,
-  ApiOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
-  CloudServerOutlined,
   KeyOutlined,
   UserOutlined,
   SafetyCertificateOutlined,
   LogoutOutlined,
+  GithubOutlined,
+  SunOutlined,
+  MoonOutlined,
+  DesktopOutlined,
+  CheckOutlined,
+  CloudServerOutlined,
 } from '@ant-design/icons';
 import { useAccountStore } from '../../application/account/store';
 import { ApiKeyModal } from '../components/ApiKeyModal';
 import { AdminLoginModal } from '../components/AdminLoginModal';
+import { BrandLogo } from '../components/BrandLogo';
+import { useThemeMode, type ThemeMode } from '../theme/context';
+import { NAV_KEYS, type NavKey } from './navKeys';
 
 const { Header, Sider, Content } = Layout;
-const { Text } = Typography;
+
+const REPO_URL = 'https://github.com/alanbulan/oai-prism';
+
+const NAV: Record<NavKey, { label: string; icon: React.ReactNode; description: string }> = {
+  accounts: {
+    label: '账号与计划池',
+    icon: <TeamOutlined />,
+    description: '上游账号、凭据有效期与调度状态',
+  },
+  statistics: {
+    label: '调用统计',
+    icon: <BarChartOutlined />,
+    description: '吞吐走势、成功率、模型分布与逐笔请求流水',
+  },
+  chat: {
+    label: 'Chat 调试台',
+    icon: <CommentOutlined />,
+    description: '直连网关对话，验证模型、推理强度与多模态输入',
+  },
+};
+
+const THEME_OPTIONS: { key: ThemeMode; label: string; icon: React.ReactNode }[] = [
+  { key: 'light', label: '浅色', icon: <SunOutlined /> },
+  { key: 'dark', label: '深色', icon: <MoonOutlined /> },
+  { key: 'system', label: '跟随系统', icon: <DesktopOutlined /> },
+];
 
 interface MainLayoutProps {
-  currentKey: string;
-  onKeyChange: (key: string) => void;
+  currentKey: NavKey;
+  onKeyChange: (key: NavKey) => void;
   children: React.ReactNode;
 }
 
-export const MainLayout: React.FC<MainLayoutProps> = ({
-  currentKey,
-  onKeyChange,
-  children,
-}) => {
+export const MainLayout: React.FC<MainLayoutProps> = ({ currentKey, onKeyChange, children }) => {
+  const { token } = theme.useToken();
+  const screens = Grid.useBreakpoint();
+  const { mode, isDark, setMode } = useThemeMode();
   const [collapsed, setCollapsed] = useState(false);
-  const { readyCount, totalCount } = useAccountStore();
   const [apiKeyModalOpen, setApiKeyModalOpen] = useState(false);
   const [loginModalOpen, setLoginModalOpen] = useState(false);
+  const { readyCount, totalCount } = useAccountStore();
 
-  const menuItems = [
+  // 顶栏的就绪状态在任何页面都要准确：页面自己没拉账号时由外壳补一次
+  // （子组件 effect 先于外壳执行，loading 已置位说明页面已经在拉，无需重复）
+  useEffect(() => {
+    const st = useAccountStore.getState();
+    if (st.accounts.length === 0 && !st.loading) st.fetchAccounts();
+  }, []);
+
+  const page = NAV[currentKey];
+  const healthy = readyCount > 0;
+  const statusColor = healthy ? token.colorSuccess : token.colorError;
+
+  const menuItems: MenuProps['items'] = [
     {
-      key: 'accounts',
-      icon: <TeamOutlined />,
-      label: '账号与计划池',
-    },
-    {
-      key: 'statistics',
-      icon: <BarChartOutlined />,
-      label: '调用统计看板',
-    },
-    {
-      key: 'chat',
-      icon: <CommentOutlined />,
-      label: 'Chat 调试工作台',
+      type: 'group',
+      label: collapsed ? null : '工作台',
+      children: NAV_KEYS.map((k) => ({ key: k, icon: NAV[k].icon, label: NAV[k].label })),
     },
   ];
 
-  const breadcrumbNameMap: Record<string, string> = {
-    accounts: '账号与计划池',
-    statistics: '调用统计看板',
-    chat: 'Chat 调试工作台',
+  const themeMenu: MenuProps = {
+    selectedKeys: [mode],
+    items: THEME_OPTIONS.map((o) => ({
+      key: o.key,
+      icon: o.icon,
+      label: (
+        <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'space-between', gap: 24, minWidth: 96 }}>
+          {o.label}
+          {mode === o.key && <CheckOutlined style={{ color: token.colorPrimary, fontSize: 12 }} />}
+        </span>
+      ),
+    })),
+    onClick: ({ key }) => setMode(key as ThemeMode),
   };
 
+  const accountMenu: MenuProps = {
+    items: [
+      { key: 'apikey', icon: <KeyOutlined />, label: '对外 API 密钥', onClick: () => setApiKeyModalOpen(true) },
+      { key: 'auth', icon: <SafetyCertificateOutlined />, label: '管理员登录', onClick: () => setLoginModalOpen(true) },
+      { type: 'divider' },
+      {
+        key: 'logout',
+        icon: <LogoutOutlined />,
+        label: '退出 / 重新登录',
+        danger: true,
+        onClick: () => {
+          message.info('请重新认证管理员凭证');
+          setLoginModalOpen(true);
+        },
+      },
+    ],
+  };
+
+  const statusDot = (
+    <span
+      className={healthy ? 'status-dot status-dot--live' : 'status-dot'}
+      style={{ background: statusColor, color: statusColor }}
+    />
+  );
+
   return (
-    <Layout style={{ minHeight: '100vh', overflowX: 'hidden' }}>
-      {/* 企业级浅色侧边栏 */}
+    <Layout style={{ height: '100vh', overflow: 'hidden' }}>
       <Sider
         collapsible
         collapsed={collapsed}
         onCollapse={setCollapsed}
         trigger={null}
-        width={230}
-        theme="light"
-        style={{
-          background: '#ffffff',
-          borderRight: '1px solid #f0f0f0',
-          boxShadow: '0 2px 8px rgba(0, 0, 0, 0.02)',
-          zIndex: 10,
-        }}
+        width={236}
+        collapsedWidth={72}
+        breakpoint="lg"
+        onBreakpoint={(broken) => setCollapsed(broken)}
+        style={{ borderRight: `1px solid ${token.colorBorderSecondary}`, zIndex: 10 }}
       >
-        {/* Logo 与系统标题 */}
-        <div
-          style={{
-            height: 64,
-            display: 'flex',
-            alignItems: 'center',
-            padding: collapsed ? '0 24px' : '0 20px',
-            background: '#ffffff',
-            borderBottom: '1px solid #f0f0f0',
-            overflow: 'hidden',
-            transition: 'all 0.2s',
-          }}
-        >
-          <ApiOutlined style={{ fontSize: 24, color: '#1677ff', flexShrink: 0 }} />
-          {!collapsed && (
-            <div style={{ marginLeft: 12, overflow: 'hidden' }}>
-              <div style={{ color: '#1f2328', fontWeight: 600, fontSize: 16, lineHeight: 1.2 }}>
-                OAIprism
+        <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+          {/* 品牌区 */}
+          <div
+            style={{
+              height: 60,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 10,
+              padding: collapsed ? '0 20px' : '0 18px',
+              flexShrink: 0,
+              overflow: 'hidden',
+            }}
+          >
+            <BrandLogo size={32} />
+            {!collapsed && (
+              <div style={{ lineHeight: 1.15, whiteSpace: 'nowrap' }}>
+                <div style={{ fontWeight: 650, fontSize: 16, letterSpacing: -0.2, color: token.colorTextHeading }}>
+                  OAIprism
+                </div>
+                <div style={{ fontSize: 11, color: token.colorTextTertiary, letterSpacing: 0.4 }}>Gateway Console</div>
               </div>
-              <div style={{ color: '#8c8c8c', fontSize: 11 }}>
-                Codex 代理管理控制台
+            )}
+          </div>
+
+          <Menu
+            mode="inline"
+            selectedKeys={[currentKey]}
+            onClick={(e) => onKeyChange(e.key as NavKey)}
+            items={menuItems}
+            style={{ borderInlineEnd: 0, flex: 1, minHeight: 0, overflowY: 'auto', paddingTop: 4 }}
+          />
+
+          {/* 运行状态卡 */}
+          <div style={{ padding: collapsed ? '12px 0' : 12, flexShrink: 0 }}>
+            {collapsed ? (
+              <Tooltip placement="right" title={`就绪账号 ${readyCount} / ${totalCount}`}>
+                <div style={{ display: 'flex', justifyContent: 'center' }}>{statusDot}</div>
+              </Tooltip>
+            ) : (
+              <div
+                style={{
+                  border: `1px solid ${token.colorBorderSecondary}`,
+                  background: token.colorBgContainer,
+                  borderRadius: 10,
+                  padding: '10px 12px',
+                  fontSize: 12,
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: token.colorText }}>
+                  {statusDot}
+                  <span style={{ fontWeight: 500 }}>{healthy ? '服务就绪' : '无可用账号'}</span>
+                  <span style={{ marginLeft: 'auto', color: token.colorTextSecondary, fontVariantNumeric: 'tabular-nums' }}>
+                    {readyCount} / {totalCount}
+                  </span>
+                </div>
+                <div style={{ marginTop: 6, color: token.colorTextTertiary, display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <CloudServerOutlined />
+                  prism.openai.com
+                </div>
               </div>
-            </div>
-          )}
-        </div>
+            )}
+          </div>
 
-        {/* 侧边菜单栏 */}
-        <Menu
-          theme="light"
-          mode="inline"
-          selectedKeys={[currentKey]}
-          onClick={(e) => onKeyChange(e.key)}
-          items={menuItems}
-          style={{ marginTop: 8, borderRight: 0 }}
-        />
-
-        {/* 底部折叠切换按钮 */}
-        <div
-          style={{
-            position: 'absolute',
-            bottom: 0,
-            width: '100%',
-            height: 48,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            borderTop: '1px solid #f0f0f0',
-            color: '#595959',
-            background: '#fafafa',
-            cursor: 'pointer',
-          }}
-          onClick={() => setCollapsed(!collapsed)}
-        >
-          {collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+          <div
+            onClick={() => setCollapsed(!collapsed)}
+            style={{
+              height: 44,
+              flexShrink: 0,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              borderTop: `1px solid ${token.colorBorderSecondary}`,
+              color: token.colorTextSecondary,
+              cursor: 'pointer',
+            }}
+          >
+            {collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+          </div>
         </div>
       </Sider>
 
-      <Layout style={{ background: '#f5f7fa' }}>
-        {/* 企业级白色顶部栏 */}
+      <Layout style={{ minWidth: 0 }}>
         <Header
           style={{
-            background: '#fff',
-            padding: '0 24px',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
-            borderBottom: '1px solid #f0f0f0',
-            height: 64,
-            lineHeight: '64px',
+            gap: 16,
+            borderBottom: `1px solid ${token.colorBorderSecondary}`,
+            lineHeight: 'normal',
           }}
         >
-          {/* 面包屑 */}
-          <Space size="middle">
-            <Button
-              type="text"
-              icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
-              onClick={() => setCollapsed(!collapsed)}
-              style={{ fontSize: 16, width: 40, height: 40 }}
-            />
-            <Breadcrumb
-              items={[
-                { title: '控制台' },
-                { title: breadcrumbNameMap[currentKey] || '当前页面' },
-              ]}
-            />
-          </Space>
-
-          {/* 右侧状态区 */}
-          <Space size="middle">
-            <Tooltip title="当前后端健康活跃账号数 / 挂载账号总数">
-              <Badge
-                status={readyCount > 0 ? 'success' : 'error'}
-                text={
-                  <Text style={{ fontSize: 13 }}>
-                    就绪: <strong style={{ color: readyCount > 0 ? '#52c41a' : '#ff4d4f' }}>{readyCount}</strong> / {totalCount}
-                  </Text>
-                }
-              />
-            </Tooltip>
-
-            <Tag color="geekblue" icon={<CloudServerOutlined />}>
-              prism.openai.com
-            </Tag>
-
-            {/* 对外 API Key 管理与快速接入入口 */}
-            <Tooltip title="查看与配置对外客户端调用的 API 密钥 (Bearer Token)">
-              <Button
-                icon={<KeyOutlined />}
-                size="small"
-                onClick={() => setApiKeyModalOpen(true)}
-              >
-                API 密钥
-              </Button>
-            </Tooltip>
-
-            {/* 管理员登录与身份入口 */}
-            <Dropdown
-              menu={{
-                items: [
-                  {
-                    key: 'apikey',
-                    icon: <KeyOutlined />,
-                    label: '对外 API 密钥',
-                    onClick: () => setApiKeyModalOpen(true),
-                  },
-                  {
-                    key: 'auth',
-                    icon: <SafetyCertificateOutlined />,
-                    label: '登录认证设置',
-                    onClick: () => setLoginModalOpen(true),
-                  },
-                  { type: 'divider' },
-                  {
-                    key: 'logout',
-                    icon: <LogoutOutlined />,
-                    label: '退出 / 重新登录',
-                    danger: true,
-                    onClick: () => {
-                      message.info('请重新认证管理员凭证');
-                      setLoginModalOpen(true);
-                    },
-                  },
-                ],
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 }}>
+            <div
+              style={{
+                width: 34,
+                height: 34,
+                borderRadius: 9,
+                display: 'grid',
+                placeItems: 'center',
+                fontSize: 16,
+                color: token.colorPrimary,
+                background: token.colorPrimaryBg,
+                flexShrink: 0,
               }}
-              placement="bottomRight"
             >
-              <Space style={{ cursor: 'pointer' }}>
-                <Avatar size="small" icon={<UserOutlined />} style={{ backgroundColor: '#1677ff' }} />
-                <Text style={{ fontSize: 13, fontWeight: 500 }}>管理员</Text>
+              {page.icon}
+            </div>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 16, fontWeight: 600, color: token.colorTextHeading, whiteSpace: 'nowrap' }}>
+                {page.label}
+              </div>
+              {screens.md && (
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: token.colorTextTertiary,
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                  }}
+                >
+                  {page.description}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <Space size={4}>
+            <Dropdown menu={themeMenu} trigger={['click']} placement="bottomRight">
+              <Tooltip title="外观主题">
+                <Button type="text" icon={isDark ? <MoonOutlined /> : <SunOutlined />} />
+              </Tooltip>
+            </Dropdown>
+            <Tooltip title="GitHub 仓库">
+              <Button type="text" icon={<GithubOutlined />} href={REPO_URL} target="_blank" rel="noreferrer" />
+            </Tooltip>
+            <Button icon={<KeyOutlined />} onClick={() => setApiKeyModalOpen(true)} style={{ marginInline: 8 }}>
+              {screens.sm ? 'API 密钥' : null}
+            </Button>
+            <Dropdown menu={accountMenu} placement="bottomRight" trigger={['click']}>
+              <Space size={8} style={{ cursor: 'pointer', padding: '4px 6px', borderRadius: 8 }}>
+                <Avatar
+                  size={28}
+                  icon={<UserOutlined />}
+                  style={{ background: `linear-gradient(135deg, ${token.colorPrimary}, #a855f7)` }}
+                />
+                {screens.md && <span style={{ fontSize: 13, fontWeight: 500, color: token.colorText }}>管理员</span>}
               </Space>
             </Dropdown>
           </Space>
         </Header>
 
-        {/* 页面内容容器：高度 = 100vh - 顶栏 64px - 上下边距 16/20，
-            body 级零滚动条，滚动收敛到各页面内部 */}
+        {/* 内容容器：body 级零滚动条，滚动收敛到各页面内部 */}
         <Content
           style={{
-            margin: '16px 24px 20px',
-            height: 'calc(100vh - 100px)',
+            flex: 1,
             minHeight: 0,
+            padding: '20px 24px',
             overflow: 'hidden',
             display: 'flex',
             flexDirection: 'column',
@@ -259,7 +307,6 @@ export const MainLayout: React.FC<MainLayoutProps> = ({
           {children}
         </Content>
 
-        {/* API 密钥与管理员登录弹窗 */}
         <ApiKeyModal open={apiKeyModalOpen} onClose={() => setApiKeyModalOpen(false)} />
         <AdminLoginModal open={loginModalOpen} onClose={() => setLoginModalOpen(false)} />
       </Layout>

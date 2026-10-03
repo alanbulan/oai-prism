@@ -51,3 +51,6 @@ __pycache__/
 # 临时抓包与测试生成文件
 tools/*.png
 tools/*_logs.json
+
+# Playwright MCP 截图/日志输出
+.playwright-mcp/

@@ -2,7 +2,34 @@
    OAIprism Dashboard 全局样式
    设计目标：页面撑满视口、body 级零滚动条、
    表格区域内部滚动、分页固定底部。
+   颜色一律走下方变量，<html data-theme="dark"> 时整体切换。
    =================================================================== */
+
+:root {
+  --op-code-bg: #f6f8fb;
+  --op-code-border: #e6e9f0;
+  --op-inline-code-bg: rgba(79, 70, 229, 0.07);
+  --op-inline-code-fg: #4338ca;
+  --op-table-border: #e6e9f0;
+  --op-table-head: #f8f9fc;
+  --op-quote: #d0d5dd;
+  --op-muted: #667085;
+  --op-scrollbar: rgba(16, 24, 40, 0.16);
+  --op-scrollbar-hover: rgba(16, 24, 40, 0.28);
+}
+
+html[data-theme='dark'] {
+  --op-code-bg: #0f1218;
+  --op-code-border: #232837;
+  --op-inline-code-bg: rgba(124, 127, 251, 0.14);
+  --op-inline-code-fg: #b4b6ff;
+  --op-table-border: #232837;
+  --op-table-head: #161a22;
+  --op-quote: #344054;
+  --op-muted: #98a2b3;
+  --op-scrollbar: rgba(255, 255, 255, 0.14);
+  --op-scrollbar-hover: rgba(255, 255, 255, 0.26);
+}
 
 html,
 body,
@@ -11,9 +38,85 @@ body,
   padding: 0;
   height: 100%;
   overflow: hidden; /* body 级零滚动条：滚动全部收敛到内容容器内部 */
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
-    'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol',
-    'Noto Color Emoji';
+  font-family: Inter, 'Segoe UI Variable Text', 'Segoe UI', -apple-system, BlinkMacSystemFont,
+    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei UI', 'Microsoft YaHei', 'Helvetica Neue',
+    Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 细滚动条：与浅色/深色背景都协调 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--op-scrollbar) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--op-scrollbar);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--op-scrollbar-hover);
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 运行状态指示点：就绪时带呼吸光晕 */
+.status-dot {
+  position: relative;
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.status-dot--live::after {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  opacity: 0;
+  animation: op-pulse 2s ease-out infinite;
+}
+
+@keyframes op-pulse {
+  0% {
+    transform: scale(0.6);
+    opacity: 0.6;
+  }
+  100% {
+    transform: scale(1.6);
+    opacity: 0;
+  }
+}
+
+/* 页面淡入：切页时不再生硬闪现 */
+.page-fill {
+  animation: op-fade-in 0.24s ease-out;
+}
+
+@keyframes op-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 /* 页面根：填满 Content 容器（Content 高度 = 100vh - 顶栏 64px - 上下边距） */
@@ -138,16 +241,16 @@ body,
 }
 
 .md-body pre {
-  background: #f6f8fa;
-  border: 1px solid #eaecef;
-  border-radius: 8px;
-  padding: 10px 12px;
+  background: var(--op-code-bg);
+  border: 1px solid var(--op-code-border);
+  border-radius: 10px;
+  padding: 12px 14px;
   overflow-x: auto;
   margin: 8px 0;
 }
 
 .md-body code {
-  font-family: 'Cascadia Code', Consolas, 'Courier New', monospace;
+  font-family: 'JetBrains Mono', 'Cascadia Code', 'SF Mono', Consolas, monospace;
   font-size: 13px;
 }
 
@@ -158,7 +261,8 @@ body,
 }
 
 .md-body :not(pre) > code {
-  background: #f0f2f5;
+  background: var(--op-inline-code-bg);
+  color: var(--op-inline-code-fg);
   border-radius: 4px;
   padding: 1px 5px;
 }
@@ -171,13 +275,13 @@ body,
 
 .md-body th,
 .md-body td {
-  border: 1px solid #e8e8e8;
-  padding: 5px 10px;
+  border: 1px solid var(--op-table-border);
+  padding: 6px 10px;
   text-align: left;
 }
 
 .md-body th {
-  background: #fafafa;
+  background: var(--op-table-head);
 }
 
 .md-body ul,
@@ -187,10 +291,10 @@ body,
 }
 
 .md-body blockquote {
-  border-left: 3px solid #d9d9d9;
+  border-left: 3px solid var(--op-quote);
   margin: 8px 0;
   padding: 2px 12px;
-  color: #666;
+  color: var(--op-muted);
 }
 
 .md-body img {

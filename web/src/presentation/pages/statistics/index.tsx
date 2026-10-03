@@ -3,7 +3,7 @@ import {
   Card,
   Row,
   Col,
-  Statistic,
+  Empty,
   Table,
   Space,
   Button,
@@ -14,6 +14,7 @@ import {
   Select,
   Input,
   Tooltip,
+  theme,
 } from 'antd';
 import {
   LineChartOutlined,
@@ -29,6 +30,9 @@ import { stripEffort } from '../../../domain/modelFilter';
 import { useStatisticsStore } from '../../../application/statistics/store';
 import { useAccountStore } from '../../../application/account/store';
 import type { RequestLog } from '../../../domain/statistics/entity';
+import { StatCard } from '../../components/StatCard';
+import { SPECTRUM, MONO_FAMILY } from '../../theme/tokens';
+import { useThemeMode } from '../../theme/context';
 
 const { Text } = Typography;
 
@@ -40,6 +44,9 @@ const fmtDuration = (ms: number) => {
 };
 
 export const StatisticsPage: React.FC = () => {
+  const { token } = theme.useToken();
+  const { isDark } = useThemeMode();
+  const chartTheme = { type: isDark ? 'classicDark' : 'classic', view: { viewFill: 'transparent' } };
   const {
     summary,
     modelUsages,
@@ -84,19 +91,24 @@ export const StatisticsPage: React.FC = () => {
     return `${s}秒`;
   };
 
-  // 折线/面积图配置 (QPS 走势)
+  // 折线/面积图配置 (QPS 走势)：品牌色渐隐填充，深浅主题自适应
   const areaConfig = {
     data: timeSeries,
     xField: 'timestamp',
     yField: 'qps',
-    smooth: true,
+    shapeField: 'smooth',
+    theme: chartTheme,
+    axis: {
+      x: { labelAutoRotate: false, labelAutoHide: true, tick: false },
+      y: { grid: true, gridLineDash: [4, 4], gridStrokeOpacity: 0.6 },
+    },
     style: {
-      fill: 'linear-gradient(-90deg, white 0%, #1677ff 100%)',
-      fillOpacity: 0.35,
+      fill: `linear-gradient(-90deg, ${token.colorBgContainer} 0%, ${token.colorPrimary} 100%)`,
+      fillOpacity: 0.3,
     },
     line: {
       style: {
-        stroke: '#1677ff',
+        stroke: token.colorPrimary,
         lineWidth: 2,
       },
     },
@@ -128,8 +140,8 @@ export const StatisticsPage: React.FC = () => {
       .sort((a, b) => b.requests - a.requests);
   }, [modelUsages, currentModelIds]);
 
-  // 与饼图共享的固定色板（保证图例/列表颜色一一对应）
-  const MODEL_PALETTE = ['#1677ff', '#00c4a3', '#faad14', '#ff7a45', '#9254de', '#2d8cf0'];
+  // 与饼图共享的品牌光谱色板（保证图例/列表颜色一一对应）
+  const MODEL_PALETTE = SPECTRUM;
 
   // 饼图配置 (模型调用分布)
   // 外置 label 关闭 —— 模型名/占比/请求数/均延迟全部由右侧紧凑列表承担，
@@ -138,8 +150,10 @@ export const StatisticsPage: React.FC = () => {
     data: activeUsages,
     angleField: 'requests',
     colorField: 'model',
-    radius: 0.8,
-    innerRadius: 0.6,
+    radius: 0.92,
+    innerRadius: 0.66,
+    theme: chartTheme,
+    style: { stroke: token.colorBgContainer, lineWidth: 2 },
     scale: { color: { range: MODEL_PALETTE } },
     label: false,
     legend: false,
@@ -153,7 +167,7 @@ export const StatisticsPage: React.FC = () => {
       key: 'timestamp',
       width: 170,
       render: (ts: string) => (
-        <Text style={{ fontSize: 13, fontFamily: 'monospace' }}>
+        <Text style={{ fontSize: 13, fontFamily: MONO_FAMILY, fontVariantNumeric: 'tabular-nums' }}>
           {ts ? new Date(ts).toLocaleTimeString() + ' ' + new Date(ts).toLocaleDateString() : '-'}
         </Text>
       ),
@@ -179,7 +193,7 @@ export const StatisticsPage: React.FC = () => {
       render: (p: string, r: RequestLog) => (
         <Space>
           <Tag color="blue">{r.method}</Tag>
-          <span style={{ fontFamily: 'monospace', fontSize: 13 }}>{p}</span>
+          <span style={{ fontFamily: MONO_FAMILY, fontSize: 13 }}>{p}</span>
         </Space>
       ),
     },
@@ -223,7 +237,8 @@ export const StatisticsPage: React.FC = () => {
       render: (ms: number) => (
         <span style={{
           fontWeight: 600,
-          color: ms > 60000 ? '#ff4d4f' : ms > 15000 ? '#faad14' : '#52c41a'
+          fontVariantNumeric: 'tabular-nums',
+          color: ms > 60000 ? token.colorError : ms > 15000 ? token.colorWarning : token.colorSuccess
         }}>
           {fmtDuration(ms)}
         </span>
@@ -241,6 +256,7 @@ export const StatisticsPage: React.FC = () => {
       title: '操作',
       key: 'action',
       width: 80,
+      fixed: 'right' as const,
       render: (_: any, r: RequestLog) => (
         <Button
           type="link"
@@ -260,57 +276,51 @@ export const StatisticsPage: React.FC = () => {
       <Space orientation="vertical" size="large" style={{ width: '100%' }}>
       {/* 顶部真实指标卡片 */}
       <Row gutter={[16, 16]}>
-        <Col xs={24} sm={12} md={6}>
-          <Card hoverable>
-            <Statistic
-              title="累计请求"
-              value={summary?.totalRequests || 0}
-              prefix={<LineChartOutlined style={{ color: '#1677ff' }} />}
-              suffix="次"
-            />
-            <div style={{ marginTop: 8, fontSize: 12, color: '#888' }}>
-              失败 <Text type={summary?.failures ? 'danger' : 'secondary'}>{summary?.failures || 0}</Text> 次
-            </div>
-          </Card>
+        <Col xs={12} xl={6}>
+          <StatCard
+            title="累计请求"
+            value={(summary?.totalRequests || 0).toLocaleString()}
+            suffix="次"
+            icon={<LineChartOutlined />}
+            color={SPECTRUM[0]}
+            loading={loading && !summary}
+            footer={
+              <>
+                失败 <Text type={summary?.failures ? 'danger' : 'secondary'} style={{ fontSize: 12 }}>{summary?.failures || 0}</Text> 次
+              </>
+            }
+          />
         </Col>
-        <Col xs={24} sm={12} md={6}>
-          <Card hoverable>
-            <Statistic
-              title="请求成功率"
-              value={summary?.successRate || 100.0}
-              precision={1}
-              prefix={<CheckCircleOutlined style={{ color: '#52c41a' }} />}
-              suffix="%"
-            />
-            <div style={{ marginTop: 8, fontSize: 12, color: '#888' }}>
-              就绪账号: <strong style={{ color: '#52c41a' }}>{summary?.activeAccounts || 0}</strong> / {summary?.accountsTotal || 0}
-            </div>
-          </Card>
+        <Col xs={12} xl={6}>
+          <StatCard
+            title="请求成功率"
+            value={(summary?.successRate ?? 100).toFixed(1)}
+            suffix="%"
+            icon={<CheckCircleOutlined />}
+            color={token.colorSuccess}
+            loading={loading && !summary}
+            footer={`就绪账号 ${summary?.activeAccounts || 0} / ${summary?.accountsTotal || 0}`}
+          />
         </Col>
-        <Col xs={24} sm={12} md={6}>
-          <Card hoverable>
-            <Statistic
-              title="平均处理耗时"
-              value={summary?.avgLatencyMs ? fmtDuration(summary.avgLatencyMs) : '0 ms'}
-              prefix={<FieldTimeOutlined style={{ color: '#faad14' }} />}
-            />
-            <div style={{ marginTop: 8, fontSize: 12, color: '#888' }}>
-              运行时长: {formatUptime(summary?.uptimeSec)}
-            </div>
-          </Card>
+        <Col xs={12} xl={6}>
+          <StatCard
+            title="平均处理耗时"
+            value={summary?.avgLatencyMs ? fmtDuration(summary.avgLatencyMs) : '0 ms'}
+            icon={<FieldTimeOutlined />}
+            color={token.colorWarning}
+            loading={loading && !summary}
+            footer={`已运行 ${formatUptime(summary?.uptimeSec)}`}
+          />
         </Col>
-        <Col xs={24} sm={12} md={6}>
-          <Card hoverable>
-            <Statistic
-              title="请求明细记录"
-              value={requestLogsTotal}
-              prefix={<ThunderboltOutlined style={{ color: '#722ed1' }} />}
-              suffix="笔"
-            />
-            <div style={{ marginTop: 8, fontSize: 12, color: '#888' }}>
-              SQLite 全量审计 · 每笔真实请求
-            </div>
-          </Card>
+        <Col xs={12} xl={6}>
+          <StatCard
+            title="请求明细记录"
+            value={requestLogsTotal.toLocaleString()}
+            suffix="笔"
+            icon={<ThunderboltOutlined />}
+            color={SPECTRUM[5]}
+            footer="SQLite 全量审计 · 每笔真实请求"
+          />
         </Col>
       </Row>
 
@@ -319,7 +329,7 @@ export const StatisticsPage: React.FC = () => {
         <Col xs={24} lg={14}>
           <Card
             title="请求吞吐走势"
-            style={{ height: '100%', display: 'flex', flexDirection: 'column' }}
+            style={{ height: '100%', display: 'flex', flexDirection: 'column', boxShadow: token.boxShadowTertiary }}
             styles={{ body: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } }}
             extra={
               <Button icon={<ReloadOutlined />} onClick={fetchMetrics} loading={loading}>
@@ -327,13 +337,11 @@ export const StatisticsPage: React.FC = () => {
               </Button>
             }
           >
-            <div style={{ flex: 1, minHeight: 260 }}>
+            <div style={{ height: 280 }}>
               {timeSeries.length > 0 ? (
                 <Area {...areaConfig} autoFit />
               ) : (
-                <div style={{ textAlign: 'center', paddingTop: 100, color: '#999' }}>
-                  暂无请求数据
-                </div>
+                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无请求数据" style={{ paddingTop: 60 }} />
               )}
             </div>
           </Card>
@@ -341,14 +349,14 @@ export const StatisticsPage: React.FC = () => {
         <Col xs={24} lg={10}>
           <Card
             title="模型调用分布"
-            style={{ height: '100%', display: 'flex', flexDirection: 'column' }}
+            style={{ height: '100%', display: 'flex', flexDirection: 'column', boxShadow: token.boxShadowTertiary }}
             styles={{ body: { padding: '12px 16px', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } }}
           >
             {activeUsages.length > 0 ? (
               <Row gutter={8} align="middle" style={{ flex: 1, minHeight: 0 }}>
                 {/* 环形图：外部标签与图例全部关闭，信息由右侧列表承担 */}
                 <Col span={11} style={{ height: '100%', display: 'flex', alignItems: 'center' }}>
-                  <div style={{ width: '100%', height: '100%', minHeight: 220 }}>
+                  <div style={{ width: '100%', height: 260 }}>
                     <Pie {...pieConfig} autoFit />
                   </div>
                 </Col>
@@ -362,7 +370,7 @@ export const StatisticsPage: React.FC = () => {
                         alignItems: 'center',
                         gap: 8,
                         padding: '7px 0',
-                        borderBottom: i < activeUsages.length - 1 ? '1px solid #f5f5f5' : 'none',
+                        borderBottom: i < activeUsages.length - 1 ? `1px solid ${token.colorBorderSecondary}` : 'none',
                       }}
                     >
                       <span
@@ -392,9 +400,7 @@ export const StatisticsPage: React.FC = () => {
                 </Col>
               </Row>
             ) : (
-              <div style={{ textAlign: 'center', paddingTop: 100, color: '#999' }}>
-                暂无调用记录
-              </div>
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无调用记录" style={{ paddingTop: 60 }} />
             )}
           </Card>
         </Col>
@@ -402,12 +408,8 @@ export const StatisticsPage: React.FC = () => {
 
       {/* 核心！每一笔请求明细流水表格 */}
       <Card
-        title={
-          <Space wrap>
-            <LineChartOutlined style={{ color: '#1677ff' }} />
-            <span>请求明细流水</span>
-          </Space>
-        }
+        style={{ boxShadow: token.boxShadowTertiary }}
+        title="请求明细流水"
         extra={
           <Space wrap>
             <Input
@@ -490,7 +492,7 @@ export const StatisticsPage: React.FC = () => {
             <Descriptions.Item label="请求方法与路径">
               <Space size={6} style={{ maxWidth: '100%' }}>
                 <Tag color="blue" style={{ flexShrink: 0 }}>{selectedLog.method}</Tag>
-                <span style={{ fontFamily: 'monospace', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <span style={{ fontFamily: MONO_FAMILY, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {selectedLog.path}
                 </span>
               </Space>
@@ -518,7 +520,7 @@ export const StatisticsPage: React.FC = () => {
               <Text
                 style={{
                   fontSize: 12,
-                  color: '#666',
+                  color: token.colorTextSecondary,
                   display: 'block',
                   wordBreak: 'break-all',
                   whiteSpace: 'normal',
