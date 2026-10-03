@@ -241,10 +241,10 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	created := time.Now().Unix()
 
 	if req.Stream {
-		h.streamResponses(w, r, runReq, id, created, req.Model, bridge, execToolName, execKind, !hasPriorToolResult(rawFields))
+		h.streamResponses(w, r, runReq, id, created, req.Model, bridge, execToolName, execKind)
 		return
 	}
-	h.syncResponses(w, r, runReq, id, created, req.Model, bridge, execToolName, execKind, isAux, !hasPriorToolResult(rawFields))
+	h.syncResponses(w, r, runReq, id, created, req.Model, bridge, execToolName, execKind, isAux)
 }
 
 var responsesKnownFields = map[string]struct{}{
@@ -293,7 +293,7 @@ func responsesConversationKey(r *http.Request, body map[string]json.RawMessage, 
 	return conversationKey(r, body, conv)
 }
 
-func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id string, created int64, publicModel string, bridge bool, execToolName, execKind string, allowNudge bool) {
+func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id string, created int64, publicModel string, bridge bool, execToolName, execKind string) {
 	// 流式头必须早于首帧，只能回显客户端带回来的会话 ID（见 streamChat 注释）。
 	setConversationHeader(w, runReq.ConversationID)
 
@@ -396,46 +396,14 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		}
 		h.log.Info("模型首轮生成文本完成", "text", truncateRunes(text, 100), "hasJS", js != "", "deltaFiles", deltaCount)
 
-		// 防线一：网关自动纠偏重试（Auto-Nudge Retry）
-		// 当模型陷入沙箱消化错觉（口头宣称已创建，或沙箱产生了 DeltaFiles 但未输出 ```codex-exec 围栏），
-		// 且允许纠偏重试（allowNudge 为 true）时，网关在内部自动注入纠偏提示并重试一轮。
-		if js == "" && allowNudge && IsFauxSandboxCompletion(text, deltaCount) {
-			h.log.Info("检测到模型在沙盒内消化操作或口头宣称已创建，自动触发 Bridge Nudge 纠偏重试",
-				"reply", truncateRunes(text, 80), "deltaFiles", deltaCount)
-			retryReq := *runReq
-			retryReq.Input = append(make([]prism.InputItem, 0, len(runReq.Input)+2), runReq.Input...)
-			retryReq.Input = append(retryReq.Input, prism.NewAssistantItem(text))
-			retryReq.Input = append(retryReq.Input, prism.NewUserItem(bridgeRetryNudge(text)))
-			if res != nil && res.ResponseID != "" {
-				retryReq.PreviousResponseID = res.ResponseID
-			}
-
-			var sb2 strings.Builder
-			res2, runErr2 := h.runner.Run(r.Context(), &retryReq, func(d Delta) error {
-				sb2.WriteString(d.Text)
-				return nil
-			})
-			if runErr2 == nil && res2 != nil {
-				text2 := sb2.String()
-				if js0, ok := extractExecBlock(text2); ok {
-					js = ensureExecJS(js0)
-					text = text2
-					res = res2
-					if res.Usage != nil {
-						usage = res.Usage
-					}
-					h.log.Info("Bridge Nudge 纠偏成功，模型已生成本地执行 JS", "text", truncateRunes(text, 80))
-				}
-			}
-		}
-
-		// 防线二：沙箱产物（DeltaFiles）自动转译为本地写入命令
-		// 若经过上述步骤依然未生成本地执行块，但沙箱中确实产生了文件变更，
-		// 网关直接将上游 DeltaFiles 合成为本地 exec_command 执行命令，确保产物 100% 写入用户本地电脑！
+		// 单轮沙箱产物无缝落地：
+		// 若模型未直接输出 codex-exec 围栏，但上游沙盒内产生了文件变更（DeltaFiles），
+		// 网关在当前轮次直接将上游 DeltaFiles 提取并合成为客户端本地 exec_command 执行命令，
+		// 确保输出产物 100% 写入用户本地电脑空间，绝不留在上游沙盒，且无需任何二次重试！
 		if js == "" && res != nil && len(res.DeltaFiles) > 0 {
 			isWin := strings.Contains(strings.ToLower(r.UserAgent()), "windows")
 			js = SynthesizeDeltaFilesExecJS(res.DeltaFiles, isWin)
-			h.log.Info("已自动将上游沙盒内生成的 DeltaFiles 合成为本地执行 JS", "files", len(res.DeltaFiles), "isWin", isWin)
+			h.log.Info("已在当前轮次自动将上游沙盒内生成的 DeltaFiles 合成为本地执行命令", "files", len(res.DeltaFiles), "isWin", isWin)
 		}
 
 
@@ -563,7 +531,7 @@ func emitTextResponseEvents(sw *sse.Writer, buf *[]byte, id, publicModel string,
 	return nil
 }
 
-func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id string, created int64, publicModel string, bridge bool, execToolName, execKind string, isAux bool, allowNudge bool) {
+func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id string, created int64, publicModel string, bridge bool, execToolName, execKind string, isAux bool) {
 	res, err := h.runner.Run(r.Context(), runReq, nil)
 	bindLogAccount(r, res)
 	if !isAux {
@@ -604,46 +572,15 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 		if js0, ok := extractExecBlock(text); ok {
 			js = ensureExecJS(js0)
 		}
-		deltaCount := 0
-		if res != nil {
-			deltaCount = len(res.DeltaFiles)
-		}
 
-		// 防线一：网关自动纠偏重试（Auto-Nudge Retry）
-		if js == "" && allowNudge && IsFauxSandboxCompletion(text, deltaCount) {
-			h.log.Info("检测到模型在沙盒内消化操作或口头宣称已创建，自动触发 Bridge Nudge 纠偏重试 (sync)",
-				"reply", truncateRunes(text, 80), "deltaFiles", deltaCount)
-			retryReq := *runReq
-			retryReq.Input = append(make([]prism.InputItem, 0, len(runReq.Input)+2), runReq.Input...)
-			retryReq.Input = append(retryReq.Input, prism.NewAssistantItem(text))
-			retryReq.Input = append(retryReq.Input, prism.NewUserItem(bridgeRetryNudge(text)))
-			if res != nil && res.ResponseID != "" {
-				retryReq.PreviousResponseID = res.ResponseID
-			}
-			res2, runErr2 := h.runner.Run(r.Context(), &retryReq, nil)
-			if runErr2 == nil && res2 != nil {
-				text2 := res2.Text
-				if js0, ok := extractExecBlock(text2); ok {
-					js = ensureExecJS(js0)
-					text = text2
-					res = res2
-					if res.Usage != nil {
-						usage = &ResponsesUsage{
-							InputTokens:  res.Usage.InputTokens,
-							OutputTokens: res.Usage.OutputTokens,
-							TotalTokens:  res.Usage.TotalTokens,
-						}
-					}
-					h.log.Info("Bridge Nudge 纠偏成功，模型已生成本地执行 JS (sync)", "text", truncateRunes(text, 80))
-				}
-			}
-		}
-
-		// 防线二：沙箱产物（DeltaFiles）自动转译为本地写入命令
+		// 单轮沙箱产物无缝落地：
+		// 若模型未直接输出 codex-exec 围栏，但上游沙盒内产生了文件变更（DeltaFiles），
+		// 网关在当前轮次直接将上游 DeltaFiles 提取并合成为客户端本地 exec_command 执行命令，
+		// 确保输出产物 100% 写入用户本地电脑空间，绝不留在上游沙盒，且无需任何二次重试！
 		if js == "" && res != nil && len(res.DeltaFiles) > 0 {
 			isWin := strings.Contains(strings.ToLower(r.UserAgent()), "windows")
 			js = SynthesizeDeltaFilesExecJS(res.DeltaFiles, isWin)
-			h.log.Info("已自动将上游沙盒内生成的 DeltaFiles 合成为本地执行 JS (sync)", "files", len(res.DeltaFiles), "isWin", isWin)
+			h.log.Info("已在当前轮次自动将上游沙盒内生成的 DeltaFiles 合成为本地执行命令 (sync)", "files", len(res.DeltaFiles), "isWin", isWin)
 		}
 
 		if js != "" {
