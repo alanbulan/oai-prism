@@ -19,6 +19,7 @@
   <a href="https://github.com/alanbulan/oai-prism/stargazers"><img src="https://img.shields.io/github/stars/alanbulan/oai-prism?style=flat-square&logo=github&color=f5c518" alt="Stars"></a>
   <a href="https://github.com/alanbulan/oai-prism/network/members"><img src="https://img.shields.io/github/forks/alanbulan/oai-prism?style=flat-square&logo=github" alt="Forks"></a>
   <a href="https://github.com/alanbulan/oai-prism/commits/master"><img src="https://img.shields.io/github/last-commit/alanbulan/oai-prism?style=flat-square" alt="Last commit"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/alanbulan/oai-prism?style=flat-square&color=blue" alt="License"></a>
 </p>
 
 <p>
@@ -262,6 +263,10 @@ cd web && pnpm install && npx tsc --noEmit && pnpm build
     <img src="https://api.star-history.com/svg?repos=alanbulan/oai-prism&type=Date" alt="Star History Chart" width="100%">
   </picture>
 </a>
+
+## 许可证
+
+[MIT](LICENSE) © 2026 alanbulan
 
 ## 声明
 
