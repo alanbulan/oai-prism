@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/oai-prism/oaiprism/internal/middleware"
 	"github.com/oai-prism/oaiprism/internal/prism"
 	"github.com/oai-prism/oaiprism/internal/sse"
@@ -131,11 +130,6 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	runReq.ConversationID = convIDFromReq
 	if runReq.ConversationID == "" && chainConv != "" {
 		runReq.ConversationID = chainConv
-	}
-	// 首轮尚未绑定上游会话 ID 时，由网关为当前会话生成一个固定的持久会话 ID（对齐 WebUI cdx1_<uuid> 格式）
-	// 确保该会话在整个生命周期内固定不变，彻底解决每次请求新建一个会话记录的根本问题！
-	if runReq.ConversationID == "" {
-		runReq.ConversationID = "cdx1_" + uuid.NewString()
 	}
 
 	// 关键：继承上一轮的真实响应句柄（PreviousResponseID）
