@@ -801,7 +801,8 @@ func generateLocalTitle(raw json.RawMessage) string {
 			for _, l := range lines {
 				l = strings.TrimSpace(l)
 				if l != "" && !strings.Contains(l, "Generate a concise") &&
-					!strings.HasPrefix(l, "#") && !strings.HasPrefix(l, "<") {
+					!strings.HasPrefix(l, "#") && !strings.HasPrefix(l, "<") &&
+					!strings.EqualFold(l, "user prompt:") && !strings.EqualFold(l, "user prompt") {
 					candidate = l
 					break
 				}
@@ -817,6 +818,9 @@ func generateLocalTitle(raw json.RawMessage) string {
 
 	lines := strings.Split(candidate, "\n")
 	firstLine := strings.TrimSpace(lines[0])
+	firstLine = strings.TrimPrefix(firstLine, "User prompt:")
+	firstLine = strings.TrimPrefix(firstLine, "User prompt")
+	firstLine = strings.TrimPrefix(firstLine, ":")
 	firstLine = strings.TrimPrefix(firstLine, "- ")
 	firstLine = strings.TrimPrefix(firstLine, "* ")
 	firstLine = strings.TrimSpace(firstLine)
