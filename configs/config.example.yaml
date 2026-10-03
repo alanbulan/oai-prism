@@ -24,6 +24,11 @@ server:
   # 浏览器直连本代理时才需要填，例如 http://localhost:3000
   cors_origin: ""
 
+  # Dashboard 管理员密码登录（也可用 OAI_PRISM_ADMIN_PASSWORD）。
+  # 留空 = 不开放密码登录：管理端（/admin/*）只接受本机请求或 facade.api_keys 里的 Key。
+  # admin_user: admin
+  # admin_password: ""
+
   tls:
     enabled: false
     cert_file: ""
@@ -165,13 +170,26 @@ pool:
 facade:
   enabled: true
 
-  # 调用方鉴权。留空表示不校验（仅限本机或内网！）
-  # 也可以用环境变量 OAI_PRISM_API_KEYS 传，逗号分隔。
+  # 调用方鉴权（也可以用环境变量 OAI_PRISM_API_KEYS 传，逗号分隔）。
+  #
+  # 有效 Key = 这里配置的 Key ∪ Dashboard 生成的 Key（SQLite）：
+  #   - 两者都为空时只放行本机请求（不再对局域网/公网裸奔）；
+  #   - 这里配置的 Key 同时具备远程管理权限；Dashboard 生成的 Key 只能
+  #     调用 API，管理端（/admin/*）要求本机请求、这里的 Key 或管理员登录。
   api_keys: []
   # api_keys:
   #   - sk-oaiprism-your-secret
 
   default_model: gpt-6.1-sol
+
+  # 是否把会话链里的续接句柄（conversationId / previousResponseId /
+  # codex_listen_snapshot）附带给上游。每轮始终发送完整上下文 —— 实测上游
+  # 不会凭句柄替我们拼历史，只发增量必然失忆；这里只决定是否额外附带句柄。
+  upstream_continuation: false
+
+  # 允许 chat 接口按 X-Local-Workspace 头把上游产物写到网关所在机器的目录。
+  # 默认关闭（等于让调用方指定网关主机上的写入位置）；开启后也只接受本机请求。
+  local_workspace_write: false
 
   # 对外模型名 -> 上游真名 + 推理强度。
   # label 是 /v1/models 里的展示名（可选，不填则不带 name 字段）。
