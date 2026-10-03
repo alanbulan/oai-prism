@@ -736,34 +736,81 @@ func toFunctionArguments(block string) string {
 		}
 	}
 
-	// JS 源码：提取 exec_command({ cmd: "..." }) 里的 cmd 字符串。
+	// JS 源码：提取 exec_command 里的 shell 命令。
 	if cmd, ok := extractJSCmd(trimmed); ok {
 		if b, err := json.Marshal(map[string]string{"cmd": cmd}); err == nil {
 			return string(b)
 		}
 	}
 
-	// 兜底：整段当命令。
-	if b, err := json.Marshal(map[string]string{"cmd": trimmed}); err == nil {
+	// 兜底：剥离 JS 胶水代码，防止把 const out = await tools... 发给 shell 触发语法错误。
+	sanitized := stripJSGlueLines(trimmed)
+	if b, err := json.Marshal(map[string]string{"cmd": sanitized}); err == nil {
 		return string(b)
 	}
 	return `{"cmd":""}`
 }
 
-// extractJSCmd 从 JS 源码里提取 cmd 参数（支持单/双引号、反引号与转义）。
+// extractJSCmd 从 JS 源码里提取需要执行的 shell 命令（支持行内字面量、ES6 属性简写、变量引用、String.raw 模板字符串等全形态）。
 func extractJSCmd(js string) (string, bool) {
-	idx := strings.Index(js, "cmd:")
-	if idx < 0 {
-		idx = strings.Index(js, `"cmd"`)
-		if idx < 0 {
-			return "", false
+	trimmed := strings.TrimSpace(js)
+	if trimmed == "" {
+		return "", false
+	}
+
+	// 1. 优先尝试从定义的变量中提取 (如 const cmd = String.raw`...` 或 let cmd = `...` 或 const script = "...")
+	varNames := []string{"cmd", "command", "script", "psScript", "shCmd"}
+	for _, vName := range varNames {
+		if val, ok := extractVariableDefinition(trimmed, vName); ok {
+			return val, true
 		}
 	}
-	rest := js[idx:]
-	// 跳到第一个引号
+
+	// 2. 尝试从 exec_command({ cmd: ... }) 或 ("cmd": ...) 中提取
+	for _, sig := range []string{"cmd:", `"cmd":`, `'cmd':`, "command:", `"command":`} {
+		idx := strings.Index(trimmed, sig)
+		if idx >= 0 {
+			after := trimmed[idx+len(sig):]
+			trimmedAfter := strings.TrimSpace(after)
+			// 2.1 紧跟引号：字面量
+			if len(trimmedAfter) > 0 && (trimmedAfter[0] == '"' || trimmedAfter[0] == '\'' || trimmedAfter[0] == '`') {
+				if val, ok := extractQuotedString(trimmedAfter); ok {
+					return val, true
+				}
+			}
+			// 2.2 紧跟变量名：提取该变量
+			endVar := strings.IndexAny(trimmedAfter, ",; \r\n}")
+			if endVar > 0 {
+				vName := strings.TrimSpace(trimmedAfter[:endVar])
+				if val, ok := extractVariableDefinition(trimmed, vName); ok {
+					return val, true
+				}
+			}
+		}
+	}
+
+	// 3. 扫描任意带有 = 的变量声明并提取其字符串（如 const x = String.raw`...`）
+	if val, ok := extractAnyAssignedQuotedString(trimmed); ok {
+		return val, true
+	}
+
+	// 4. 强力防胶水代码泄露兜底：
+	// 如果整段文本包含反引号 `...`，且包含 tools.exec_command 或 await tools：
+	// 直接提取反引号内容（因为真正的 shell 脚本都在反引号内）
+	if strings.Contains(trimmed, "tools.") || strings.Contains(trimmed, "await ") {
+		if val, ok := extractQuotedString(trimmed); ok {
+			return val, true
+		}
+	}
+
+	return "", false
+}
+
+// extractQuotedString 从文本中找到第一个引号（` 或 " 或 '）并提取闭合的字符串内容。
+func extractQuotedString(s string) (string, bool) {
 	q := -1
-	for i, r := range rest {
-		if r == '"' || r == '\'' || r == '`' {
+	for i, r := range s {
+		if r == '`' || r == '"' || r == '\'' {
 			q = i
 			break
 		}
@@ -771,11 +818,35 @@ func extractJSCmd(js string) (string, bool) {
 	if q < 0 {
 		return "", false
 	}
-	quote := rest[q]
+	quote := s[q]
 	var sb strings.Builder
 	escaped := false
-	for i := q + 1; i < len(rest); i++ {
-		c := rest[i]
+	for i := q + 1; i < len(s); i++ {
+		c := s[i]
+		if quote == '`' {
+			// JS 反引号模板字符串：保留原始换行与格式
+			if escaped {
+				if c == '`' || c == '\\' {
+					sb.WriteByte(c)
+				} else {
+					sb.WriteByte('\\')
+					sb.WriteByte(c)
+				}
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '`' {
+				return sb.String(), true
+			}
+			sb.WriteByte(c)
+			continue
+		}
+
+		// 单双引号字符串
 		if escaped {
 			switch c {
 			case 'n':
@@ -784,22 +855,87 @@ func extractJSCmd(js string) (string, bool) {
 				sb.WriteByte('\t')
 			case 'r':
 				sb.WriteByte('\r')
+			case '\\', '"', '\'':
+				sb.WriteByte(c)
 			default:
+				sb.WriteByte('\\')
 				sb.WriteByte(c)
 			}
 			escaped = false
 			continue
 		}
-		if c == '\\' && quote != '`' {
+		if c == '\\' {
 			escaped = true
 			continue
 		}
 		if c == quote {
-			return sb.String(), sb.Len() > 0
+			return sb.String(), true
 		}
 		sb.WriteByte(c)
 	}
 	return "", false
+}
+
+// extractVariableDefinition 提取 JS 中指定变量定义的引号内容（支持 String.raw 与普通引号）
+func extractVariableDefinition(js string, varName string) (string, bool) {
+	patterns := []string{
+		"const " + varName,
+		"let " + varName,
+		"var " + varName,
+		varName + " =",
+		varName + "=",
+	}
+	for _, p := range patterns {
+		idx := strings.Index(js, p)
+		if idx >= 0 {
+			eqIdx := strings.Index(js[idx:], "=")
+			if eqIdx >= 0 {
+				afterEq := js[idx+eqIdx+1:]
+				if val, ok := extractQuotedString(afterEq); ok {
+					return val, true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+// extractAnyAssignedQuotedString 扫描任意带有 = 的变量声明并提取其字符串
+func extractAnyAssignedQuotedString(js string) (string, bool) {
+	for _, kw := range []string{"const ", "let ", "var "} {
+		idx := strings.Index(js, kw)
+		if idx >= 0 {
+			eqIdx := strings.Index(js[idx:], "=")
+			if eqIdx >= 0 {
+				afterEq := js[idx+eqIdx+1:]
+				if val, ok := extractQuotedString(afterEq); ok {
+					return val, true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+// stripJSGlueLines 剥离可能残留在命令中的 JS 胶水代码行，避免送入 shell 引发语法错误
+func stripJSGlueLines(text string) string {
+	lines := strings.Split(text, "\n")
+	var kept []string
+	for _, line := range lines {
+		l := strings.TrimSpace(line)
+		if strings.HasPrefix(l, "const ") || strings.HasPrefix(l, "let ") || strings.HasPrefix(l, "var ") {
+			if strings.Contains(l, "tools.exec_command") || strings.Contains(l, "tools.") {
+				continue
+			}
+		}
+		if strings.HasPrefix(l, "const out =") || strings.HasPrefix(l, "const out=") ||
+			strings.HasPrefix(l, "text(") || strings.HasPrefix(l, "exit(") ||
+			strings.HasPrefix(l, "await tools.") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
 }
 
 // customToolCallItemJSON 构造 Responses 协议的 custom_tool_call 条目。

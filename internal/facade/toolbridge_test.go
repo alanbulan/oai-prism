@@ -211,6 +211,19 @@ func TestToFunctionArguments(t *testing.T) {
 	if m["cmd"] != "a\nb" && m["cmd"] != `a\nb` {
 		t.Logf("换行处理: %q（可接受）", m["cmd"])
 	}
+
+	// 关键回归测试（用户本次诊断 Bug）：const cmd = String.raw`...` + { cmd, max_output_tokens: 16000 }
+	userCase := "const cmd = String.raw`\nWrite-Output 'Hello Diagnosis'\nGet-Process\n`;\nconst out = await tools.exec_command({ cmd, max_output_tokens: 16000 });\ntext(out);"
+	args4 := toFunctionArguments(userCase)
+	if err := json.Unmarshal([]byte(args4), &m); err != nil {
+		t.Fatalf("用户诊断场景失败: %s", args4)
+	}
+	if strings.Contains(m["cmd"], "tools.exec_command") || strings.Contains(m["cmd"], "const out =") {
+		t.Fatalf("提取结果绝不能包含 JS 胶水代码: %q", m["cmd"])
+	}
+	if !strings.Contains(m["cmd"], "Write-Output 'Hello Diagnosis'") || !strings.Contains(m["cmd"], "Get-Process") {
+		t.Fatalf("未能正确提取变量中的命令内容: %q", m["cmd"])
+	}
 }
 
 // TestHasPriorToolResult：已有执行结果时不应再注入"你什么都没执行"的纠错。
