@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,12 +19,14 @@ var httpClientForImage = &http.Client{
 	Timeout: 15 * time.Second,
 }
 
-// preprocessInputImages 确保输入中的图片为上游原生支持的 Base64 Data URI input_image 格式。
-func preprocessInputImages(ctx context.Context, client *prism.Client, p prism.Principal, projectID string, items []prism.InputItem) []prism.InputItem {
+// preprocessInputImages 将输入中的图片（Base64/URL/本地路径）真实上传至项目工作区，
+// 并按官方 WebUI 规范转换为 input_file（路径为 /prism-uploads/<filename>），使上游模型能完整读取图片像素。
+func preprocessInputImages(ctx context.Context, client *prism.Client, p prism.Principal, projectID string, items []prism.InputItem) ([]prism.InputItem, bool) {
 	if len(items) == 0 {
-		return items
+		return items, false
 	}
 
+	var hasUpload bool
 	outItems := make([]prism.InputItem, len(items))
 	for i, item := range items {
 		outItems[i] = item
@@ -44,13 +48,6 @@ func preprocessInputImages(ctx context.Context, client *prism.Client, p prism.Pr
 				continue
 			}
 
-			// 如果已经是 Base64 Data URI，直接原样保留原生 input_image
-			if strings.HasPrefix(c.ImageURL, "data:image/") {
-				newContents = append(newContents, c)
-				continue
-			}
-
-			// 外部 HTTP 图片：下载并转为 Base64 Data URI
 			data, ext, ok := extractImageData(ctx, c.ImageURL)
 			if !ok || len(data) == 0 {
 				newContents = append(newContents, c)
@@ -66,6 +63,32 @@ func preprocessInputImages(ctx context.Context, client *prism.Client, p prism.Pr
 			case ".gif":
 				mime = "image/gif"
 			}
+
+			// 若当前具备 projectID，直接上传到项目存储并注入官方 input_file
+			if projectID != "" && client != nil {
+				filename := "image_" + randHex(6) + ext
+				err := client.UploadRawProjectFile(ctx, p, projectID, filename, mime, data)
+				if err != nil {
+					// 兜底回退到 multipart 上传
+					_, err = client.UploadFile(ctx, p, prism.FileUpload{
+						ProjectID:   projectID,
+						Path:        filename,
+						Filename:    filename,
+						ContentType: mime,
+						Data:        data,
+					})
+				}
+				if err == nil {
+					hasUpload = true
+					newContents = append(newContents, prism.InputContent{
+						Type:        "input_file",
+						Filename:    filename,
+						ProjectPath: filename,
+					})
+				}
+			}
+
+			// 同时保留原生 input_image（Base64 Data URI），兼顾纯视觉模型与沙箱环境
 			b64 := base64.StdEncoding.EncodeToString(data)
 			newContents = append(newContents, prism.InputContent{
 				Type:     "input_image",
@@ -75,7 +98,7 @@ func preprocessInputImages(ctx context.Context, client *prism.Client, p prism.Pr
 		}
 		outItems[i].Content = newContents
 	}
-	return outItems
+	return outItems, hasUpload
 }
 
 func extractImageData(ctx context.Context, imgURL string) ([]byte, string, bool) {
@@ -104,7 +127,25 @@ func extractImageData(ctx context.Context, imgURL string) ([]byte, string, bool)
 		return decoded, ext, true
 	}
 
-	// 2. 外部 HTTP/HTTPS 链接（排除 prism 内部域名）
+	// 2. 本地文件路径（支持 file:/// 或直接绝对路径）
+	localPath := imgURL
+	if strings.HasPrefix(localPath, "file:///") {
+		localPath = strings.TrimPrefix(localPath, "file:///")
+	} else if strings.HasPrefix(localPath, "file://") {
+		localPath = strings.TrimPrefix(localPath, "file://")
+	}
+	if fi, err := os.Stat(localPath); err == nil && !fi.IsDir() {
+		data, err := os.ReadFile(localPath)
+		if err == nil && len(data) > 0 {
+			ext := strings.ToLower(filepath.Ext(localPath))
+			if ext == "" {
+				ext = ".png"
+			}
+			return data, ext, true
+		}
+	}
+
+	// 3. 外部 HTTP/HTTPS 链接（排除 prism 内部域名）
 	if (strings.HasPrefix(imgURL, "http://") || strings.HasPrefix(imgURL, "https://")) && !strings.Contains(imgURL, "prism.openai.com") {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, imgURL, nil)
 		if err != nil {
@@ -116,7 +157,7 @@ func extractImageData(ctx context.Context, imgURL string) ([]byte, string, bool)
 		}
 		defer func() { _ = resp.Body.Close() }()
 
-		data, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20)) // 限制 10MB
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 15<<20)) // 限制 15MB
 		if err != nil {
 			return nil, "", false
 		}

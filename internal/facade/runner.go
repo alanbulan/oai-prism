@@ -326,7 +326,9 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	// 看起来像"上游挂了"，实际上是"你没给我沙箱"。
 	// 上游的 codexRequestDebug 里会直接写 sandbox_url_resolved: null。
 	var sb *prism.Sandbox
-	if !req.IsAux {
+	if s := r.sandboxes.Get(acct.ID); s.Usable() {
+		sb = s
+	} else {
 		s, err := r.ensureSandbox(ctx, acct, projectID)
 		if err != nil {
 			r.log.Warn("申请沙箱失败，尝试不带沙箱继续", "account", acct.ID, "err", err)
@@ -334,21 +336,19 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		} else {
 			sb = s
 		}
-	} else if projectID != "" {
-		// 伴生轻量请求：若当前账号已有可用沙箱，直接复用已有容器，避免上游因缺少沙箱报错 sandbox_reconnecting
-		if s := r.sandboxes.Get(acct.ID); s.Usable() {
-			sb = s
-		}
 	}
 
-	// 2.5) 工作区同步：**只申请沙箱是不够的**。
-	//
-	// 沙箱拿到句柄后仍会停在 syncing，必须再为它注入
-	// 项目资源令牌与 Y-Sweet 文档凭证，它才会去同步工作区。
-	// 漏掉这一步的症状极具误导性：不报错，只是永远 syncing，
-	// 最终会话处理固定 122 秒后 504 —— 看起来像"上游挂了"。
-	//
-	// 失败同样不阻断：start 会给出明确原因。
+	// 2.3) 处理图片上传：必须在沙箱工作区同步之前上传至项目！
+	inputItems := req.Input
+	var hasNewUpload bool
+	if projectID != "" {
+		inputItems, hasNewUpload = preprocessInputImages(ctx, r.client, p, projectID, inputItems)
+	}
+
+	// 2.5) 工作区同步：若上传了新文件，强制失效同步状态，触发沙箱拉取最新文件
+	if hasNewUpload {
+		r.sandboxes.InvalidateProject(acct.ID, projectID)
+	}
 	if sb.Usable() && projectID != "" {
 		if !r.syncSandboxWorkspace(ctx, acct, sb, projectID) {
 			// 同步未就绪还硬上 start，上游**必然**回
@@ -382,11 +382,6 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		// 字段名是 snake_case —— 与前端 bundle 里一致，别"顺手改成驼峰"。
 		meta["sandbox_url"] = sb.URL
 		meta["sandbox_token"] = sb.Token
-	}
-
-	inputItems := req.Input
-	if projectID != "" {
-		inputItems = preprocessInputImages(ctx, r.client, p, projectID, inputItems)
 	}
 	// 注意：此处不做任何轮次标记/扰动。2026-10-02 实验矩阵证明
 	// system comment 与零宽空格两类标记本身就会让历史到达失败
@@ -1016,9 +1011,20 @@ func (r *Runner) ActiveProject(accountID string) (string, bool) {
 func (r *Runner) resolveProject(ctx context.Context, acct *account.Account, req *RunRequest) (string, error) {
 	f := &r.cfg.Facade
 
-	// 伴生轻量请求（标题/摘要生成）：纯文本推理，绝不绑定或创建项目与沙箱
+	// 伴生轻量请求（标题/摘要生成）：优先复用活跃项目与沙箱
 	if req.IsAux {
-		return "", nil
+		if actProj, ok := r.ActiveProject(acct.ID); ok && actProj != "" {
+			return actProj, nil
+		}
+		if id, ok := r.projects.Get(acct.ID, "aux_bucket", time.Now()); ok {
+			return id, nil
+		}
+		id, err := r.createProject(ctx, acct)
+		if err == nil && id != "" {
+			r.projects.Put(acct.ID, "aux_bucket", id, time.Now())
+			r.projects.PutActive(acct.ID, id, time.Now())
+		}
+		return id, err
 	}
 
 	bucketKey := req.StickyKey

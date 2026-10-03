@@ -182,12 +182,25 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	isAux := !bridge && len(rawFields["input"]) < 3000 && (toolsStr == "" || toolsStr == "null" || toolsStr == "[]")
 	runReq.IsAux = isAux
 	if isAux {
-		// 客户端标题生成专用拦截：Codex CLI 会并发发起带有特定 prompt 的单行标题请求，
-		// 本地毫秒级直接响应合法结构化 JSON，免除上游资源消耗与沙箱并发冲突。
+		// 客户端标题生成：Codex CLI 会发起带有特定 prompt 的单行标题请求，
+		// 请求上游真实模型生成标题，并将结果规范化包裹为客户端期望的结构化 JSON。
 		if strings.Contains(string(rawFields["input"]), "Generate a concise, single-line task title") {
+			if runReq.ProjectID == "" {
+				if chainProj, _, _, _, _ := sessionChainGet(stickyKey); chainProj != "" {
+					runReq.ProjectID = chainProj
+				} else if actProj, ok := h.runner.ActiveProject(accountID); ok {
+					runReq.ProjectID = actProj
+				}
+			}
+			res, err := h.runner.Run(r.Context(), runReq, nil)
+			rawTitle := ""
+			if err == nil && res != nil {
+				rawTitle = res.Text
+			}
+			titleJSON := extractTitleJSON(rawTitle)
+
 			id := newID("resp_")
 			created := time.Now().Unix()
-			titleJSON := `{"title": "Codex Task"}`
 			if req.Stream {
 				setConversationHeader(w, runReq.ConversationID)
 				sw, err := sse.New(w)
@@ -628,3 +641,66 @@ func extractSentinelToken(r *http.Request) map[string]string {
 
 // heartbeatInterval 是流式等待期间的心跳间隔（1.5秒一次，确保持续激活下游客户端 SSE 事件流并刷新 idle timeout）。
 const heartbeatInterval = 1500 * time.Millisecond
+
+// extractTitleJSON 将上游模型生成的任意格式标题清洗并封装为客户端要求的合法 JSON {"title": "..."}
+func extractTitleJSON(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return `{"title": "任务对话"}`
+	}
+	// 1. 若本身已经是合法含有 title 字段的 JSON
+	var parsed struct {
+		Title string `json:"title"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err == nil && parsed.Title != "" {
+		cleaned, _ := json.Marshal(map[string]string{"title": parsed.Title})
+		return string(cleaned)
+	}
+
+	// 2. 处理 markdown code block ```json ... ```
+	if idx := strings.Index(raw, "```"); idx != -1 {
+		rest := raw[idx+3:]
+		if nl := strings.IndexByte(rest, '\n'); nl != -1 {
+			rest = rest[nl+1:]
+		}
+		if endIdx := strings.Index(rest, "```"); endIdx != -1 {
+			block := strings.TrimSpace(rest[:endIdx])
+			if err := json.Unmarshal([]byte(block), &parsed); err == nil && parsed.Title != "" {
+				cleaned, _ := json.Marshal(map[string]string{"title": parsed.Title})
+				return string(cleaned)
+			}
+		}
+	}
+
+	// 3. 处理内嵌 {"title": "..."}
+	if start := strings.Index(raw, `{"title"`); start != -1 {
+		if end := strings.IndexByte(raw[start:], '}'); end != -1 {
+			candidate := raw[start : start+end+1]
+			if err := json.Unmarshal([]byte(candidate), &parsed); err == nil && parsed.Title != "" {
+				cleaned, _ := json.Marshal(map[string]string{"title": parsed.Title})
+				return string(cleaned)
+			}
+		}
+	}
+
+	// 4. 普通纯文本：去除首尾引号、多余空白及换行，截取单行
+	lines := strings.Split(raw, "\n")
+	title := ""
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		l = strings.Trim(l, "\"`'#*- ")
+		if l != "" {
+			title = l
+			break
+		}
+	}
+	if title == "" {
+		title = "任务对话"
+	}
+	runes := []rune(title)
+	if len(runes) > 30 {
+		title = string(runes[:30])
+	}
+	cleaned, _ := json.Marshal(map[string]string{"title": title})
+	return string(cleaned)
+}

@@ -1686,6 +1686,34 @@ func (c *Client) UploadFile(ctx context.Context, p Principal, up FileUpload) (js
 	return raw, nil
 }
 
+// UploadRawProjectFile 直接以原始二进制流上传项目文件（完全对齐官方 WebUI /api/project-files/upload）
+func (c *Client) UploadRawProjectFile(ctx context.Context, p Principal, projectID, filename, contentType string, data []byte) error {
+	fileID := newUUID()
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	hdr := c.buildHeaders(p, contentType, "*/*")
+	hdr["x-prism-file-id"] = fileID
+	if projectID != "" {
+		hdr["x-prism-project-id"] = projectID
+	}
+	hdr["x-prism-file-name"] = filename
+	hdr["x-prism-file-size"] = strconv.Itoa(len(data))
+	hdr["x-prism-require-project-edit-access"] = "true"
+
+	resp, err := c.Do(ctx, p, http.MethodPost, PathProjectFilesUpload, headerFromMap(hdr), data, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return &creds.APIError{Op: "upload_raw_project_file", Status: resp.StatusCode, Body: truncate(string(raw), 400)}
+	}
+	return nil
+}
+
 // PatchThumbnail 更新项目缩略图（文档：PATCH /api/projects/{uuid}/thumbnail）。
 func (c *Client) PatchThumbnail(ctx context.Context, p Principal, projectID string, payload map[string]any) (json.RawMessage, error) {
 	path := "/api/projects/" + url.PathEscape(projectID) + "/thumbnail"

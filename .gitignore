@@ -47,3 +47,7 @@ coverage.out
 tools/__pycache__/
 __pycache__/
 *.pyc
+
+# 临时抓包与测试生成文件
+tools/*.png
+tools/*_logs.json
