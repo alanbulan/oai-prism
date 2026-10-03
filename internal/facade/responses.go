@@ -244,7 +244,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		h.streamResponses(w, r, runReq, id, created, req.Model, bridge, execToolName, execKind, !hasPriorToolResult(rawFields))
 		return
 	}
-	h.syncResponses(w, r, runReq, id, created, req.Model, bridge, execToolName, execKind, isAux)
+	h.syncResponses(w, r, runReq, id, created, req.Model, bridge, execToolName, execKind, isAux, !hasPriorToolResult(rawFields))
 }
 
 var responsesKnownFields = map[string]struct{}{
@@ -390,7 +390,53 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		if js0, ok := extractExecBlock(text); ok {
 			js = ensureExecJS(js0)
 		}
-		h.log.Info("模型首轮生成文本完成", "text", truncateRunes(text, 100), "hasJS", js != "")
+		deltaCount := 0
+		if res != nil {
+			deltaCount = len(res.DeltaFiles)
+		}
+		h.log.Info("模型首轮生成文本完成", "text", truncateRunes(text, 100), "hasJS", js != "", "deltaFiles", deltaCount)
+
+		// 防线一：网关自动纠偏重试（Auto-Nudge Retry）
+		// 当模型陷入沙箱消化错觉（口头宣称已创建，或沙箱产生了 DeltaFiles 但未输出 ```codex-exec 围栏），
+		// 且允许纠偏重试（allowNudge 为 true）时，网关在内部自动注入纠偏提示并重试一轮。
+		if js == "" && allowNudge && IsFauxSandboxCompletion(text, deltaCount) {
+			h.log.Info("检测到模型在沙盒内消化操作或口头宣称已创建，自动触发 Bridge Nudge 纠偏重试",
+				"reply", truncateRunes(text, 80), "deltaFiles", deltaCount)
+			retryReq := *runReq
+			retryReq.Input = append(make([]prism.InputItem, 0, len(runReq.Input)+2), runReq.Input...)
+			retryReq.Input = append(retryReq.Input, prism.NewAssistantItem(text))
+			retryReq.Input = append(retryReq.Input, prism.NewUserItem(bridgeRetryNudge(text)))
+			if res != nil && res.ResponseID != "" {
+				retryReq.PreviousResponseID = res.ResponseID
+			}
+
+			var sb2 strings.Builder
+			res2, runErr2 := h.runner.Run(r.Context(), &retryReq, func(d Delta) error {
+				sb2.WriteString(d.Text)
+				return nil
+			})
+			if runErr2 == nil && res2 != nil {
+				text2 := sb2.String()
+				if js0, ok := extractExecBlock(text2); ok {
+					js = ensureExecJS(js0)
+					text = text2
+					res = res2
+					if res.Usage != nil {
+						usage = res.Usage
+					}
+					h.log.Info("Bridge Nudge 纠偏成功，模型已生成本地执行 JS", "text", truncateRunes(text, 80))
+				}
+			}
+		}
+
+		// 防线二：沙箱产物（DeltaFiles）自动转译为本地写入命令
+		// 若经过上述步骤依然未生成本地执行块，但沙箱中确实产生了文件变更，
+		// 网关直接将上游 DeltaFiles 合成为本地 exec_command 执行命令，确保产物 100% 写入用户本地电脑！
+		if js == "" && res != nil && len(res.DeltaFiles) > 0 {
+			isWin := strings.Contains(strings.ToLower(r.UserAgent()), "windows")
+			js = SynthesizeDeltaFilesExecJS(res.DeltaFiles, isWin)
+			h.log.Info("已自动将上游沙盒内生成的 DeltaFiles 合成为本地执行 JS", "files", len(res.DeltaFiles), "isWin", isWin)
+		}
 
 
 		if js != "" {
@@ -517,7 +563,7 @@ func emitTextResponseEvents(sw *sse.Writer, buf *[]byte, id, publicModel string,
 	return nil
 }
 
-func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id string, created int64, publicModel string, bridge bool, execToolName, execKind string, isAux bool) {
+func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id string, created int64, publicModel string, bridge bool, execToolName, execKind string, isAux bool, allowNudge bool) {
 	res, err := h.runner.Run(r.Context(), runReq, nil)
 	bindLogAccount(r, res)
 	if !isAux {
@@ -554,10 +600,53 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 	}
 
 	if bridge {
-		// 桥模式：有 exec 块就回 custom_tool_call（CLI 认的形状），
-		// 没有就回普通文本 message。
+		var js string
 		if js0, ok := extractExecBlock(text); ok {
-			js := ensureExecJS(js0)
+			js = ensureExecJS(js0)
+		}
+		deltaCount := 0
+		if res != nil {
+			deltaCount = len(res.DeltaFiles)
+		}
+
+		// 防线一：网关自动纠偏重试（Auto-Nudge Retry）
+		if js == "" && allowNudge && IsFauxSandboxCompletion(text, deltaCount) {
+			h.log.Info("检测到模型在沙盒内消化操作或口头宣称已创建，自动触发 Bridge Nudge 纠偏重试 (sync)",
+				"reply", truncateRunes(text, 80), "deltaFiles", deltaCount)
+			retryReq := *runReq
+			retryReq.Input = append(make([]prism.InputItem, 0, len(runReq.Input)+2), runReq.Input...)
+			retryReq.Input = append(retryReq.Input, prism.NewAssistantItem(text))
+			retryReq.Input = append(retryReq.Input, prism.NewUserItem(bridgeRetryNudge(text)))
+			if res != nil && res.ResponseID != "" {
+				retryReq.PreviousResponseID = res.ResponseID
+			}
+			res2, runErr2 := h.runner.Run(r.Context(), &retryReq, nil)
+			if runErr2 == nil && res2 != nil {
+				text2 := res2.Text
+				if js0, ok := extractExecBlock(text2); ok {
+					js = ensureExecJS(js0)
+					text = text2
+					res = res2
+					if res.Usage != nil {
+						usage = &ResponsesUsage{
+							InputTokens:  res.Usage.InputTokens,
+							OutputTokens: res.Usage.OutputTokens,
+							TotalTokens:  res.Usage.TotalTokens,
+						}
+					}
+					h.log.Info("Bridge Nudge 纠偏成功，模型已生成本地执行 JS (sync)", "text", truncateRunes(text, 80))
+				}
+			}
+		}
+
+		// 防线二：沙箱产物（DeltaFiles）自动转译为本地写入命令
+		if js == "" && res != nil && len(res.DeltaFiles) > 0 {
+			isWin := strings.Contains(strings.ToLower(r.UserAgent()), "windows")
+			js = SynthesizeDeltaFilesExecJS(res.DeltaFiles, isWin)
+			h.log.Info("已自动将上游沙盒内生成的 DeltaFiles 合成为本地执行 JS (sync)", "files", len(res.DeltaFiles), "isWin", isWin)
+		}
+
+		if js != "" {
 			callID := newID("ctc_")
 			setConversationHeader(w, conversationID)
 			var out any

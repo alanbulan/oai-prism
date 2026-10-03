@@ -586,4 +586,59 @@ func TestExtractIncrementalInput(t *testing.T) {
 	}
 }
 
+func TestIsFauxSandboxCompletion(t *testing.T) {
+	// 命中场景 1：口头声称已创建
+	if !IsFauxSandboxCompletion("已创建 `pelican-bicycle.html:1`，浏览器打开即可查看。", 0) {
+		t.Errorf("未能识别口头宣称已创建")
+	}
+
+	// 命中场景 2：存在 DeltaFiles
+	if !IsFauxSandboxCompletion("这是你的文件说明", 1) {
+		t.Errorf("有 DeltaFiles 必须判定为需要纠偏或合成")
+	}
+
+	// 命中场景 3：英文 created file
+	if !IsFauxSandboxCompletion("I have created file `main.py` in the workspace.", 0) {
+		t.Errorf("未能识别英文 created file")
+	}
+
+	// 正常回答不应误判
+	if IsFauxSandboxCompletion("请问你需要使用什么前端框架？比如 React 或 Vue？", 0) {
+		t.Errorf("普通问答不应误判为假完成")
+	}
+}
+
+func TestSynthesizeDeltaFilesExecJS(t *testing.T) {
+	diffBytes, _ := json.Marshal("--- /dev/null\n+++ src/app.html\n@@ -0,0 +1,2 @@\n+<h1>Hello</h1>\n+<svg></svg>")
+	files := []prism.CodexDeltaFile{
+		{
+			FilePath: "src/app.html",
+			Status:   "added",
+			Diff:     json.RawMessage(diffBytes),
+		},
+		{
+			FilePath: "old.txt",
+			Status:   "deleted",
+		},
+	}
+
+	// Windows 测试
+	winJS := SynthesizeDeltaFilesExecJS(files, true)
+	if !strings.Contains(winJS, "WriteAllBytes") || !strings.Contains(winJS, "Split-Path") {
+		t.Errorf("Windows JS 应当包含 WriteAllBytes 和 Split-Path: %s", winJS)
+	}
+	if !strings.Contains(winJS, "Remove-Item") {
+		t.Errorf("Windows JS 应当处理删除文件: %s", winJS)
+	}
+
+	// POSIX 测试
+	posixJS := SynthesizeDeltaFilesExecJS(files, false)
+	if !strings.Contains(posixJS, "base64 -d") || !strings.Contains(posixJS, "mkdir -p") {
+		t.Errorf("POSIX JS 应当包含 base64 -d 和 mkdir -p: %s", posixJS)
+	}
+	if !strings.Contains(posixJS, "rm -f") {
+		t.Errorf("POSIX JS 应当处理删除文件: %s", posixJS)
+	}
+}
+
 
