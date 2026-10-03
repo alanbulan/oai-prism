@@ -26,7 +26,10 @@ package facade
 // 第二轮起自动重建链条，不影响正确性（只会丢一次上下文）。
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -43,14 +46,15 @@ const (
 )
 
 type sessionChainEntry struct {
-	ProjectID      string
-	ConversationID string
-	ResponseID     string // 上一轮回复句柄 —— 关联用途（上游不代管历史）
-	AccountID      string
-	Model          string
-	ListenSnapshot json.RawMessage
-	History        []ChatMessage // 本会话累积的对话历史（user/assistant 交替）
-	UpdatedAt      time.Time
+	ProjectID        string
+	ConversationID   string
+	ResponseID       string // 上一轮回复句柄 —— 关联用途（上游不代管历史）
+	AccountID        string
+	Model            string
+	ListenSnapshot   json.RawMessage
+	History          []ChatMessage     // 本会话累积的对话历史（user/assistant 交替）
+	SynthesizedFiles map[string]string // cleanPath -> hash(status + diff)，防止重复合成导致死循环
+	UpdatedAt        time.Time
 }
 
 var sessionChain = struct {
@@ -367,3 +371,62 @@ func resReqID(res *RunResult) string {
 	}
 	return res.RequestID
 }
+
+// sessionChainFilterNewDeltaFiles 过滤出会话中尚未合成过（或内容发生变化）的 DeltaFiles，
+// 并将本次合成的文件内容哈希记录入库，防止跨轮次重复合成导致无限循环。
+func sessionChainFilterNewDeltaFiles(key string, files []prism.CodexDeltaFile) []prism.CodexDeltaFile {
+	if len(files) == 0 {
+		return nil
+	}
+	sessionChain.mu.Lock()
+	defer sessionChain.mu.Unlock()
+
+	var e *sessionChainEntry
+	if key != "" {
+		if entry, ok := sessionChain.entries[key]; ok {
+			e = entry
+		}
+	}
+
+	// 若未找到现有 entry，但传入了有效 key，则就地建立 entry 方便记录文件合成状态
+	if e == nil && key != "" {
+		e = &sessionChainEntry{
+			SynthesizedFiles: make(map[string]string),
+			UpdatedAt:        time.Now(),
+		}
+		sessionChain.entries[key] = e
+	}
+
+	if e == nil {
+		var valid []prism.CodexDeltaFile
+		for _, f := range files {
+			if !isSystemIgnoredFile(f.FilePath) {
+				valid = append(valid, f)
+			}
+		}
+		return valid
+	}
+
+	if e.SynthesizedFiles == nil {
+		e.SynthesizedFiles = make(map[string]string)
+	}
+
+	var newFiles []prism.CodexDeltaFile
+	for _, f := range files {
+		if isSystemIgnoredFile(f.FilePath) {
+			continue
+		}
+		cleanPath := filepath.ToSlash(filepath.Clean(strings.TrimSpace(f.FilePath)))
+		diff := f.DiffString()
+		sum := sha256.Sum256([]byte(f.Status + ":" + diff))
+		hash := hex.EncodeToString(sum[:])
+
+		if oldHash, exists := e.SynthesizedFiles[cleanPath]; exists && oldHash == hash {
+			continue // 该文件在该状态和内容下已合成下发过，跳过
+		}
+		newFiles = append(newFiles, f)
+		e.SynthesizedFiles[cleanPath] = hash
+	}
+	return newFiles
+}
+

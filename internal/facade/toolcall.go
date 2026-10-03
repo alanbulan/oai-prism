@@ -82,6 +82,9 @@ func MapDeltaFilesToToolCalls(files []prism.CodexDeltaFile, declaredTools []Chat
 
 	toolCalls := make([]ToolCall, 0, len(files))
 	for i, f := range files {
+		if isSystemIgnoredFile(f.FilePath) {
+			continue
+		}
 		content := ExtractContentFromDiff(f.DiffString())
 		fnName := preferredWriteTool
 		argsMap := make(map[string]any)
@@ -139,6 +142,9 @@ func ApplyLocalWorkspaceFiles(workspaceRoot string, files []prism.CodexDeltaFile
 	}
 
 	for _, f := range files {
+		if isSystemIgnoredFile(f.FilePath) {
+			continue
+		}
 		targetPath := filepath.Join(cleanRoot, filepath.Clean(f.FilePath))
 		// 安全检查：防止路径遍历攻击 (Path Traversal Protection)
 		if !strings.HasPrefix(targetPath, cleanRoot) {

@@ -1014,11 +1014,26 @@ func writeJSONString(sb *strings.Builder, s string) {
 	sb.WriteString(strings.TrimRight(buf.String(), "\n"))
 }
 
-// IsFauxSandboxCompletion 判断模型的文本是否是“假完成”（口头声称已创建，或沙箱自产自销）。
-func IsFauxSandboxCompletion(text string, deltaFilesCount int) bool {
-	if deltaFilesCount > 0 {
+// isSystemIgnoredFile 判断文件是否为上游沙盒内系统注入文件或模板，这类文件绝不可当作用户产物下发本地
+func isSystemIgnoredFile(path string) bool {
+	clean := filepath.ToSlash(filepath.Clean(strings.TrimSpace(path)))
+	clean = strings.TrimPrefix(clean, "./")
+	clean = strings.TrimPrefix(clean, "/")
+	lower := strings.ToLower(clean)
+	base := filepath.Base(lower)
+	if base == "agents.md" || base == "readme.md" || base == "instructions.md" {
 		return true
 	}
+	if strings.HasPrefix(lower, ".git/") || lower == ".git" ||
+		strings.HasPrefix(lower, ".codex/") || lower == ".codex" ||
+		strings.HasPrefix(lower, "codex_workspace/") || lower == "codex_workspace" {
+		return true
+	}
+	return false
+}
+
+// IsFauxSandboxCompletion 判断模型的文本是否是“假完成”（口头声称已创建，或沙箱自产自销）。
+func IsFauxSandboxCompletion(text string) bool {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
 		return false
@@ -1041,12 +1056,17 @@ func IsFauxSandboxCompletion(text string, deltaFilesCount int) bool {
 
 // SynthesizeDeltaFilesExecJS 把上游沙箱内的 DeltaFiles 合成为由客户端在本地终端执行的 exec_command JS。
 // 使用 Base64 编码方式写入本地文件，绝对杜绝任何引号转义、换行符破坏或 shell 语法报错。
+// 必须严格过滤掉系统级文件（如 AGENTS.md / README.md / .git 等），防止死循环。
 func SynthesizeDeltaFilesExecJS(files []prism.CodexDeltaFile, isWindows bool) string {
 	if len(files) == 0 {
 		return ""
 	}
 	var sb strings.Builder
-	for i, f := range files {
+	idx := 0
+	for _, f := range files {
+		if isSystemIgnoredFile(f.FilePath) {
+			continue
+		}
 		cleanPath := filepath.Clean(f.FilePath)
 		if f.Status == "deleted" {
 			var cmd string
@@ -1056,11 +1076,12 @@ func SynthesizeDeltaFilesExecJS(files []prism.CodexDeltaFile, isWindows bool) st
 				cmd = fmt.Sprintf(`rm -f '%s'`, cleanPath)
 			}
 			var jsPart strings.Builder
-			jsPart.WriteString(fmt.Sprintf(`const out%d = await tools.exec_command({ cmd: `, i))
+			jsPart.WriteString(fmt.Sprintf(`const out%d = await tools.exec_command({ cmd: `, idx))
 			writeJSONString(&jsPart, cmd)
-			jsPart.WriteString(` });` + "\n" + fmt.Sprintf(`text(out%d);`, i))
+			jsPart.WriteString(` });` + "\n" + fmt.Sprintf(`text(out%d);`, idx))
 			sb.WriteString(jsPart.String())
 			sb.WriteString("\n")
+			idx++
 			continue
 		}
 
@@ -1077,11 +1098,12 @@ func SynthesizeDeltaFilesExecJS(files []prism.CodexDeltaFile, isWindows bool) st
 				cleanPath, b64, cleanPath)
 		}
 		var jsPart strings.Builder
-		jsPart.WriteString(fmt.Sprintf(`const out%d = await tools.exec_command({ cmd: `, i))
+		jsPart.WriteString(fmt.Sprintf(`const out%d = await tools.exec_command({ cmd: `, idx))
 		writeJSONString(&jsPart, cmd)
-		jsPart.WriteString(` });` + "\n" + fmt.Sprintf(`text(out%d);`, i))
+		jsPart.WriteString(` });` + "\n" + fmt.Sprintf(`text(out%d);`, idx))
 		sb.WriteString(jsPart.String())
 		sb.WriteString("\n")
+		idx++
 	}
 	return strings.TrimSpace(sb.String())
 }

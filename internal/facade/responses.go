@@ -417,11 +417,18 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		// 单轮沙箱产物无缝落地：
 		// 若模型未直接输出 codex-exec 围栏，但上游沙盒内产生了文件变更（DeltaFiles），
 		// 网关在当前轮次直接将上游 DeltaFiles 提取并合成为客户端本地 exec_command 执行命令，
-		// 确保输出产物 100% 写入用户本地电脑空间，绝不留在上游沙盒，且无需任何二次重试！
+		// 确保输出产物 100% 写入用户本地电脑空间，绝不留在上游沙盒。
+		// 必须通过 sessionChainFilterNewDeltaFiles 过滤系统文件并记录哈希，防止重复合成导致无限死循环！
 		if js == "" && res != nil && len(res.DeltaFiles) > 0 {
-			isWin := strings.Contains(strings.ToLower(r.UserAgent()), "windows")
-			js = SynthesizeDeltaFilesExecJS(res.DeltaFiles, isWin)
-			h.log.Info("已在当前轮次自动将上游沙盒内生成的 DeltaFiles 合成为本地执行命令", "files", len(res.DeltaFiles), "isWin", isWin)
+			newDeltaFiles := sessionChainFilterNewDeltaFiles(runReq.StickyKey, res.DeltaFiles)
+			if len(newDeltaFiles) > 0 {
+				isWin := strings.Contains(strings.ToLower(r.UserAgent()), "windows")
+				synth := SynthesizeDeltaFilesExecJS(newDeltaFiles, isWin)
+				if synth != "" {
+					js = synth
+					h.log.Info("已在当前轮次自动将上游沙盒内生成的 DeltaFiles 合成为本地执行命令", "files", len(newDeltaFiles), "isWin", isWin)
+				}
+			}
 		}
 
 
@@ -595,11 +602,18 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 		// 单轮沙箱产物无缝落地：
 		// 若模型未直接输出 codex-exec 围栏，但上游沙盒内产生了文件变更（DeltaFiles），
 		// 网关在当前轮次直接将上游 DeltaFiles 提取并合成为客户端本地 exec_command 执行命令，
-		// 确保输出产物 100% 写入用户本地电脑空间，绝不留在上游沙盒，且无需任何二次重试！
+		// 确保输出产物 100% 写入用户本地电脑空间，绝不留在上游沙盒。
+		// 必须通过 sessionChainFilterNewDeltaFiles 过滤系统文件并记录哈希，防止重复合成导致无限死循环！
 		if js == "" && res != nil && len(res.DeltaFiles) > 0 {
-			isWin := strings.Contains(strings.ToLower(r.UserAgent()), "windows")
-			js = SynthesizeDeltaFilesExecJS(res.DeltaFiles, isWin)
-			h.log.Info("已在当前轮次自动将上游沙盒内生成的 DeltaFiles 合成为本地执行命令 (sync)", "files", len(res.DeltaFiles), "isWin", isWin)
+			newDeltaFiles := sessionChainFilterNewDeltaFiles(runReq.StickyKey, res.DeltaFiles)
+			if len(newDeltaFiles) > 0 {
+				isWin := strings.Contains(strings.ToLower(r.UserAgent()), "windows")
+				synth := SynthesizeDeltaFilesExecJS(newDeltaFiles, isWin)
+				if synth != "" {
+					js = synth
+					h.log.Info("已在当前轮次自动将上游沙盒内生成的 DeltaFiles 合成为本地执行命令 (sync)", "files", len(newDeltaFiles), "isWin", isWin)
+				}
+			}
 		}
 
 		if js != "" {

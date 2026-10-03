@@ -601,23 +601,68 @@ func TestExtractIncrementalInput(t *testing.T) {
 
 func TestIsFauxSandboxCompletion(t *testing.T) {
 	// 命中场景 1：口头声称已创建
-	if !IsFauxSandboxCompletion("已创建 `pelican-bicycle.html:1`，浏览器打开即可查看。", 0) {
+	if !IsFauxSandboxCompletion("已创建 `pelican-bicycle.html:1`，浏览器打开即可查看。") {
 		t.Errorf("未能识别口头宣称已创建")
 	}
 
-	// 命中场景 2：存在 DeltaFiles
-	if !IsFauxSandboxCompletion("这是你的文件说明", 1) {
-		t.Errorf("有 DeltaFiles 必须判定为需要纠偏或合成")
-	}
-
-	// 命中场景 3：英文 created file
-	if !IsFauxSandboxCompletion("I have created file `main.py` in the workspace.", 0) {
+	// 命中场景 2：英文 created file
+	if !IsFauxSandboxCompletion("I have created file `main.py` in the workspace.") {
 		t.Errorf("未能识别英文 created file")
 	}
 
 	// 正常回答不应误判
-	if IsFauxSandboxCompletion("请问你需要使用什么前端框架？比如 React 或 Vue？", 0) {
+	if IsFauxSandboxCompletion("请问你需要使用什么前端框架？比如 React 或 Vue？") {
 		t.Errorf("普通问答不应误判为假完成")
+	}
+}
+
+func TestIsSystemIgnoredFile(t *testing.T) {
+	if !isSystemIgnoredFile("AGENTS.md") {
+		t.Errorf("AGENTS.md 必须被判定为系统忽略文件")
+	}
+	if !isSystemIgnoredFile("/codex_workspace/AGENTS.md") {
+		t.Errorf("沙箱路径 /codex_workspace/AGENTS.md 必须被判定为系统忽略文件")
+	}
+	if !isSystemIgnoredFile("README.md") {
+		t.Errorf("README.md 必须被判定为系统忽略文件")
+	}
+	if !isSystemIgnoredFile(".git/config") {
+		t.Errorf(".git/config 必须被判定为系统忽略文件")
+	}
+	if isSystemIgnoredFile("src/index.html") {
+		t.Errorf("正常用户文件 src/index.html 绝不能被忽略")
+	}
+	if isSystemIgnoredFile("pelican-bicycle.html") {
+		t.Errorf("正常用户文件 pelican-bicycle.html 绝不能被忽略")
+	}
+}
+
+func TestSessionChainFilterNewDeltaFiles(t *testing.T) {
+	key := "test-dedup-" + t.Name()
+	diffBytes, _ := json.Marshal("--- /dev/null\n+++ src/app.html\n@@ -0,0 +1 @@\n+test")
+	files := []prism.CodexDeltaFile{
+		{
+			FilePath: "AGENTS.md",
+			Status:   "added",
+			Diff:     json.RawMessage(`"system file"`),
+		},
+		{
+			FilePath: "src/app.html",
+			Status:   "added",
+			Diff:     json.RawMessage(diffBytes),
+		},
+	}
+
+	// 第 1 轮：过滤掉 AGENTS.md，返回 src/app.html
+	filtered1 := sessionChainFilterNewDeltaFiles(key, files)
+	if len(filtered1) != 1 || filtered1[0].FilePath != "src/app.html" {
+		t.Fatalf("第 1 轮应只保留 src/app.html，实际得到 %v", filtered1)
+	}
+
+	// 第 2 轮：上游继续返回相同的 files，应当全部去重过滤，返回空切片
+	filtered2 := sessionChainFilterNewDeltaFiles(key, files)
+	if len(filtered2) != 0 {
+		t.Fatalf("第 2 轮未改变的文件必须全部被去重，实际得到 %v", filtered2)
 	}
 }
 
