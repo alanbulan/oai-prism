@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/oai-prism/oaiprism/internal/middleware"
 	"github.com/oai-prism/oaiprism/internal/prism"
 	"github.com/oai-prism/oaiprism/internal/sse"
@@ -130,15 +131,28 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		API:          "responses",
 		ExtraHeaders: extractSentinelToken(r),
 	}
-	// 继承客户端传入的延续字段（用于增量单条消息客户端）
+	// 继承客户端显式传入的延续字段（若客户端显式指定则透传，但绝不从网关内部 sessionChain 隐式合成 previousResponseId）
 	runReq.PreviousResponseID = req.PreviousResponseID
 	runReq.ConversationID = conversationIDFrom(r, rawFields)
 
-	// 会话状态持久化继承：从 sessionChain 恢复上轮项目句柄
-	if chainProj, _, _, _, _ := sessionChainGet(stickyKey); chainProj != "" {
-		if runReq.ProjectID == "" {
-			runReq.ProjectID = chainProj
+	// 会话状态持久化继承：从 sessionChain 恢复上轮项目句柄、会话句柄与沙箱快照
+	chainProj, chainConv, _, _, chainSnap := sessionChainGet(stickyKey)
+	if runReq.ProjectID == "" && chainProj != "" {
+		runReq.ProjectID = chainProj
+	}
+	if runReq.ConversationID == "" && chainConv != "" {
+		runReq.ConversationID = chainConv
+	}
+	// 首轮尚未绑定上游会话 ID 时，由网关为当前会话生成一个固定的持久会话 ID（对齐 WebUI cdx1_<uuid> 格式）
+	// 确保该会话在整个生命周期内固定不变，彻底解决每次请求新建一个会话记录的根本问题！
+	if runReq.ConversationID == "" {
+		runReq.ConversationID = "cdx1_" + uuid.NewString()
+	}
+	if len(chainSnap) > 0 {
+		if runReq.Metadata == nil {
+			runReq.Metadata = make(map[string]any, 2)
 		}
+		runReq.Metadata["codex_listen_snapshot"] = string(chainSnap)
 	}
 
 	// 历史注入：仅当客户端本身没有携带往轮历史（单条消息客户端）时，
@@ -149,15 +163,6 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 			runReq.Input = injectChainHistory(runReq.Input, hist)
 			runReq.PreviousResponseID = ""
 		}
-	}
-
-	// 关键：在桥模式（Codex CLI）下，全量多轮历史已经由 foldInputHistory 折叠拼入 input 首条 System 消息中。
-	// 实测证明：上游若同时收到 previousResponseId，会判定为"增量调用"而直接丢弃/忽略 System 中的折叠历史，
-	// 导致模型在多轮追问时发生灾难性失忆（"本次对话中我还没有创建或输出文件"）。
-	// 因此在桥模式下，发给上游的 PreviousResponseID 与 ConversationID 必须置空，确保上游完整消化 System 中的历史。
-	if bridge {
-		runReq.PreviousResponseID = ""
-		runReq.ConversationID = ""
 	}
 	runReq.Extra = passthroughFields(rawFields, responsesKnownFields)
 
@@ -274,6 +279,10 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 			case <-heartbeatStop:
 				return
 			case <-t.C:
+				// 发送标准 SSE 注释保活行（防止任何客户端或代理 idle timeout）
+				if err := sw.WriteRaw([]byte(": keepalive\n\n")); err != nil {
+					return
+				}
 				hb := AppendResponsesEvent(nil, ResponsesEvent{
 					Type: "response.in_progress", ResponseID: id,
 					Model: publicModel, CreatedAt: created,
@@ -597,9 +606,5 @@ func extractSentinelToken(r *http.Request) map[string]string {
 	return extra
 }
 
-// heartbeatInterval 是流式等待期间的心跳间隔。
-//
-// 15 秒：远小于常见反代的 proxy_read_timeout（默认 60s）
-// 与 node http 的默认超时，又不会显著增加事件量
-// （一轮 5 分钟的请求约多 20 个事件，可忽略）。
-const heartbeatInterval = 15 * time.Second
+// heartbeatInterval 是流式等待期间的心跳间隔（1.5秒一次，确保持续激活下游客户端 SSE 事件流并刷新 idle timeout）。
+const heartbeatInterval = 1500 * time.Millisecond

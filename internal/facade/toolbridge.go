@@ -234,9 +234,6 @@ func foldInputHistory(items []prism.InputItem) []prism.InputItem {
 		items[0].Content[0].Text += history
 	}
 
-	// 关键：必须完整保留客户端传入的全部上下文条目，绝不截断删除中间消息！
-	// 本地 Codex CLI 自行控制上下文窗口（达到 256K 会自行触发 compress），
-	// 网关完整透传每一轮 User/Assistant/Tool 消息，模型才能直接认知多轮身份与对话细节。
 	return items
 }
 
@@ -312,14 +309,6 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 		return nil
 	}
 
-	items := make([]prism.InputItem, 0, len(blocks)+3)
-	// OS 事实声明（可能为空）拼在桥指令最前面 —— 越靠前越是"背景事实"。
-	head := bridgePrompt()
-	if strings.TrimSpace(defaultSystem) != "" {
-		head = defaultSystem + "\n\n" + head
-	}
-	items = append(items, prism.NewSystemItem(head))
-
 	textOf := func(r json.RawMessage) string {
 		if len(r) == 0 {
 			return ""
@@ -328,9 +317,6 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 		if json.Unmarshal(r, &s) == nil {
 			return s
 		}
-		// 也可能是 content 数组（[{"type":"input_text","text":"..."}]）——
-		// CLI 的工具结果用这种形状。直接 string(r) 会让模型读到一坨转义
-		// JSON，它读不懂就以为"没有输出"，转而要求用户重发内容。
 		var parts []struct {
 			Text string `json:"text"`
 		}
@@ -346,7 +332,6 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 		return string(r)
 	}
 	contentText := func(r json.RawMessage) string {
-		// content 可能是字符串，也可能是 [{type,input_text/text}] 数组。
 		var s string
 		if json.Unmarshal(r, &s) == nil {
 			return s
@@ -364,19 +349,48 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 		return ""
 	}
 
+	// 预先提取并合并所有来自客户端的 developer/system 消息指令
+	var devSystem strings.Builder
+	for _, b := range blocks {
+		if b.Type == "message" {
+			role := strings.ToLower(strings.TrimSpace(b.Role))
+			if role == "developer" || role == "system" {
+				txt := contentText(b.Content)
+				if strings.TrimSpace(txt) != "" {
+					if devSystem.Len() > 0 {
+						devSystem.WriteString("\n\n")
+					}
+					devSystem.WriteString(strings.TrimSpace(txt))
+				}
+			}
+		}
+	}
+
+	items := make([]prism.InputItem, 0, len(blocks)+2)
+	// OS 事实声明（可能为空）拼在桥指令最前面 —— 越靠前越是"背景事实"。
+	head := bridgePrompt()
+	if strings.TrimSpace(defaultSystem) != "" {
+		head = defaultSystem + "\n\n" + head
+	}
+	if devSystem.Len() > 0 {
+		head = head + "\n\n" + devSystem.String()
+	}
+	// 关键：发给上游的 input 数组里有且仅有唯一一条位于 items[0] 的 System 消息，
+	// 避免上游后端在提取 Context 时因多条 System 覆盖而丢弃桥指令与多轮历史！
+	items = append(items, prism.NewSystemItem(head))
+
 	for _, b := range blocks {
 		switch b.Type {
 		case "message":
 			role := strings.ToLower(strings.TrimSpace(b.Role))
+			if role == "developer" || role == "system" {
+				// 已集中合并进首条 System 消息，跳过
+				continue
+			}
 			text := contentText(b.Content)
-			switch role {
-			case "developer", "system":
-				if strings.TrimSpace(text) != "" {
-					items = append(items, prism.NewSystemItem(text))
-				}
-			case "assistant":
+			if role == "assistant" {
 				items = append(items, prism.NewAssistantItem(text))
-			default:
+			} else {
 				items = append(items, prism.NewUserItem(text))
 			}
 		case "custom_tool_call", "function_call":

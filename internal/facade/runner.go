@@ -334,6 +334,11 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		} else {
 			sb = s
 		}
+	} else if projectID != "" {
+		// 伴生轻量请求：若当前账号已有可用沙箱，直接复用已有容器，避免上游因缺少沙箱报错 sandbox_reconnecting
+		if s := r.sandboxes.Get(acct.ID); s.Usable() {
+			sb = s
+		}
 	}
 
 	// 2.5) 工作区同步：**只申请沙箱是不够的**。
@@ -423,11 +428,14 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		r.app.SandboxOps.Inc("start", "not_ready")
 		r.log.Info("沙箱未就绪，稍后重试",
 			"attempt", attempt, "of", sandboxStartRetries, "reason", sandboxReason(startResp))
-		// 仅在多次未就绪（容器可能真正回收）时才失效整个沙箱，避免冷启动瞬态抖动销毁热容器
-		if attempt >= 3 {
-			r.sandboxes.Invalidate(acct.ID)
-		} else {
-			r.sandboxes.InvalidateProject(acct.ID, projectID)
+		// 关键保护：仅在主请求且确实持有沙箱容器时才执行失效，绝不让伴生轻量请求误杀主会话的沙箱缓存！
+		if !req.IsAux && sb.Usable() && projectID != "" {
+			if strings.EqualFold(sandboxReason(startResp), "sandbox_reconnecting") || attempt >= 2 {
+				r.sandboxes.Invalidate(acct.ID)
+				sb = nil // 必须置空本地指针，触发下方重新申请与装配崭新沙箱容器
+			} else {
+				r.sandboxes.InvalidateProject(acct.ID, projectID)
+			}
 		}
 		// 线性退避：上游限流窗口是分钟级，固定短间隔只会打在限流上。
 		if serr := sleepCtx(ctx, time.Duration(attempt)*sandboxRetryDelay); serr != nil {
@@ -464,6 +472,14 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 
 	if requestID != "" {
 		r.journal.RecordStart(requestID, convID, acct.ID, projectID, turnState)
+	}
+	if len(turnState) > 0 {
+		var tsMap map[string]any
+		if err := json.Unmarshal(turnState, &tsMap); err == nil {
+			if promptStr, ok := tsMap["prompt"].(string); ok && promptStr != "" {
+				r.log.Debug("上游组装 Prompt", "bytes", len(promptStr), "head", truncateRunes(promptStr, 80))
+			}
+		}
 	}
 
 	bumpFirstByte := func() {
@@ -942,6 +958,7 @@ func isSandboxNotReady(resp *prism.StartResponse) bool {
 		reason == "sandbox_not_ready",
 		strings.Contains(msg, "submit prompt again"),
 		strings.Contains(msg, "reconnecting to sandbox"),
+		strings.Contains(msg, "synchronization timed out"),
 		strings.Contains(msg, "gateway timeout"):
 		return true
 	}
