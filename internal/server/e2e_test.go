@@ -20,6 +20,7 @@ import (
 
 	"github.com/oai-prism/oaiprism/internal/config"
 	"github.com/oai-prism/oaiprism/internal/logx"
+	"github.com/oai-prism/oaiprism/internal/tokens"
 )
 
 // fakeUpstream 模拟 prism.openai.com 的真实协议。
@@ -70,6 +71,9 @@ type fakeUpstream struct {
 	//   false（默认）-> pending 帧带累计正文，前缀差分能还原出增量（真流式）
 	//   true         -> 只有终态才有正文（只能等生成完再一次给出）
 	finalOnlyPayload bool
+
+	// noUsage 模拟真实上游：终态 payload 里没有 usage（抓包实证），网关须自行计数。
+	noUsage bool
 }
 
 // genState 是单个生成请求的状态。
@@ -101,6 +105,9 @@ func (f *fakeUpstream) payloadOutput(text string, withReasoning bool) map[string
 			map[string]any{"type": "output_text", "text": text},
 		},
 	})
+	if f.noUsage {
+		return map[string]any{"output": output}
+	}
 	return map[string]any{
 		"output": output,
 		"usage":  map[string]any{"input_tokens": 12, "output_tokens": 40},
@@ -2037,4 +2044,72 @@ func TestAdmin_Requests_And_Chat_SQLite(t *testing.T) {
 		t.Fatalf("DELETE /admin/chat/sessions 失败: %v", err)
 	}
 	respDel.Body.Close()
+}
+
+// 真实上游不回 usage：网关按实际收发内容用 o200k_base 精确计数，
+// 同一组数字既返回给客户端，也写进请求流水。
+func TestE2E_MeasuredUsageRecorded(t *testing.T) {
+	ts, _ := newTestServer(t, &fakeUpstream{t: t, noUsage: true}, goodAccount(), nil)
+
+	code, out := doLocal(t, http.MethodPost, ts.URL+"/v1/chat/completions",
+		`{"model":"gpt-5","messages":[{"role":"user","content":"hello world"}]}`,
+		map[string]string{"Content-Type": "application/json"})
+	if code != http.StatusOK {
+		t.Fatalf("chat 失败: %d %s", code, out)
+	}
+	var resp struct {
+		Choices []struct {
+			Message struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens            int `json:"prompt_tokens"`
+			CompletionTokens        int `json:"completion_tokens"`
+			TotalTokens             int `json:"total_tokens"`
+			CompletionTokensDetails struct {
+				ReasoningTokens int `json:"reasoning_tokens"`
+			} `json:"completion_tokens_details"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(out), &resp); err != nil || len(resp.Choices) == 0 {
+		t.Fatalf("解析响应失败: %v %s", err, out)
+	}
+	u := resp.Usage
+	// 输出 = 正文 + 推理文本的精确 token 数（推理部分单列 reasoning_tokens）；
+	// 输入至少含 user 消息本身（3 帧 + 角色 1 + 正文 2）+ 回复引导 3
+	msg := resp.Choices[0].Message
+	reasoning := tokens.Count(msg.ReasoningContent)
+	if want := tokens.Count(msg.Content) + reasoning; u.CompletionTokens != want {
+		t.Fatalf("completion_tokens = %d, 正文+推理精确计数为 %d", u.CompletionTokens, want)
+	}
+	if u.CompletionTokensDetails.ReasoningTokens != reasoning {
+		t.Fatalf("reasoning_tokens = %d, want %d", u.CompletionTokensDetails.ReasoningTokens, reasoning)
+	}
+	if u.PromptTokens < 9 || u.TotalTokens != u.PromptTokens+u.CompletionTokens {
+		t.Fatalf("usage 不自洽: %+v", u)
+	}
+
+	// 流水异步落库，轮询等待
+	var logged struct {
+		Items []struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"items"`
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		code, body := doLocal(t, http.MethodGet, ts.URL+"/admin/requests?page=1&page_size=1", "", nil)
+		if code == http.StatusOK && json.Unmarshal([]byte(body), &logged) == nil && len(logged.Items) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("请求流水未落库: %d %s", code, body)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := logged.Items[0]; got.PromptTokens != u.PromptTokens || got.CompletionTokens != u.CompletionTokens {
+		t.Fatalf("流水用量 %+v 与响应 usage %+v 不一致", got, u)
+	}
 }

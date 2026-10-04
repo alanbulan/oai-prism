@@ -146,14 +146,20 @@ func applyHeaderOverrides(r *http.Request, model, effort *string) (accountID, pr
 	return
 }
 
-// bindLogAccount 把本次运行实际使用的账号记进审计上下文。
+// bindLogResult 把本次运行实际使用的账号与 token 用量记进审计上下文。
 //
 // 账号是 Runner 在租约阶段才确定的，外层事先不知道。不能写回请求头：
 // X-Oaiprism-Account 是客户端可控输入，失败时流水会记下调用方伪造的值。
 // res 可能为 nil（启动即失败，连账号都没租到），此时不写。
-func bindLogAccount(r *http.Request, res *RunResult) {
-	if res != nil && res.AccountID != "" {
+func bindLogResult(r *http.Request, res *RunResult) {
+	if res == nil {
+		return
+	}
+	if res.AccountID != "" {
 		middleware.RecordLogAccount(r, res.AccountID)
+	}
+	if res.Usage != nil {
+		middleware.RecordLogUsage(r, res.Usage.InputTokens, res.Usage.OutputTokens)
 	}
 }
 

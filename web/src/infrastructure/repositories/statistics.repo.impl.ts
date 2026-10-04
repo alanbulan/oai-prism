@@ -50,6 +50,8 @@ export class StatisticsRepositoryImpl implements IStatisticsRepository {
     let failures = 0;
     let successRate = 100.0;
     let avgLatencyMs = 0;
+    let promptTokens = 0;
+    let completionTokens = 0;
 
     try {
       const res = await httpClient.get<any>('/admin/statistics');
@@ -58,6 +60,8 @@ export class StatisticsRepositoryImpl implements IStatisticsRepository {
       failures = data.failures || 0;
       successRate = data.success_rate !== undefined ? Number(data.success_rate.toFixed(1)) : 100.0;
       avgLatencyMs = data.avg_latency_ms || 0;
+      promptTokens = data.total_prompt_tokens || 0;
+      completionTokens = data.total_completion_tokens || 0;
     } catch {
       // 若尚未发起请求或失败，以 0 为准
     }
@@ -70,6 +74,8 @@ export class StatisticsRepositoryImpl implements IStatisticsRepository {
       accountsTotal: adminStats.accountsTotal,
       currentQPS: totalReq > 0 ? Number((totalReq / Math.max(adminStats.uptimeSec, 1)).toFixed(2)) : 0,
       avgLatencyMs,
+      promptTokens,
+      completionTokens,
       projectCacheSize: adminStats.projectCacheSize,
       uptimeSec: adminStats.uptimeSec,
     };
@@ -96,6 +102,8 @@ export class StatisticsRepositoryImpl implements IStatisticsRepository {
         requests: m.requests || 0,
         percentage: m.percentage !== undefined ? Number(m.percentage.toFixed(1)) : 0,
         avgLatencyMs: m.avg_latency_ms || 0,
+        promptTokens: m.prompt_tokens || 0,
+        completionTokens: m.completion_tokens || 0,
       }));
     } catch {
       return [];
@@ -108,6 +116,9 @@ export class StatisticsRepositoryImpl implements IStatisticsRepository {
       const data = res.data?.time_series || [];
       return data.map((p: any) => ({
         timestamp: p.timestamp,
+        requests: p.requests || 0,
+        failures: p.failures || 0,
+        tokens: p.tokens || 0,
         qps: p.qps !== undefined ? Number(p.qps.toFixed(2)) : 0,
         latency: p.latency || 0,
         errorRate: p.error_rate !== undefined ? Number(p.error_rate.toFixed(1)) : 0,
@@ -123,7 +134,7 @@ export class StatisticsRepositoryImpl implements IStatisticsRepository {
     params.set('page_size', String(filter.pageSize || 10));
     if (filter.model) params.set('model', filter.model);
     if (filter.accountId) params.set('account_id', filter.accountId);
-    if (filter.statusCode) params.set('status', String(filter.statusCode));
+    if (filter.status) params.set('status', filter.status);
 
     const res = await httpClient.get<any>(`/admin/requests?${params.toString()}`);
     const data = res.data || {};
@@ -132,8 +143,8 @@ export class StatisticsRepositoryImpl implements IStatisticsRepository {
       timestamp: d.timestamp,
       method: d.method || 'GET',
       path: d.path || '',
-      model: d.model || '-',
-      accountId: d.account_id || '-',
+      model: d.model || '',
+      accountId: d.account_id || '',
       statusCode: d.status_code || 200,
       durationMs: d.duration_ms || 0,
       promptTokens: d.prompt_tokens || 0,

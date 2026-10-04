@@ -9,6 +9,26 @@ import axios from 'axios';
  */
 const API_KEY_STORAGE = 'oaiprism_api_key';
 
+/**
+ * 凭据事件：网关鉴权中间件拒绝（401/403 且错误码属于网关自身）时通知订阅方，
+ * 由应用层弹出"连接网关"引导 —— 此前前端静默吞掉 401，页面只剩空表，
+ * 看起来像账号数据丢失。
+ */
+const GATEWAY_AUTH_CODES = new Set(['invalid_api_key', 'admin_forbidden', 'cross_origin_forbidden']);
+const authFailureListeners = new Set<(message: string) => void>();
+const credentialListeners = new Set<() => void>();
+
+export function onAuthFailure(fn: (message: string) => void): () => void {
+  authFailureListeners.add(fn);
+  return () => authFailureListeners.delete(fn);
+}
+
+/** 本地保存的 Key 变化（填入、切换、登录）时触发 */
+export function onCredentialChange(fn: () => void): () => void {
+  credentialListeners.add(fn);
+  return () => credentialListeners.delete(fn);
+}
+
 export function getApiKey(): string {
   try {
     return localStorage.getItem(API_KEY_STORAGE) || '';
@@ -27,6 +47,7 @@ export function setApiKey(key: string): void {
   } catch {
     // 隐私模式下 localStorage 可能不可用：静默降级为会话内使用。
   }
+  credentialListeners.forEach((fn) => fn());
 }
 
 /**
@@ -41,8 +62,9 @@ export const httpClient = axios.create({
 });
 
 httpClient.interceptors.request.use((config) => {
+  // 调用方显式指定的 Authorization 优先（如保存前先校验候选 Key）
   const key = getApiKey();
-  if (key) {
+  if (key && !config.headers.Authorization) {
     config.headers.Authorization = `Bearer ${key}`;
   }
   return config;
@@ -58,6 +80,10 @@ httpClient.interceptors.response.use(
       (typeof data?.error === 'string' ? data.error : '') ||
       error.message ||
       '网络请求异常';
+    const status = error.response?.status;
+    if ((status === 401 || status === 403) && GATEWAY_AUTH_CODES.has(data?.error?.code)) {
+      authFailureListeners.forEach((fn) => fn(msg));
+    }
     return Promise.reject(new Error(msg));
   }
 );

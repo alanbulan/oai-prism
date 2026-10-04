@@ -165,9 +165,21 @@ type ChatChoice struct {
 
 // ChatUsage 是 token 用量。
 type ChatUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens            int                      `json:"prompt_tokens"`
+	CompletionTokens        int                      `json:"completion_tokens"`
+	TotalTokens             int                      `json:"total_tokens"`
+	PromptTokensDetails     *PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+}
+
+// PromptTokensDetails 与 OpenAI 同名结构对齐。网关不做提示缓存，cached_tokens 恒为 0。
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
+// CompletionTokensDetails 中 reasoning_tokens 已含在 completion_tokens 内。
+type CompletionTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
 }
 
 // ---------------------------- Anthropic Messages ----------------------------
@@ -289,9 +301,21 @@ type ResponsesContent struct {
 
 // ResponsesUsage 是用量。
 type ResponsesUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-	TotalTokens  int `json:"total_tokens"`
+	InputTokens         int                         `json:"input_tokens"`
+	InputTokensDetails  ResponsesInputTokenDetails  `json:"input_tokens_details"`
+	OutputTokens        int                         `json:"output_tokens"`
+	OutputTokensDetails ResponsesOutputTokenDetails `json:"output_tokens_details"`
+	TotalTokens         int                         `json:"total_tokens"`
+}
+
+// ResponsesInputTokenDetails 与 OpenAI 同名结构对齐（Codex CLI 会读取）。
+type ResponsesInputTokenDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
+// ResponsesOutputTokenDetails 中 reasoning_tokens 已含在 output_tokens 内。
+type ResponsesOutputTokenDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
 }
 
 // ---------------------------- 错误 ----------------------------

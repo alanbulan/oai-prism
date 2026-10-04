@@ -10,6 +10,8 @@ interface AccountState {
   readyCount: number;
   credsFile: string;
   loading: boolean;
+  /** 最近一次拉取失败的原因（成功后清空） */
+  error: string;
   selectedAccount: AccountStats | null;
   detailDrawerOpen: boolean;
   importModalOpen: boolean;
@@ -39,6 +41,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
   readyCount: 0,
   credsFile: '',
   loading: false,
+  error: '',
   selectedAccount: null,
   detailDrawerOpen: false,
   importModalOpen: false,
@@ -57,7 +60,11 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         totalCount: data.count,
         readyCount: data.ready,
         credsFile: data.creds_file,
+        error: '',
       });
+    } catch (err: any) {
+      // 不向上抛：页面以 error 渲染空态；鉴权失败另由 auth store 引导
+      set({ error: err?.message || '加载失败' });
     } finally {
       set({ loading: false });
     }

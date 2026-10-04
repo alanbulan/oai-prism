@@ -185,7 +185,7 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 	}
 
 	res, runErr := h.runner.Run(r.Context(), runReq, emit)
-	bindLogAccount(r, res)
+	bindLogResult(r, res)
 	// 成功回复才记历史：失败（含吐了一半就断）的轮次进历史会把残缺回答教给模型。
 	if runErr == nil {
 		sessionChainPut(runReq.StickyKey, chainConv(res), resReqID(res), resAccount(res), runReq.Model)
@@ -247,8 +247,7 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 	if includeUsage && res != nil {
 		usage := res.Usage
 		if usage == nil {
-			est := estimateTokens(res.Text)
-			usage = &prism.Usage{OutputTokens: est, TotalTokens: est}
+			usage = outputOnlyUsage(res)
 		}
 		buf = AppendChatChunk(buf[:0], ChatChunkSpec{
 			ID: id, Created: created, Model: publicModel, EmptyChoices: true, Usage: usage,
@@ -263,7 +262,7 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 // syncChat 处理非流式返回。
 func (h *Handler) syncChat(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id string, created int64, publicModel string, declaredTools []ChatTool) {
 	res, err := h.runner.Run(r.Context(), runReq, nil)
-	bindLogAccount(r, res)
+	bindLogResult(r, res)
 	// 成功回复才记历史：失败的轮次进历史会把"空回答"教给模型。
 	if err == nil {
 		sessionChainPut(runReq.StickyKey, chainConv(res), resReqID(res), resAccount(res), runReq.Model)
@@ -307,17 +306,12 @@ func (h *Handler) syncChat(w http.ResponseWriter, r *http.Request, runReq *RunRe
 		resp.PrismConversationID = res.ConversationID
 		setConversationHeader(w, res.ConversationID)
 	}
-	if res.Usage != nil {
-		resp.Usage = &ChatUsage{
-			PromptTokens:     res.Usage.InputTokens,
-			CompletionTokens: res.Usage.OutputTokens,
-			TotalTokens:      res.Usage.TotalTokens,
-		}
-	} else {
-		// 上游未给用量时按字符数粗略估算，避免客户端拿到 null 崩掉。
-		est := estimateTokens(res.Text)
-		resp.Usage = &ChatUsage{PromptTokens: 0, CompletionTokens: est, TotalTokens: est}
+	usage := res.Usage
+	if usage == nil {
+		// runner 成功路径总会给出用量；这里只是防御，避免客户端拿到 null 崩掉。
+		usage = outputOnlyUsage(res)
 	}
+	resp.Usage = newChatUsage(usage)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -360,36 +354,6 @@ func finishReason(res *RunResult) string {
 		return "tool_calls"
 	}
 	return "stop"
-}
-
-// estimateInputTokens 估算一次请求的 prompt token 量：累加全部
-// input 条目（system + 折叠历史 + 本轮消息）的文本。
-// 这就是"上下文窗口用量"的数值来源（上游轮询响应不回 usage）。
-func estimateInputTokens(items []prism.InputItem) int {
-	var sb strings.Builder
-	for _, it := range items {
-		for _, c := range it.Content {
-			sb.WriteString(c.Text)
-		}
-	}
-	return estimateTokens(sb.String())
-}
-
-// estimateTokens 是尽力而为的估算：CJK 约 1 字 1 token，
-// 拉丁文约 4 字符 1 token。只用于上游没给用量时的占位。
-func estimateTokens(s string) int {
-	if s == "" {
-		return 0
-	}
-	cjk, other := 0, 0
-	for _, r := range s {
-		if r >= 0x2E80 {
-			cjk++
-		} else {
-			other++
-		}
-	}
-	return cjk + other/4
 }
 
 // mapError 把内部错误映射成 HTTP 状态码。

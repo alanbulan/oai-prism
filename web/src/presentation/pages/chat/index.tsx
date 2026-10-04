@@ -1,5 +1,5 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Avatar, Button, Card, Dropdown, Input, List, Modal, Popconfirm, Space, Typography, Upload, message, theme } from 'antd';
+import React, { useEffect, useRef, useState } from 'react';
+import { Avatar, Button, Card, Dropdown, Input, List, Modal, Popconfirm, Space, Tooltip, Typography, Upload, message, theme } from 'antd';
 import {
   RobotOutlined,
   UserOutlined,
@@ -15,17 +15,15 @@ import {
   CloseOutlined,
   EditOutlined,
   DeleteOutlined,
-  LinkOutlined,
+  CopyOutlined,
 } from '@ant-design/icons';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import rehypeRaw from 'rehype-raw';
 import { Bubble, Sender, ThoughtChain, Prompts } from '@ant-design/x';
 import type { ReasoningEffort } from '../../../domain/chat/entity';
 import { effortsForModel } from '../../../domain/modelFilter';
 import { useChatStore } from '../../../application/chat/store';
 import { BrandLogo } from '../../components/BrandLogo';
 import { SPECTRUM } from '../../theme/tokens';
+import { MarkdownView } from './markdown/MarkdownView';
 
 const { Text } = Typography;
 
@@ -38,40 +36,6 @@ const EFFORT_LABELS: Record<ReasoningEffort, string> = {
 };
 const EFFORT_ORDER: ReasoningEffort[] = ['low', 'medium', 'high', 'xhigh'];
 
-
-/** HTML/SVG 代码块的渲染预览：iframe 直出 + 源码切换 + 新窗口打开 */
-const HtmlPreview: React.FC<{ code: string; lang: string }> = ({ code, lang }) => {
-  const { token } = theme.useToken();
-  const [showSource, setShowSource] = useState(false);
-  const blobUrl = useMemo(() => URL.createObjectURL(new Blob([code], { type: 'text/html' })), [code]);
-  useEffect(() => () => URL.revokeObjectURL(blobUrl), [blobUrl]);
-
-  return (
-    <div style={{ border: `1px solid ${token.colorBorderSecondary}`, borderRadius: 10, overflow: 'hidden', margin: '8px 0', background: token.colorBgContainer }}>
-      <div style={{ background: token.colorFillQuaternary, padding: '4px 10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: `1px solid ${token.colorBorderSecondary}` }}>
-        <span style={{ fontSize: 12, color: token.colorTextSecondary }}>{lang === 'svg' ? 'SVG 渲染预览' : 'HTML 渲染预览'}</span>
-        <Space size={0}>
-          <Button type="text" size="small" onClick={() => setShowSource(!showSource)}>
-            {showSource ? '渲染结果' : '查看源码'}
-          </Button>
-          <Button type="text" size="small" icon={<LinkOutlined />} onClick={() => window.open(blobUrl, '_blank')} title="在新窗口打开" />
-        </Space>
-      </div>
-      {showSource ? (
-        <pre style={{ background: 'var(--op-code-bg)', margin: 0, padding: '10px 12px', overflowX: 'auto', fontSize: 12 }}>
-          <code>{code}</code>
-        </pre>
-      ) : (
-        <iframe
-          srcDoc={code}
-          title="html-preview"
-          sandbox="allow-scripts"
-          style={{ width: '100%', height: 340, border: 'none', background: '#fff', display: 'block' }}
-        />
-      )}
-    </div>
-  );
-};
 
 export const ChatPlaygroundPage: React.FC = () => {
   const { token } = theme.useToken();
@@ -110,11 +74,29 @@ export const ChatPlaygroundPage: React.FC = () => {
   // 当前模型的可用推理档位（由后端清单中的档位变体推导，如 6 Luna 没有 low）
   const availableEfforts = effortsForModel(selectedModel, allModelIds);
 
-  // 消息区自动滚底（流式增量与首屏渲染都跟随）
+  // 消息区自动滚底：切换会话时直接到底；流式增量只在用户本就停在底部时跟随，
+  // 往上翻阅历史时不被新内容拽回去。
+  const stickToBottom = useRef(true);
+  const onMessagesScroll = () => {
+    const el = msgListRef.current;
+    if (el) stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
+  useEffect(() => {
+    stickToBottom.current = true;
+  }, [currentSessionId]);
   useEffect(() => {
     const el = msgListRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && stickToBottom.current) el.scrollTop = el.scrollHeight;
   }, [sessions, currentSessionId]);
+
+  const copyMessage = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      message.success('已复制整条回复（Markdown 原文）');
+    } catch {
+      message.error('复制失败：浏览器未授权剪贴板');
+    }
+  };
 
   const activeSession = sessions.find((s) => s.id === currentSessionId);
   const messages = activeSession?.messages || [];
@@ -169,10 +151,27 @@ export const ChatPlaygroundPage: React.FC = () => {
   // Bubble 列表转换
   const bubbleItems = messages.map((m) => {
     const isUser = m.role === 'user';
+    const streaming = m.status === 'loading';
     return {
       key: m.id,
       role: m.role,
       placement: (isUser ? 'end' : 'start') as 'end' | 'start',
+      // 用户消息：浅色气泡；助手回复：无边框、撑满消息区（代码与 HTML 预览需要整宽）
+      variant: (isUser ? 'filled' : 'borderless') as 'filled' | 'borderless',
+      styles: isUser
+        ? { content: { background: token.colorPrimaryBg, borderRadius: 14, maxWidth: 720 } }
+        : {
+            // 组件默认给左侧气泡右边留 15% 空白，助手回复要整宽
+            root: { paddingInlineEnd: 0 },
+            body: { flex: 1, minWidth: 0 },
+            content: { width: '100%', padding: '4px 0 0' },
+          },
+      footer:
+        !isUser && !streaming && m.content ? (
+          <Tooltip title="复制整条回复">
+            <Button type="text" size="small" icon={<CopyOutlined />} onClick={() => copyMessage(m.content)} />
+          </Tooltip>
+        ) : undefined,
       avatar: isUser ? (
         <Avatar icon={<UserOutlined />} style={{ background: `linear-gradient(135deg, ${token.colorPrimary}, #a855f7)` }} />
       ) : (
@@ -201,11 +200,7 @@ export const ChatPlaygroundPage: React.FC = () => {
                   {
                     title: '深度推理过程',
                     status: m.status === 'loading' ? 'loading' : 'success',
-                    description: (
-                      <Text type="secondary" style={{ whiteSpace: 'pre-wrap', fontSize: 13 }}>
-                        {m.reasoning}
-                      </Text>
-                    ),
+                    description: <MarkdownView content={m.reasoning} streaming={streaming} className="md-reasoning" />,
                   },
                 ]}
               />
@@ -214,31 +209,11 @@ export const ChatPlaygroundPage: React.FC = () => {
           {isUser ? (
             <div style={{ whiteSpace: 'pre-wrap', fontSize: 14 }}>{m.content}</div>
           ) : (
-            <div className="md-body">
-              {m.content ? (
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm]}
-                  rehypePlugins={[rehypeRaw]}
-                  components={{
-                    // html/svg 代码块 → 渲染预览（iframe 直出），其余走默认
-                    pre: ({ children }: any) => {
-                      const child: any = Array.isArray(children) ? children[0] : children;
-                      const cls: string = child?.props?.className || '';
-                      const lang = (/language-(\w+)/.exec(cls)?.[1] || '').toLowerCase();
-                      const raw = String(child?.props?.children ?? '').replace(/\n$/, '');
-                      if ((lang === 'html' || lang === 'svg') && raw) {
-                        return <HtmlPreview code={raw} lang={lang} />;
-                      }
-                      return <pre>{children}</pre>;
-                    },
-                  }}
-                >
-                  {m.content}
-                </ReactMarkdown>
-              ) : m.status === 'loading' ? (
-                '正在思考生成中...'
-              ) : null}
-            </div>
+            m.content ? (
+              <MarkdownView content={m.content} streaming={streaming} />
+            ) : streaming ? (
+              <Text type="secondary">正在思考生成中…</Text>
+            ) : null
           )}
         </div>
       ),
@@ -324,6 +299,7 @@ export const ChatPlaygroundPage: React.FC = () => {
             locale={{ emptyText: '暂无会话' }}
             renderItem={(s) => (
               <List.Item
+                className="conv-item"
                 onClick={() => selectSession(s.id)}
                 style={{
                   cursor: 'pointer',
@@ -366,9 +342,11 @@ export const ChatPlaygroundPage: React.FC = () => {
               >
                 {/* 单行强制：flex + minWidth:0 + ellipsis，任何长度都不折行 */}
                 <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
-                  <span style={{ display: 'block', fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {s.title}
-                  </span>
+                  <Tooltip title={s.title} placement="right" mouseEnterDelay={0.6}>
+                    <span style={{ display: 'block', fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {s.title}
+                    </span>
+                  </Tooltip>
                 </div>
               </List.Item>
             )}
@@ -378,7 +356,7 @@ export const ChatPlaygroundPage: React.FC = () => {
         {/* 右侧对话主体区（官方 Bubble.List + Sender） */}
         <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
           {/* 消息展示区：撑满剩余高度、内部滚动、自动跟随到底 */}
-          <div ref={msgListRef} style={{ flex: 1, minHeight: 0, padding: 20, overflowY: 'auto' }}>
+          <div ref={msgListRef} onScroll={onMessagesScroll} style={{ flex: 1, minHeight: 0, padding: '20px 24px', overflowY: 'auto' }}>
             {messages.length === 0 ? (
               <div style={{ textAlign: 'center', marginTop: 60 }}>
                 <BrandLogo size={56} style={{ margin: '0 auto' }} />

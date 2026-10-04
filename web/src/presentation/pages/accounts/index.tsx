@@ -14,6 +14,7 @@ import {
   message,
   Typography,
   Popconfirm,
+  Empty,
   theme,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
@@ -30,14 +31,17 @@ import {
   CheckCircleOutlined,
   WarningOutlined,
   FieldTimeOutlined,
+  DisconnectOutlined,
 } from '@ant-design/icons';
 import type { AccountStats } from '../../../domain/account/entity';
 import { useAccountStore } from '../../../application/account/store';
+import { useAuthStore } from '../../../application/auth/store';
 import { AccountImportModal } from './AccountImportModal';
 import { PlanDetailDrawer } from './PlanDetailDrawer';
 import { AccountEditModal } from './AccountEditModal';
 import { StatCard } from '../../components/StatCard';
 import { SPECTRUM } from '../../theme/tokens';
+import { formatDate } from '../../utils/format';
 
 const { Text } = Typography;
 
@@ -49,6 +53,7 @@ export const AccountsPage: React.FC = () => {
     accounts,
     readyCount,
     loading,
+    error,
     fetchAccounts,
     reloadPool,
     refreshAccount,
@@ -57,6 +62,7 @@ export const AccountsPage: React.FC = () => {
     openEditModal,
     setImportModalOpen,
   } = useAccountStore();
+  const { blocked, openPrompt } = useAuthStore();
 
   // 搜索与过滤状态
   const [searchText, setSearchText] = useState('');
@@ -114,13 +120,17 @@ export const AccountsPage: React.FC = () => {
   }, [accounts]);
 
   const readyPct = accounts.length > 0 ? Math.round((readyCount / accounts.length) * 100) : 0;
+  // 未连接网关时数据未知：显示"—"而不是 0，避免误以为账号被清空
+  const unknown = blocked && accounts.length === 0;
+  const kpi = (n: number) => (unknown ? '—' : n);
+  const unit = unknown ? undefined : '个';
 
   // 单账号后端刷新
   const handleSingleRefresh = async (record: AccountStats) => {
     setRefreshingId(record.id);
     try {
       const res = await refreshAccount(record.id);
-      message.success(`账号 [${record.name}] 凭据已刷新！计划: ${res.plan}，到期: ${new Date(res.expires_at).toLocaleDateString()}`);
+      message.success(`账号 [${record.name}] 凭据已刷新！计划: ${res.plan}，到期: ${formatDate(res.expires_at)}`);
     } catch (err: any) {
       message.error(`刷新失败: ${err.message}`);
     } finally {
@@ -133,7 +143,7 @@ export const AccountsPage: React.FC = () => {
       title: '账号',
       dataIndex: 'name',
       key: 'name',
-      width: 250,
+      // 不设宽度：吃掉其余列分完后的剩余空间
       fixed: 'left',
       render: (_, record) => (
         <div style={{ minWidth: 0, lineHeight: 1.45 }}>
@@ -154,7 +164,7 @@ export const AccountsPage: React.FC = () => {
               type="secondary"
               copyable={{ text: record.email }}
               ellipsis
-              style={{ display: 'block', fontSize: 12, maxWidth: 220 }}
+              style={{ display: 'block', fontSize: 12, maxWidth: '100%' }}
             >
               {record.email}
             </Text>
@@ -168,7 +178,7 @@ export const AccountsPage: React.FC = () => {
       title: '计划',
       dataIndex: 'plan',
       key: 'plan',
-      width: 100,
+      width: 96,
       render: (plan) => {
         const p = (plan || 'pro').toLowerCase();
         const color = p.includes('team') || p.includes('enterprise') ? 'gold' : p.includes('pro') ? 'blue' : 'default';
@@ -183,7 +193,7 @@ export const AccountsPage: React.FC = () => {
       title: '调度状态',
       dataIndex: 'enabled',
       key: 'enabled',
-      width: 120,
+      width: 108,
       render: (enabled, record) => {
         if (record.cooldown_sec > 0) {
           return (
@@ -205,7 +215,7 @@ export const AccountsPage: React.FC = () => {
     {
       title: '凭据构成',
       key: 'credentials',
-      width: 160,
+      width: 164,
       render: (_, record) => (
         <span className="cred-tags">
           <Tooltip title={record.has_access_token ? 'Access Token 正常' : '缺失 Access Token'}>
@@ -226,13 +236,13 @@ export const AccountsPage: React.FC = () => {
       title: 'Token 到期',
       dataIndex: 'token_expires',
       key: 'token_expires',
-      width: 120,
+      width: 116,
       render: (expires, record) => {
         if (!expires) return <Text type="secondary">永久/静态</Text>;
         const days = Math.round((record.expires_in_sec || 0) / 86400);
         return (
           <div style={{ lineHeight: 1.45 }}>
-            <div style={{ fontVariantNumeric: 'tabular-nums' }}>{new Date(expires).toLocaleDateString()}</div>
+            <div style={{ fontVariantNumeric: 'tabular-nums' }}>{formatDate(expires)}</div>
             <Text type={days <= 2 ? 'danger' : 'secondary'} style={{ fontSize: 12 }}>
               <ClockCircleOutlined /> {days > 0 ? `剩余 ${days} 天` : '即将到期'}
             </Text>
@@ -241,32 +251,32 @@ export const AccountsPage: React.FC = () => {
       },
     },
     {
-      title: <Tooltip title="在途请求 / 并发上限">并发</Tooltip>,
-      key: 'concurrency',
-      width: 80,
+      // 并发与请求计数合并为一列：两行紧凑展示，窄屏也不挤压账号列
+      title: <Tooltip title="在途请求 / 并发上限；本次启动以来的请求与失败数">负载</Tooltip>,
+      key: 'load',
+      width: 120,
       render: (_, record) => {
         const max = record.max_concurrency > 0 ? record.max_concurrency : '∞';
         return (
-          <Text style={{ fontVariantNumeric: 'tabular-nums' }}>
-            <strong>{record.inflight}</strong> / {max}
-          </Text>
+          <div style={{ lineHeight: 1.45, fontVariantNumeric: 'tabular-nums' }}>
+            <div>
+              <Text type="secondary" style={{ fontSize: 12 }}>并发 </Text>
+              <strong>{record.inflight}</strong> / {max}
+            </div>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              请求 {record.total_requests} · 失败{' '}
+              <Text type={record.failures > 0 ? 'danger' : 'secondary'} style={{ fontSize: 12 }}>
+                {record.failures}
+              </Text>
+            </Text>
+          </div>
         );
       },
     },
     {
-      title: '请求 / 失败',
-      key: 'stats',
-      width: 100,
-      render: (_, record) => (
-        <Text style={{ fontVariantNumeric: 'tabular-nums' }}>
-          {record.total_requests} / <Text type={record.failures > 0 ? 'danger' : 'secondary'}>{record.failures}</Text>
-        </Text>
-      ),
-    },
-    {
       title: '操作',
       key: 'actions',
-      width: 150,
+      width: 128,
       fixed: 'right',
       render: (_, record) => (
         <Space size={2}>
@@ -315,8 +325,8 @@ export const AccountsPage: React.FC = () => {
       <Col xs={12} xl={6}>
         <StatCard
           title="账号总数"
-          value={accounts.length}
-          suffix="个"
+          value={kpi(accounts.length)}
+          suffix={unit}
           icon={<TeamOutlined />}
           color={SPECTRUM[0]}
           loading={loading && accounts.length === 0}
@@ -326,8 +336,8 @@ export const AccountsPage: React.FC = () => {
       <Col xs={12} xl={6}>
         <StatCard
           title="就绪可调度"
-          value={readyCount}
-          suffix="个"
+          value={kpi(readyCount)}
+          suffix={unit}
           icon={<CheckCircleOutlined />}
           color={token.colorSuccess}
           loading={loading && accounts.length === 0}
@@ -337,8 +347,8 @@ export const AccountsPage: React.FC = () => {
       <Col xs={12} xl={6}>
         <StatCard
           title="冷却 / 停用"
-          value={overview.cooling + overview.disabled}
-          suffix="个"
+          value={kpi(overview.cooling + overview.disabled)}
+          suffix={unit}
           icon={<WarningOutlined />}
           color={token.colorWarning}
           loading={loading && accounts.length === 0}
@@ -348,14 +358,14 @@ export const AccountsPage: React.FC = () => {
       <Col xs={12} xl={6}>
         <StatCard
           title="7 天内凭据到期"
-          value={overview.expiring}
-          suffix="个"
+          value={kpi(overview.expiring)}
+          suffix={unit}
           icon={<FieldTimeOutlined />}
           color={token.colorError}
           loading={loading && accounts.length === 0}
           footer={
             overview.earliest
-              ? `最早到期 ${new Date(overview.earliest).toLocaleDateString()}`
+              ? `最早到期 ${formatDate(overview.earliest)}`
               : '无带有效期的凭据'
           }
         />
@@ -472,7 +482,33 @@ export const AccountsPage: React.FC = () => {
           columns={columns}
           dataSource={filteredAccounts}
           loading={loading}
-          scroll={{ x: 1080, y: 200 }}
+          // x = 账号列最小 200 + 其余列宽之和；容器更宽时余量全部归账号列
+          scroll={{ x: 932, y: 200 }}
+          locale={{
+            emptyText: blocked ? (
+              <Empty
+                image={<DisconnectOutlined style={{ fontSize: 40, color: token.colorWarning }} />}
+                styles={{ image: { height: 48 } }}
+                description="未连接网关，暂时无法读取账号（数据仍在网关中）"
+              >
+                <Button type="primary" onClick={openPrompt}>
+                  填入 API Key
+                </Button>
+              </Empty>
+            ) : error ? (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={`加载失败：${error}`}>
+                <Button onClick={fetchAccounts}>重试</Button>
+              </Empty>
+            ) : accounts.length === 0 ? (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="账号池还是空的">
+                <Button type="primary" icon={<PlusOutlined />} onClick={() => setImportModalOpen(true)}>
+                  导入新账号
+                </Button>
+              </Empty>
+            ) : (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有符合筛选条件的账号" />
+            ),
+          }}
           pagination={{
             current: currentPage,
             pageSize: pageSize,

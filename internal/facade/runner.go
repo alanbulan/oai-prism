@@ -383,6 +383,8 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	if projectID != "" {
 		inputItems, hasNewUpload = preprocessInputImages(ctx, r.client, p, r.uploads, acct.ID, projectID, inputItems)
 	}
+	// 用量按真正发往上游的条目计（图片预处理之后），与上游生成并行计数
+	inputTokens := countInputAsync(inputItems)
 
 	// 2.5) 工作区同步：若上传了新文件，强制失效同步状态，触发沙箱拉取最新文件
 	if hasNewUpload {
@@ -573,6 +575,9 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		if st.Usage != nil {
 			result.Usage = st.Usage
 		}
+		if st.Reasoning != "" {
+			result.Reasoning = st.Reasoning
+		}
 		if st.ResponseID != "" {
 			result.ResponseID = st.ResponseID
 		}
@@ -587,13 +592,10 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		}
 		if st.Done {
 			r.journal.MarkTerminal(requestID, "completed", result.Text, nil)
-			// usage 兜底：上游轮询响应从不回 usage（顶层与 payload 均无
-			// 此键，抓包实证）。prompt 按本轮实际发送的 input 估算 ——
-			// 全量折叠模式下它就是"上下文窗口占用"的本体。
-			in := estimateInputTokens(req.Input)
-			out := estimateTokens(result.Text)
+			// 上游轮询响应从不回 usage（顶层与 payload 均无此键，抓包实证），
+			// 按本轮实际收发内容精确计数（见 usage.go）。
 			if result.Usage == nil {
-				result.Usage = &prism.Usage{InputTokens: in, OutputTokens: out, TotalTokens: in + out}
+				result.Usage = measuredUsage(inputTokens(), result)
 			}
 			if result.ProjectID != "" && result.ConversationID != "" {
 				r.projects.Put(acct.ID, "cid:"+result.ConversationID, result.ProjectID, time.Now())
@@ -770,11 +772,9 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 				return result, err
 			}
 			r.journal.MarkTerminal(requestID, "completed", result.Text, nil)
-			// usage 兜底（与上方 start 直达完成路径同款）：上游不回 usage。
-			in := estimateInputTokens(req.Input)
-			out := estimateTokens(result.Text)
+			// 用量计算与上方 start 直达完成路径同款。
 			if result.Usage == nil {
-				result.Usage = &prism.Usage{InputTokens: in, OutputTokens: out, TotalTokens: in + out}
+				result.Usage = measuredUsage(inputTokens(), result)
 			}
 			if result.ProjectID != "" && result.ConversationID != "" {
 				r.projects.Put(acct.ID, "cid:"+result.ConversationID, result.ProjectID, time.Now())

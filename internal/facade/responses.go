@@ -317,7 +317,7 @@ func hasContinuation(req *RunRequest) bool {
 // canRetry 由调用方决定（流式路径只有在客户端还没收到任何正文时才能重试）。
 func (h *Handler) runResponses(r *http.Request, runReq *RunRequest, turn *responsesTurn, emit func(Delta) error, canRetry func() bool) (*RunResult, error) {
 	res, err := h.runner.Run(r.Context(), runReq, emit)
-	bindLogAccount(r, res)
+	bindLogResult(r, res)
 	if err == nil || turn.isAux || !hasContinuation(runReq) || !isContinuationError(err) {
 		return res, err
 	}
@@ -336,7 +336,7 @@ func (h *Handler) runResponses(r *http.Request, runReq *RunRequest, turn *respon
 		runReq.ProjectID = ""
 	}
 	res, err = h.runner.Run(r.Context(), runReq, emit)
-	bindLogAccount(r, res)
+	bindLogResult(r, res)
 	return res, err
 }
 
@@ -663,11 +663,7 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 		text = res.Text
 		conversationID = res.ConversationID
 		if res.Usage != nil {
-			usage = &ResponsesUsage{
-				InputTokens:  res.Usage.InputTokens,
-				OutputTokens: res.Usage.OutputTokens,
-				TotalTokens:  res.Usage.TotalTokens,
-			}
+			usage = newResponsesUsage(res.Usage)
 		}
 	}
 

@@ -16,6 +16,7 @@
   --op-muted: #667085;
   --op-scrollbar: rgba(16, 24, 40, 0.16);
   --op-scrollbar-hover: rgba(16, 24, 40, 0.28);
+  --op-conv-hover: #f2f3f8;
 }
 
 html[data-theme='dark'] {
@@ -29,6 +30,7 @@ html[data-theme='dark'] {
   --op-muted: #98a2b3;
   --op-scrollbar: rgba(255, 255, 255, 0.14);
   --op-scrollbar-hover: rgba(255, 255, 255, 0.26);
+  --op-conv-hover: #1a1e28;
 }
 
 html,
@@ -119,9 +121,9 @@ body,
   }
 }
 
-/* 页面根：填满 Content 容器（Content 高度 = 100vh - 顶栏 64px - 上下边距） */
+/* 页面根：填满 Content 容器剩余高度（顶部可能有"未连接"横幅，故用 flex 而非 100%） */
 .page-fill {
-  height: 100%;
+  flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -201,9 +203,32 @@ body,
   overflow: hidden;
 }
 
+/* 表头一律单行：列宽不足时由横向滚动承担，而不是把"请求 / 失败"折成两行 */
+.ant-table-wrapper .ant-table-thead > tr > th {
+  white-space: nowrap;
+}
+
 /* 请求明细流水：所有单元格强制单行，禁止自动换行（换行属于显示缺陷） */
 .stat-log .ant-table-cell {
   white-space: nowrap;
+}
+
+.stat-log .ant-table-tbody > tr {
+  cursor: pointer;
+}
+
+/* 详情抽屉里的 User-Agent / 错误信息：等宽、可换行、可选中 */
+.op-mono-block {
+  font-family: 'JetBrains Mono', 'Cascadia Code', 'SF Mono', Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: var(--op-code-bg);
+  border: 1px solid var(--op-code-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 0;
 }
 
 /* 凭据构成标签：紧凑无边距，防止撑破列宽 */
@@ -223,88 +248,28 @@ body,
   border-radius: 4px;
 }
 
-/* ------------------------------------------------------------------
-   Chat Markdown 渲染体：代码块/表格/列表的排版细节
-   ------------------------------------------------------------------ */
-.md-body {
-  font-size: 14px;
-  line-height: 1.65;
-  word-break: break-word;
+/* Chat 的 Markdown 渲染样式随页面按需加载：pages/chat/markdown/markdown.css */
+
+/* 会话列表：标题占满整行，操作按钮悬停时浮现（不再常驻挤占标题） */
+.conv-item {
+  position: relative;
 }
 
-.md-body p {
-  margin: 0 0 8px;
+.conv-item .ant-list-item-action {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  margin-inline-start: 0 !important;
+  transform: translateY(-50%);
+  opacity: 0;
+  transition: opacity 0.15s;
+  padding-inline-start: 16px;
+  background: linear-gradient(90deg, transparent, var(--op-conv-hover) 14px);
 }
 
-.md-body p:last-child {
-  margin-bottom: 0;
-}
-
-.md-body pre {
-  background: var(--op-code-bg);
-  border: 1px solid var(--op-code-border);
-  border-radius: 10px;
-  padding: 12px 14px;
-  overflow-x: auto;
-  margin: 8px 0;
-}
-
-.md-body code {
-  font-family: 'JetBrains Mono', 'Cascadia Code', 'SF Mono', Consolas, monospace;
-  font-size: 13px;
-}
-
-.md-body pre code {
-  background: transparent;
-  border: none;
-  padding: 0;
-}
-
-.md-body :not(pre) > code {
-  background: var(--op-inline-code-bg);
-  color: var(--op-inline-code-fg);
-  border-radius: 4px;
-  padding: 1px 5px;
-}
-
-.md-body table {
-  border-collapse: collapse;
-  margin: 8px 0;
-  width: 100%;
-}
-
-.md-body th,
-.md-body td {
-  border: 1px solid var(--op-table-border);
-  padding: 6px 10px;
-  text-align: left;
-}
-
-.md-body th {
-  background: var(--op-table-head);
-}
-
-.md-body ul,
-.md-body ol {
-  padding-left: 22px;
-  margin: 6px 0;
-}
-
-.md-body blockquote {
-  border-left: 3px solid var(--op-quote);
-  margin: 8px 0;
-  padding: 2px 12px;
-  color: var(--op-muted);
-}
-
-.md-body img {
-  max-width: 100%;
-  border-radius: 8px;
-}
-
-.md-body h1, .md-body h2, .md-body h3, .md-body h4 {
-  margin: 12px 0 8px;
-  line-height: 1.4;
+.conv-item:hover .ant-list-item-action,
+.conv-item:focus-within .ant-list-item-action {
+  opacity: 1;
 }
 
 /* 会话列表：去阴影，回归标准列表观感 */

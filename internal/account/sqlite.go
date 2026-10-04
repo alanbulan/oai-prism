@@ -374,20 +374,26 @@ type RequestLogFilter struct {
 	Model      string
 	AccountID  string
 	StatusCode int
+	// StatusClass 按状态码段过滤：2 → 2xx，4 → 4xx，5 → 5xx（与 StatusCode 二选一）。
+	StatusClass int
 }
 
 // ModelUsageStat 真实模型使用占比
 type ModelUsageStat struct {
-	Model        string  `json:"model"`
-	Requests     int     `json:"requests"`
-	Percentage   float64 `json:"percentage"`
-	AvgLatencyMs int64   `json:"avg_latency_ms"`
+	Model            string  `json:"model"`
+	Requests         int     `json:"requests"`
+	Percentage       float64 `json:"percentage"`
+	AvgLatencyMs     int64   `json:"avg_latency_ms"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
 }
 
 // TimeSeriesPoint 真实时间序列统计点
 type TimeSeriesPoint struct {
 	Timestamp string  `json:"timestamp"`
 	Requests  int     `json:"requests"`
+	Failures  int     `json:"failures"`
+	Tokens    int64   `json:"tokens"`
 	QPS       float64 `json:"qps"`
 	Latency   int64   `json:"latency"`
 	ErrorRate float64 `json:"error_rate"`
@@ -395,12 +401,14 @@ type TimeSeriesPoint struct {
 
 // AggregatedStats 真实聚合统计数据（拒绝假数据）
 type AggregatedStats struct {
-	TotalRequests int               `json:"total_requests"`
-	Failures      int               `json:"failures"`
-	SuccessRate   float64           `json:"success_rate"`
-	AvgLatencyMs  int64             `json:"avg_latency_ms"`
-	ModelUsages   []ModelUsageStat  `json:"model_usages"`
-	TimeSeries    []TimeSeriesPoint `json:"time_series"`
+	TotalRequests         int               `json:"total_requests"`
+	Failures              int               `json:"failures"`
+	SuccessRate           float64           `json:"success_rate"`
+	AvgLatencyMs          int64             `json:"avg_latency_ms"`
+	TotalPromptTokens     int64             `json:"total_prompt_tokens"`
+	TotalCompletionTokens int64             `json:"total_completion_tokens"`
+	ModelUsages           []ModelUsageStat  `json:"model_usages"`
+	TimeSeries            []TimeSeriesPoint `json:"time_series"`
 }
 
 // RecordRequestLog 将一笔真实请求记录持久化至 SQLite。
@@ -487,6 +495,9 @@ func (s *SQLiteStore) QueryRequestLogs(filter RequestLogFilter) ([]RequestLogIte
 	if filter.StatusCode > 0 {
 		conditions = append(conditions, "status_code = ?")
 		args = append(args, filter.StatusCode)
+	} else if filter.StatusClass >= 1 && filter.StatusClass <= 5 {
+		conditions = append(conditions, "status_code >= ? AND status_code < ?")
+		args = append(args, filter.StatusClass*100, filter.StatusClass*100+100)
 	}
 
 	whereClause := ""
@@ -579,9 +590,11 @@ func (s *SQLiteStore) GetAggregatedStats() (*AggregatedStats, error) {
 	err := s.db.QueryRow(`
 		SELECT COUNT(*),
 		       COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
-		       AVG(duration_ms)
+		       AVG(duration_ms),
+		       COALESCE(SUM(prompt_tokens), 0),
+		       COALESCE(SUM(completion_tokens), 0)
 		FROM request_logs
-	`).Scan(&total, &fails, &avgLatency)
+	`).Scan(&total, &fails, &avgLatency, &stats.TotalPromptTokens, &stats.TotalCompletionTokens)
 	if err != nil {
 		return stats, err
 	}
@@ -599,7 +612,8 @@ func (s *SQLiteStore) GetAggregatedStats() (*AggregatedStats, error) {
 
 	// 2. 模型使用分布
 	mRows, err := s.db.Query(`
-		SELECT model, COUNT(*), COALESCE(AVG(duration_ms), 0)
+		SELECT model, COUNT(*), COALESCE(AVG(duration_ms), 0),
+		       COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0)
 		FROM request_logs
 		WHERE model != ''
 		GROUP BY model
@@ -610,7 +624,7 @@ func (s *SQLiteStore) GetAggregatedStats() (*AggregatedStats, error) {
 		for mRows.Next() {
 			var m ModelUsageStat
 			var mAvg sql.NullFloat64
-			if err := mRows.Scan(&m.Model, &m.Requests, &mAvg); err == nil {
+			if err := mRows.Scan(&m.Model, &m.Requests, &mAvg, &m.PromptTokens, &m.CompletionTokens); err == nil {
 				if total > 0 {
 					m.Percentage = float64(m.Requests) / float64(total) * 100
 				}
@@ -622,39 +636,68 @@ func (s *SQLiteStore) GetAggregatedStats() (*AggregatedStats, error) {
 		}
 	}
 
-	// 3. 真实时间趋势（按小时/分钟分桶）
-	tRows, err := s.db.Query(`
-		SELECT strftime('%H:%M', timestamp) as bucket,
-		       COUNT(*),
-		       COALESCE(AVG(duration_ms), 0),
-		       COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0)
-		FROM request_logs
-		WHERE timestamp >= datetime('now', '-24 hours')
-		GROUP BY bucket
-		ORDER BY bucket ASC
-		LIMIT 24
-	`)
-	if err == nil {
-		defer tRows.Close()
-		for tRows.Next() {
-			var p TimeSeriesPoint
-			var pAvg sql.NullFloat64
-			var pFails int
-			if err := tRows.Scan(&p.Timestamp, &p.Requests, &pAvg, &pFails); err == nil {
-				if pAvg.Valid {
-					p.Latency = int64(pAvg.Float64)
-				}
-				if p.Requests > 0 {
-					p.ErrorRate = float64(pFails) / float64(p.Requests) * 100
-					// QPS 估算 (每分钟请求数 / 60)
-					p.QPS = float64(p.Requests) / 60.0
-				}
-				stats.TimeSeries = append(stats.TimeSeries, p)
-			}
-		}
-	}
+	// 3. 近 24 小时趋势：按小时分桶，空桶补零，按时间先后排列。
+	//    早期实现按 '%H:%M' 分桶后按字符串升序取前 24 个 —— 拿到的是
+	//    "一天里最早的 24 个分钟"而不是最近 24 小时，走势图横轴与时间对不上。
+	stats.TimeSeries = hourlySeries(s.db, time.Now())
 
 	return stats, nil
+}
+
+// hourlySeries 统计截至 now 的最近 24 个整点小时桶（含当前小时）。
+// 桶时间戳为 RFC3339 UTC，由前端换算本地时区展示。
+func hourlySeries(db *sql.DB, now time.Time) []TimeSeriesPoint {
+	const n = 24
+	end := now.UTC().Truncate(time.Hour)
+	start := end.Add(-(n - 1) * time.Hour)
+
+	series := make([]TimeSeriesPoint, n)
+	for i := range series {
+		series[i].Timestamp = start.Add(time.Duration(i) * time.Hour).Format(time.RFC3339)
+	}
+
+	rows, err := db.Query(`
+		SELECT strftime('%Y-%m-%d %H:00:00', timestamp) AS bucket,
+		       COUNT(*),
+		       COALESCE(AVG(duration_ms), 0),
+		       COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(prompt_tokens + completion_tokens), 0)
+		FROM request_logs
+		WHERE timestamp >= ?
+		GROUP BY bucket
+	`, start.Format("2006-01-02 15:04:05"))
+	if err != nil {
+		return series
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var bucket string
+		var count, fails int
+		var avg float64
+		var toks int64
+		if err := rows.Scan(&bucket, &count, &avg, &fails, &toks); err != nil {
+			continue
+		}
+		t, err := time.Parse("2006-01-02 15:04:05", bucket)
+		if err != nil {
+			continue
+		}
+		i := int(t.Sub(start) / time.Hour)
+		if i < 0 || i >= n {
+			continue
+		}
+		p := &series[i]
+		p.Requests = count
+		p.Failures = fails
+		p.Tokens = toks
+		p.Latency = int64(avg)
+		if count > 0 {
+			p.ErrorRate = float64(fails) / float64(count) * 100
+			p.QPS = float64(count) / 3600
+		}
+	}
+	return series
 }
 
 // -------------------------------------------------------------

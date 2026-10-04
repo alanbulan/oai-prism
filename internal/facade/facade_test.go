@@ -412,8 +412,11 @@ func TestAppendChatChunk_FinishAndUsage(t *testing.T) {
 	if !strings.Contains(got, `"finish_reason":"stop"`) {
 		t.Errorf("缺少 finish_reason: %s", got)
 	}
-	if !strings.Contains(got, `"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}`) {
+	if !strings.Contains(got, `"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,`) {
 		t.Errorf("usage 编码错误: %s", got)
+	}
+	if !strings.Contains(got, `"completion_tokens_details":{"reasoning_tokens":0}`) {
+		t.Errorf("usage 缺少 completion_tokens_details: %s", got)
 	}
 }
 
@@ -464,7 +467,7 @@ func TestAppendAnthropicEvent_AllTypes(t *testing.T) {
 		{AnthropicEvent{Type: "content_block_stop"},
 			[]string{"event: content_block_stop"}},
 		{AnthropicEvent{Type: "message_delta", StopReason: "end_turn", Usage: d},
-			[]string{"event: message_delta", `"stop_reason":"end_turn"`, `"output_tokens":7`}},
+			[]string{"event: message_delta", `"stop_reason":"end_turn"`, `"input_tokens":5`, `"output_tokens":7`}},
 		{AnthropicEvent{Type: "message_stop"},
 			[]string{"event: message_stop"}},
 	}
@@ -575,17 +578,49 @@ func TestConversationKey(t *testing.T) {
 	}
 }
 
-func TestEstimateTokens(t *testing.T) {
-	if estimateTokens("") != 0 {
-		t.Fatal("空串应为 0")
+// 输入计数口径：每条消息 3 个帧 token + 角色名 + 正文，末尾 3 个回复引导 token
+// （openai-cookbook num_tokens_from_messages 同款）；正文用 o200k_base 精确编码。
+func TestCountInputTokens(t *testing.T) {
+	if got := countInputTokens(nil); got != 0 {
+		t.Fatalf("空输入应为 0，得到 %d", got)
 	}
-	// 中文按 1 字 1 token 估。
-	if got := estimateTokens("你好世界"); got < 4 {
-		t.Fatalf("中文估算偏低: %d", got)
+	items := []prism.InputItem{
+		prism.NewSystemItem("hello world"), // 3 + system(1) + 2
+		prism.NewUserItem("你好世界"),          // 3 + user(1) + 2
 	}
-	// 英文按 4 字符 1 token 估。
-	if got := estimateTokens("abcdefgh"); got < 2 {
-		t.Fatalf("英文估算偏低: %d", got)
+	if got, want := countInputTokens(items), 6+6+3; got != want {
+		t.Fatalf("countInputTokens = %d, want %d", got, want)
+	}
+
+	// 图片块按视觉规则计费（远程链接取不到尺寸，按 1024×1024 高精度 765 计）；
+	// input_file 计文件名。
+	img := prism.InputItem{Type: "message", Role: "user", Content: []prism.InputContent{
+		{Type: "input_text", Text: "hello world"},
+		{Type: "input_image", ImageURL: "https://example.com/a.png", Detail: "low"},
+		{Type: "input_file", Filename: "user"},
+	}}
+	if got, want := countInputTokens([]prism.InputItem{img}), 3+1+2+85+1+3; got != want {
+		t.Fatalf("含图片的 countInputTokens = %d, want %d", got, want)
+	}
+
+	// 异步计数与同步一致
+	if got := countInputAsync(items)(); got != 15 {
+		t.Fatalf("countInputAsync = %d, want 15", got)
+	}
+}
+
+// 输出计数：正文 + 推理文本，推理部分单列 reasoning_tokens（已含在输出内）。
+func TestMeasuredUsage(t *testing.T) {
+	u := measuredUsage(15, &RunResult{Text: "Hello, world!", Reasoning: "你好世界"})
+	if u.InputTokens != 15 || u.OutputTokens != 6 || u.ReasoningTokens != 2 || u.TotalTokens != 21 {
+		t.Fatalf("measuredUsage = %+v", u)
+	}
+	cu := newChatUsage(u)
+	if cu.CompletionTokensDetails == nil || cu.CompletionTokensDetails.ReasoningTokens != 2 {
+		t.Fatalf("chat usage 缺少 reasoning_tokens: %+v", cu)
+	}
+	if ru := newResponsesUsage(u); ru.OutputTokensDetails.ReasoningTokens != 2 || ru.TotalTokens != 21 {
+		t.Fatalf("responses usage 错误: %+v", ru)
 	}
 }
 

@@ -1,0 +1,441 @@
+/* ===================================================================
+   Chat 消息的 Markdown 渲染样式（随 Chat 页按需加载）
+   颜色走 index.css 中的 --op-* 变量，<html data-theme="dark"> 时整体切换。
+   =================================================================== */
+
+:root {
+  --op-md-text: #1f2430;
+  --op-md-heading: #101828;
+  --op-md-link: #4f46e5;
+  --op-md-rule: #e6e9f0;
+  --op-md-head-bg: #f7f8fb;
+  /* 代码高亮（GitHub 风格） */
+  --hl-keyword: #cf222e;
+  --hl-string: #0a3069;
+  --hl-number: #0550ae;
+  --hl-comment: #6e7781;
+  --hl-title: #8250df;
+  --hl-attr: #0550ae;
+  --hl-tag: #116329;
+  --hl-built: #953800;
+  --hl-meta: #6639ba;
+  --hl-del-bg: #ffebe9;
+  --hl-add-bg: #dafbe1;
+}
+
+html[data-theme='dark'] {
+  --op-md-text: #d6dae3;
+  --op-md-heading: #f2f4f8;
+  --op-md-link: #9b9dff;
+  --op-md-rule: #232837;
+  --op-md-head-bg: #151922;
+  --hl-keyword: #ff7b72;
+  --hl-string: #a5d6ff;
+  --hl-number: #79c0ff;
+  --hl-comment: #8b949e;
+  --hl-title: #d2a8ff;
+  --hl-attr: #79c0ff;
+  --hl-tag: #7ee787;
+  --hl-built: #ffa657;
+  --hl-meta: #d2a8ff;
+  --hl-del-bg: rgba(248, 81, 73, 0.15);
+  --hl-add-bg: rgba(46, 160, 67, 0.15);
+}
+
+/* ---------------------------------------------------------------- 正文 */
+.md-body {
+  color: var(--op-md-text);
+  font-size: 14.5px;
+  line-height: 1.75;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.md-body > :first-child {
+  margin-top: 0 !important;
+}
+
+.md-body > :last-child {
+  margin-bottom: 0 !important;
+}
+
+.md-body p {
+  margin: 0 0 10px;
+}
+
+.md-body h1,
+.md-body h2,
+.md-body h3,
+.md-body h4,
+.md-body h5,
+.md-body h6 {
+  color: var(--op-md-heading);
+  font-weight: 650;
+  line-height: 1.4;
+  margin: 20px 0 10px;
+}
+
+.md-body h1 {
+  font-size: 1.5em;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--op-md-rule);
+}
+
+.md-body h2 {
+  font-size: 1.3em;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--op-md-rule);
+}
+
+.md-body h3 {
+  font-size: 1.15em;
+}
+
+.md-body h4,
+.md-body h5,
+.md-body h6 {
+  font-size: 1em;
+}
+
+.md-body a {
+  color: var(--op-md-link);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+}
+
+.md-body a:hover {
+  border-bottom-color: currentColor;
+}
+
+.md-body strong {
+  color: var(--op-md-heading);
+  font-weight: 650;
+}
+
+.md-body ul,
+.md-body ol {
+  padding-left: 1.6em;
+  margin: 6px 0 12px;
+}
+
+.md-body li {
+  margin: 3px 0;
+}
+
+.md-body li > p {
+  margin: 4px 0;
+}
+
+.md-body li::marker {
+  color: var(--op-muted);
+}
+
+/* GFM 任务列表 */
+.md-body .contains-task-list {
+  list-style: none;
+  padding-left: 0.4em;
+}
+
+.md-body .task-list-item input {
+  margin: 0 0.5em 0 0;
+  vertical-align: middle;
+}
+
+.md-body blockquote {
+  margin: 10px 0;
+  padding: 4px 14px;
+  border-left: 3px solid var(--op-quote);
+  color: var(--op-muted);
+  background: var(--op-md-head-bg);
+  border-radius: 0 8px 8px 0;
+}
+
+.md-body hr {
+  border: none;
+  border-top: 1px solid var(--op-md-rule);
+  margin: 18px 0;
+}
+
+.md-body img {
+  max-width: 100%;
+  border-radius: 10px;
+}
+
+.md-body kbd {
+  font-family: 'JetBrains Mono', 'Cascadia Code', 'SF Mono', Consolas, monospace;
+  font-size: 12px;
+  padding: 1px 6px;
+  border: 1px solid var(--op-code-border);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: var(--op-code-bg);
+}
+
+.md-body details {
+  margin: 10px 0;
+  padding: 8px 12px;
+  border: 1px solid var(--op-md-rule);
+  border-radius: 10px;
+}
+
+.md-body summary {
+  cursor: pointer;
+  font-weight: 500;
+}
+
+/* 行内代码 */
+.md-body :not(pre) > code {
+  font-family: 'JetBrains Mono', 'Cascadia Code', 'SF Mono', Consolas, monospace;
+  font-size: 0.88em;
+  background: var(--op-inline-code-bg);
+  color: var(--op-inline-code-fg);
+  border-radius: 5px;
+  padding: 1px 6px;
+}
+
+/* ---------------------------------------------------------------- 表格 */
+.md-body .md-table {
+  margin: 10px 0 14px;
+  overflow-x: auto;
+  border: 1px solid var(--op-table-border);
+  border-radius: 10px;
+}
+
+.md-body table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13.5px;
+}
+
+.md-body th,
+.md-body td {
+  padding: 8px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--op-table-border);
+  white-space: nowrap;
+}
+
+.md-body td {
+  white-space: normal;
+}
+
+.md-body tr:last-child td {
+  border-bottom: none;
+}
+
+.md-body th {
+  background: var(--op-table-head);
+  font-weight: 600;
+  color: var(--op-md-heading);
+}
+
+.md-body tbody tr:nth-child(even) {
+  background: var(--op-md-head-bg);
+}
+
+/* ---------------------------------------------------------------- 代码卡片 */
+.op-code-card {
+  margin: 12px 0;
+  border: 1px solid var(--op-code-border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--op-code-bg);
+}
+
+.op-code-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  padding: 2px 6px 2px 12px;
+  font-size: 12px;
+  color: var(--op-muted);
+  background: var(--op-md-head-bg);
+  border-bottom: 1px solid var(--op-code-border);
+}
+
+.op-code-lang {
+  font-family: 'JetBrains Mono', 'Cascadia Code', 'SF Mono', Consolas, monospace;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  color: var(--op-md-heading);
+  text-transform: lowercase;
+}
+
+.md-body pre.op-code,
+pre.op-code {
+  margin: 0;
+  padding: 12px 16px;
+  overflow-x: auto;
+  background: var(--op-code-bg);
+  border: none;
+  border-radius: 0;
+}
+
+pre.op-code code {
+  font-family: 'JetBrains Mono', 'Cascadia Code', 'SF Mono', Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 20px;
+  background: transparent;
+  padding: 0;
+  color: var(--op-md-text);
+  white-space: pre;
+  tab-size: 2;
+}
+
+/* 长代码折叠：底部渐隐 + 展开按钮 */
+.op-code-fold {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0;
+  border-top: 1px solid var(--op-code-border);
+  background: var(--op-code-bg);
+}
+
+.op-code-fold--collapsed {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding-top: 36px;
+  border-top: none;
+  background: linear-gradient(180deg, transparent, var(--op-code-bg) 60%);
+}
+
+/* ---------------------------------------------------------------- HTML 直出 */
+/* 没有卡片外框：渲染结果直接出现在回复里，工具栏悬停时浮现 */
+.op-html-direct {
+  margin: 12px 0;
+  width: 100%;
+}
+
+.op-html-box {
+  position: relative;
+  max-width: 100%;
+  overflow: hidden;
+  transition: opacity 0.2s ease-out;
+}
+
+.op-html-tools {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 10px;
+  border: 1px solid var(--op-code-border);
+  box-shadow: 0 4px 14px rgba(16, 24, 40, 0.12);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.op-html-box:hover .op-html-tools,
+.op-html-tools:focus-within {
+  opacity: 1;
+}
+
+/* 触屏没有悬停：工具栏常驻 */
+@media (hover: none) {
+  .op-html-tools {
+    opacity: 1;
+  }
+}
+
+/* ---------------------------------------------------------------- 语法高亮 */
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal,
+.hljs-doctag,
+.hljs-type {
+  color: var(--hl-keyword);
+}
+
+.hljs-string,
+.hljs-regexp,
+.hljs-template-tag,
+.hljs-meta .hljs-string {
+  color: var(--hl-string);
+}
+
+.hljs-number,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-selector-attr,
+.hljs-selector-pseudo {
+  color: var(--hl-number);
+}
+
+.hljs-comment,
+.hljs-quote {
+  color: var(--hl-comment);
+  font-style: italic;
+}
+
+.hljs-title,
+.hljs-title.class_,
+.hljs-title.function_,
+.hljs-section {
+  color: var(--hl-title);
+}
+
+.hljs-attr,
+.hljs-attribute,
+.hljs-property,
+.hljs-selector-id,
+.hljs-selector-class {
+  color: var(--hl-attr);
+}
+
+.hljs-name,
+.hljs-tag {
+  color: var(--hl-tag);
+}
+
+.hljs-built_in,
+.hljs-symbol,
+.hljs-bullet {
+  color: var(--hl-built);
+}
+
+.hljs-meta,
+.hljs-params {
+  color: var(--hl-meta);
+}
+
+.hljs-deletion {
+  background: var(--hl-del-bg);
+}
+
+.hljs-addition {
+  background: var(--hl-add-bg);
+}
+
+.hljs-emphasis {
+  font-style: italic;
+}
+
+.hljs-strong {
+  font-weight: 600;
+}
+
+/* ---------------------------------------------------------------- 公式 */
+.md-body .katex {
+  font-size: 1.08em;
+}
+
+.md-body .katex-display {
+  margin: 12px 0;
+  padding: 4px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* ---------------------------------------------------------------- 推理过程 */
+.md-body.md-reasoning {
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--op-muted);
+}

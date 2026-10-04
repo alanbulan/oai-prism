@@ -24,6 +24,9 @@ export interface MetricSummary {
   accountsTotal: number;
   currentQPS: number;
   avgLatencyMs: number;
+  /** 累计 token（网关按 o200k_base 精确计数；该功能上线前的历史请求记为 0） */
+  promptTokens: number;
+  completionTokens: number;
   projectCacheSize: number;
   uptimeSec: number;
 }
@@ -33,10 +36,16 @@ export interface ModelUsage {
   requests: number;
   percentage: number;
   avgLatencyMs: number;
+  promptTokens: number;
+  completionTokens: number;
 }
 
+/** 近 24 小时按整点分桶的趋势点（timestamp 为桶起点，RFC3339 UTC） */
 export interface TimeSeriesPoint {
   timestamp: string;
+  requests: number;
+  failures: number;
+  tokens: number;
   qps: number;
   latency: number;
   errorRate: number;
@@ -63,7 +72,8 @@ export interface RequestLogFilter {
   pageSize: number;
   model?: string;
   accountId?: string;
-  statusCode?: number;
+  /** 精确状态码（"429"）或状态码段（"2xx" / "4xx" / "5xx"） */
+  status?: string;
 }
 
 export interface RequestLogQueryResult {

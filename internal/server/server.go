@@ -27,6 +27,7 @@ import (
 	"github.com/oai-prism/oaiprism/internal/middleware"
 	"github.com/oai-prism/oaiprism/internal/prism"
 	"github.com/oai-prism/oaiprism/internal/rawproxy"
+	"github.com/oai-prism/oaiprism/internal/tokens"
 )
 
 // Server 是完整运行实例。
@@ -539,14 +540,22 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 		q := r.URL.Query()
 		page, _ := strconv.Atoi(q.Get("page"))
 		pageSize, _ := strconv.Atoi(q.Get("page_size"))
-		statusCode, _ := strconv.Atoi(q.Get("status"))
+		// status 支持精确状态码（429）与状态码段（2xx / 4xx / 5xx）
+		status := strings.ToLower(strings.TrimSpace(q.Get("status")))
+		var statusCode, statusClass int
+		if len(status) == 3 && strings.HasSuffix(status, "xx") {
+			statusClass, _ = strconv.Atoi(status[:1])
+		} else {
+			statusCode, _ = strconv.Atoi(status)
+		}
 
 		filter := account.RequestLogFilter{
-			Page:       page,
-			PageSize:   pageSize,
-			Model:      strings.TrimSpace(q.Get("model")),
-			AccountID:  strings.TrimSpace(q.Get("account_id")),
-			StatusCode: statusCode,
+			Page:        page,
+			PageSize:    pageSize,
+			Model:       strings.TrimSpace(q.Get("model")),
+			AccountID:   strings.TrimSpace(q.Get("account_id")),
+			StatusCode:  statusCode,
+			StatusClass: statusClass,
 		}
 
 		if s.sqlite == nil {
@@ -899,6 +908,7 @@ func (s *Server) requestAuditMiddleware(next http.Handler) http.Handler {
 			ClientIP:   clientIP(r),
 			UserAgent:  r.UserAgent(),
 		}
+		item.PromptTokens, item.CompletionTokens = middleware.LogUsage(r.Context())
 		// SSE 内部失败（response.failed / SSE error 事件）在这里补记 ——
 		// HTTP 状态码帮不上忙，错误只存在事件流里。
 		if errs := middleware.LogErrors(r.Context()); len(errs) > 0 {
@@ -923,6 +933,9 @@ var startTime = time.Now()
 
 // Run 启动服务并阻塞直到 ctx 取消。
 func (s *Server) Run(ctx context.Context) error {
+	// 分词表后台预热：首次构建约需数百毫秒，不让第一笔请求承担。
+	tokens.Warmup()
+
 	// 后台任务：账号刷新、健康巡检、凭据热重载。
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 	defer bgCancel()

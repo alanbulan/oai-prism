@@ -99,7 +99,9 @@ func AppendChatChunk(dst []byte, s ChatChunkSpec) []byte {
 		dst = sse.AppendInt(dst, int64(s.Usage.OutputTokens))
 		dst = append(dst, `,"total_tokens":`...)
 		dst = sse.AppendInt(dst, int64(s.Usage.TotalTokens))
-		dst = append(dst, '}')
+		dst = append(dst, `,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":`...)
+		dst = sse.AppendInt(dst, int64(s.Usage.ReasoningTokens))
+		dst = append(dst, `}}`...)
 	}
 
 	if s.ConversationID != "" {
@@ -165,11 +167,14 @@ func AppendAnthropicEvent(dst []byte, e AnthropicEvent) []byte {
 		} else {
 			dst = append(dst, `null`...)
 		}
-		dst = append(dst, `,"stop_sequence":null},"usage":{"output_tokens":`...)
-		out := 0
+		// 新版 Anthropic API 在 message_delta 里给出完整用量（累计值）
+		in, out := 0, 0
 		if e.Usage != nil {
-			out = e.Usage.OutputTokens
+			in, out = e.Usage.InputTokens, e.Usage.OutputTokens
 		}
+		dst = append(dst, `,"stop_sequence":null},"usage":{"input_tokens":`...)
+		dst = sse.AppendInt(dst, int64(in))
+		dst = append(dst, `,"output_tokens":`...)
 		dst = sse.AppendInt(dst, int64(out))
 		dst = append(dst, `}}`...)
 
@@ -301,9 +306,11 @@ func AppendResponsesEvent(dst []byte, e ResponsesEvent) []byte {
 		if e.Usage != nil {
 			dst = append(dst, `,"usage":{"input_tokens":`...)
 			dst = sse.AppendInt(dst, int64(e.Usage.InputTokens))
-			dst = append(dst, `,"output_tokens":`...)
+			dst = append(dst, `,"input_tokens_details":{"cached_tokens":0},"output_tokens":`...)
 			dst = sse.AppendInt(dst, int64(e.Usage.OutputTokens))
-			dst = append(dst, `,"total_tokens":`...)
+			dst = append(dst, `,"output_tokens_details":{"reasoning_tokens":`...)
+			dst = sse.AppendInt(dst, int64(e.Usage.ReasoningTokens))
+			dst = append(dst, `},"total_tokens":`...)
 			dst = sse.AppendInt(dst, int64(e.Usage.TotalTokens))
 			dst = append(dst, '}')
 		}

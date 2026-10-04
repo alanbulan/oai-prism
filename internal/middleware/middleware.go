@@ -62,6 +62,28 @@ type LogErrorBox struct {
 	mu      sync.Mutex
 	msgs    []string
 	account string
+	// 本次请求的 token 用量（facade 按实际收发内容精确计数后写入）
+	promptTokens, completionTokens int
+}
+
+// RecordLogUsage 记录本次请求的 token 用量。
+// 续接失败后重试会再次写入：以最后一次成功运行为准（失败的那次不会写）。
+func RecordLogUsage(r *http.Request, prompt, completion int) {
+	if box, ok := r.Context().Value(CtxKeyLogError{}).(*LogErrorBox); ok {
+		box.mu.Lock()
+		box.promptTokens, box.completionTokens = prompt, completion
+		box.mu.Unlock()
+	}
+}
+
+// LogUsage 取出 RecordLogUsage 记录的用量。
+func LogUsage(ctx context.Context) (prompt, completion int) {
+	if box, ok := ctx.Value(CtxKeyLogError{}).(*LogErrorBox); ok {
+		box.mu.Lock()
+		defer box.mu.Unlock()
+		return box.promptTokens, box.completionTokens
+	}
+	return 0, 0
 }
 
 // RecordLogAccount 记录本次请求实际路由到的账号。

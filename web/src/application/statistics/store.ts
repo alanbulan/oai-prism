@@ -22,8 +22,9 @@ interface StatisticsState {
   requestLogsTotal: number;
   logsPage: number;
   logsPageSize: number;
-  logsFilter: { model?: string; accountId?: string; statusCode?: number };
+  logsFilter: { model?: string; accountId?: string; status?: string };
   logsLoading: boolean;
+  logsError: string;
 
   fetchMetrics: () => Promise<void>;
   fetchRequestLogs: (page?: number, pageSize?: number, filter?: Partial<RequestLogFilter>) => Promise<void>;
@@ -43,6 +44,7 @@ export const useStatisticsStore = create<StatisticsState>((set, get) => ({
   logsPageSize: 10,
   logsFilter: {},
   logsLoading: false,
+  logsError: '',
 
   fetchMetrics: async () => {
     set({ loading: true });
@@ -78,7 +80,11 @@ export const useStatisticsStore = create<StatisticsState>((set, get) => ({
         logsPage: curPage,
         logsPageSize: curPageSize,
         logsFilter: curFilter,
+        logsError: '',
       });
+    } catch (err: any) {
+      // 8 秒轮询里抛出会变成未处理的 Promise 拒绝；记录下来交给页面空态展示
+      set({ logsError: err?.message || '加载失败' });
     } finally {
       set({ logsLoading: false });
     }

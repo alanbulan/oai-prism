@@ -12,6 +12,7 @@ import (
 	"github.com/oai-prism/oaiprism/internal/middleware"
 	"github.com/oai-prism/oaiprism/internal/prism"
 	"github.com/oai-prism/oaiprism/internal/sse"
+	"github.com/oai-prism/oaiprism/internal/tokens"
 )
 
 // handleAnthropicMessages 实现 POST /v1/messages（Anthropic 协议）。
@@ -142,10 +143,11 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 
 	buf := make([]byte, 0, 2048)
 
-	// message_start 必须先发，且此时还不知道 input_tokens，
-	// 用一个占位值，最后在 message_delta 里给准确的 output_tokens。
+	// message_start 必须先发：input_tokens 此时就能精确算出（就是本轮要发的上下文），
+	// output_tokens 留到 message_delta 再给。
 	buf = AppendAnthropicEvent(buf[:0], AnthropicEvent{
 		Type: "message_start", MessageID: id, Model: publicModel,
+		Usage: &prism.Usage{InputTokens: countInputTokens(runReq.Input)},
 	})
 	if err := sw.WriteRaw(buf); err != nil {
 		return
@@ -164,7 +166,7 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 	}
 
 	res, runErr := h.runner.Run(r.Context(), runReq, emit)
-	bindLogAccount(r, res)
+	bindLogResult(r, res)
 	// 成功回复才记历史（同 chat.go）。
 	if runErr == nil {
 		sessionChainPut(runReq.StickyKey, chainConv(res), resReqID(res), resAccount(res), runReq.Model)
@@ -198,7 +200,7 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 
 func (h *Handler) syncAnthropic(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id, publicModel string) {
 	res, err := h.runner.Run(r.Context(), runReq, nil)
-	bindLogAccount(r, res)
+	bindLogResult(r, res)
 	// 成功回复才记历史（同 chat.go）。
 	if err == nil {
 		sessionChainPut(runReq.StickyKey, chainConv(res), resReqID(res), resAccount(res), runReq.Model)
@@ -232,7 +234,7 @@ func (h *Handler) syncAnthropic(w http.ResponseWriter, r *http.Request, runReq *
 			OutputTokens: res.Usage.OutputTokens,
 		}
 	} else {
-		resp.Usage = AnthropicUsage{OutputTokens: estimateTokens(text)}
+		resp.Usage = AnthropicUsage{OutputTokens: tokens.Count(text)}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

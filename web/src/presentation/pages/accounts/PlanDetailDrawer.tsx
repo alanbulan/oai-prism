@@ -8,6 +8,7 @@ import {
   CloseCircleOutlined,
 } from '@ant-design/icons';
 import { useAccountStore } from '../../../application/account/store';
+import { formatDateTime } from '../../utils/format';
 
 const { Text } = Typography;
 
@@ -62,7 +63,7 @@ export const PlanDetailDrawer: React.FC = () => {
             {selectedAccount.token_expires ? (
               <Space>
                 <ClockCircleOutlined />
-                <span>{new Date(selectedAccount.token_expires).toLocaleString()}</span>
+                <span>{formatDateTime(selectedAccount.token_expires)}</span>
                 {daysRemaining !== null && (
                   <Tag color={daysRemaining > 3 ? 'green' : 'red'}>
                     剩余 {daysRemaining} 天

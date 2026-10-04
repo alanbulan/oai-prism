@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Layout, Menu, Space, Button, Tooltip, message, Dropdown, Avatar, Grid, theme } from 'antd';
+import { Layout, Menu, Space, Button, Tooltip, message, Dropdown, Avatar, Grid, Alert, theme } from 'antd';
 import type { MenuProps } from 'antd';
 import {
   TeamOutlined,
@@ -17,10 +17,13 @@ import {
   DesktopOutlined,
   CheckOutlined,
   CloudServerOutlined,
+  DisconnectOutlined,
 } from '@ant-design/icons';
 import { useAccountStore } from '../../application/account/store';
+import { useAuthStore } from '../../application/auth/store';
 import { ApiKeyModal } from '../components/ApiKeyModal';
 import { AdminLoginModal } from '../components/AdminLoginModal';
+import { ConnectGatewayModal } from '../components/ConnectGatewayModal';
 import { BrandLogo } from '../components/BrandLogo';
 import { useThemeMode, type ThemeMode } from '../theme/context';
 import { NAV_KEYS, type NavKey } from './navKeys';
@@ -67,17 +70,20 @@ export const MainLayout: React.FC<MainLayoutProps> = ({ currentKey, onKeyChange,
   const [apiKeyModalOpen, setApiKeyModalOpen] = useState(false);
   const [loginModalOpen, setLoginModalOpen] = useState(false);
   const { readyCount, totalCount } = useAccountStore();
+  const { blocked, reason, epoch, openPrompt } = useAuthStore();
 
   // 顶栏的就绪状态在任何页面都要准确：页面自己没拉账号时由外壳补一次
-  // （子组件 effect 先于外壳执行，loading 已置位说明页面已经在拉，无需重复）
+  // （子组件 effect 先于外壳执行，loading 已置位说明页面已经在拉，无需重复）。
+  // epoch 变化 = 凭据更新，需要重新拉取。
   useEffect(() => {
     const st = useAccountStore.getState();
-    if (st.accounts.length === 0 && !st.loading) st.fetchAccounts();
-  }, []);
+    if (!st.loading) st.fetchAccounts();
+  }, [epoch]);
 
   const page = NAV[currentKey];
-  const healthy = readyCount > 0;
-  const statusColor = healthy ? token.colorSuccess : token.colorError;
+  const healthy = !blocked && readyCount > 0;
+  const statusColor = blocked ? token.colorWarning : healthy ? token.colorSuccess : token.colorError;
+  const statusLabel = blocked ? '未连接网关' : healthy ? '服务就绪' : '无可用账号';
 
   const menuItems: MenuProps['items'] = [
     {
@@ -175,29 +181,36 @@ export const MainLayout: React.FC<MainLayoutProps> = ({ currentKey, onKeyChange,
           {/* 运行状态卡 */}
           <div style={{ padding: collapsed ? '12px 0' : 12, flexShrink: 0 }}>
             {collapsed ? (
-              <Tooltip placement="right" title={`就绪账号 ${readyCount} / ${totalCount}`}>
-                <div style={{ display: 'flex', justifyContent: 'center' }}>{statusDot}</div>
+              <Tooltip placement="right" title={blocked ? '未连接网关：点击填入 API Key' : `就绪账号 ${readyCount} / ${totalCount}`}>
+                <div
+                  style={{ display: 'flex', justifyContent: 'center', cursor: blocked ? 'pointer' : 'default' }}
+                  onClick={blocked ? openPrompt : undefined}
+                >
+                  {statusDot}
+                </div>
               </Tooltip>
             ) : (
               <div
+                onClick={blocked ? openPrompt : undefined}
                 style={{
-                  border: `1px solid ${token.colorBorderSecondary}`,
-                  background: token.colorBgContainer,
+                  border: `1px solid ${blocked ? token.colorWarningBorder : token.colorBorderSecondary}`,
+                  background: blocked ? token.colorWarningBg : token.colorBgContainer,
                   borderRadius: 10,
                   padding: '10px 12px',
                   fontSize: 12,
+                  cursor: blocked ? 'pointer' : 'default',
                 }}
               >
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: token.colorText }}>
                   {statusDot}
-                  <span style={{ fontWeight: 500 }}>{healthy ? '服务就绪' : '无可用账号'}</span>
+                  <span style={{ fontWeight: 500 }}>{statusLabel}</span>
                   <span style={{ marginLeft: 'auto', color: token.colorTextSecondary, fontVariantNumeric: 'tabular-nums' }}>
-                    {readyCount} / {totalCount}
+                    {blocked ? '—' : `${readyCount} / ${totalCount}`}
                   </span>
                 </div>
                 <div style={{ marginTop: 6, color: token.colorTextTertiary, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <CloudServerOutlined />
-                  prism.openai.com
+                  {blocked ? <DisconnectOutlined /> : <CloudServerOutlined />}
+                  {blocked ? '点击填入 API Key' : 'prism.openai.com'}
                 </div>
               </div>
             )}
@@ -304,11 +317,28 @@ export const MainLayout: React.FC<MainLayoutProps> = ({ currentKey, onKeyChange,
             flexDirection: 'column',
           }}
         >
-          {children}
+          {blocked && (
+            <Alert
+              type="warning"
+              showIcon
+              icon={<DisconnectOutlined />}
+              title="未连接到网关管理接口"
+              description={`${reason || 'API Key 无效或缺失'}。数据并未丢失，填入有效的 API Key 后自动恢复显示。`}
+              action={
+                <Button type="primary" size="small" onClick={openPrompt}>
+                  填入 API Key
+                </Button>
+              }
+              style={{ marginBottom: 16, flexShrink: 0, alignItems: 'center' }}
+            />
+          )}
+          {/* 凭据更新后以新 key 重新挂载页面，各页 effect 自然重新拉取 */}
+          <React.Fragment key={epoch}>{children}</React.Fragment>
         </Content>
 
         <ApiKeyModal open={apiKeyModalOpen} onClose={() => setApiKeyModalOpen(false)} />
         <AdminLoginModal open={loginModalOpen} onClose={() => setLoginModalOpen(false)} />
+        <ConnectGatewayModal onAdminLogin={() => setLoginModalOpen(true)} />
       </Layout>
     </Layout>
   );

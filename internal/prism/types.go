@@ -431,6 +431,8 @@ type Usage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 	TotalTokens  int `json:"total_tokens"`
+	// ReasoningTokens 是 OutputTokens 中推理文本所占的部分（与 OpenAI 口径一致，已含在 OutputTokens 内）。
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 // Sandbox 是一次沙箱申请的结果。

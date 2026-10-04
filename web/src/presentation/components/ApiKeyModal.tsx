@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Modal, Table, Button, Space, Typography, message, Input, Tabs, Popconfirm, theme } from 'antd';
 import { KeyOutlined, CopyOutlined, PlusOutlined, DeleteOutlined, CodeOutlined } from '@ant-design/icons';
 import { getApiKey, setApiKey, httpClient } from '../../infrastructure/http/client';
+import { formatDateTime } from '../utils/format';
 
 const { Text, Paragraph } = Typography;
 
@@ -115,7 +116,7 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
       key: 'created_at',
       render: (t: string) => (
         <Text type="secondary" style={{ fontSize: 12 }}>
-          {t ? new Date(t).toLocaleString() : '-'}
+          {formatDateTime(t)}
         </Text>
       ),
     },
