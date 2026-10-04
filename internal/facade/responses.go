@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oai-prism/oaiprism/internal/creds"
 	"github.com/oai-prism/oaiprism/internal/middleware"
 	"github.com/oai-prism/oaiprism/internal/prism"
 	"github.com/oai-prism/oaiprism/internal/sse"
@@ -139,11 +138,17 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	promptLimit := h.cfg.Facade.PromptByteLimit()
 	var input []prism.InputItem
+	// native 是原生续接用的拆分形态（system / 往轮对话 / 本轮消息，见 native.go）。
+	var native *nativeConversation
 	if bridge {
 		// UA 推断的 OS 事实声明随桥指令一起进首条 system（见 osDirective）。
 		input = bridgeInputItems(req.Input, osDirective(r.UserAgent()))
+		native = itemsConversation(input)
 		if compaction {
 			input = appendSystemText(input, compactionDirective)
+			if native != nil {
+				native.extra = compactionDirective
+			}
 		}
 	} else {
 		// instructions 就是 Responses API 的 system：与 input 自带的 system、
@@ -159,21 +164,16 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		input = messagesFromResponsesInput(req.Input, fallback, histLimit)
 		input = prependSystemText(input, req.Instructions)
+		if native = chatConversation(responsesChatMessages(req.Input), fallback); native != nil {
+			if in := strings.TrimSpace(req.Instructions); in != "" {
+				native.system = strings.TrimSpace(in + "\n\n" + native.system)
+			}
+		}
 	}
 	if len(input) == 0 {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "input 不能为空")
 		return
 	}
-	// 客户端是否自带多轮历史（必须在折叠之前判断，折叠后 assistant 条目已被并入 system）。
-	hasClientHistory := false
-	for _, it := range input {
-		role := strings.ToLower(strings.TrimSpace(it.Role))
-		if role == "assistant" || role == "tool" || role == "function" {
-			hasClientHistory = true
-			break
-		}
-	}
-
 	// 稳定会话标识（必须在消息加工之前计算，避免折叠或裁剪历史导致哈希漂移）。
 	stickyKey := responsesConversationKey(r, rawFields, input)
 	turn.isAux = isCodexAuxRequest(r, rawFields, bridge, hasTools)
@@ -195,8 +195,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	convIDFromReq := conversationIDFrom(r, rawFields)
 	if turn.isAux {
-		// 伴生请求：不继承、不记录会话链，在专用伴生项目里跑（见 Runner.resolveProject）。
-		runReq.ConversationID = convIDFromReq
+		// 伴生请求：单次无状态，不继承、不记录会话链，在专用伴生项目里跑（见 Runner.resolveProject）。
 		runReq.Input = input
 		h.dispatchResponses(w, r, runReq, turn)
 		return
@@ -221,68 +220,37 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	default:
 		turn.chainKey = scopeKey(r, "r:"+turn.id)
 	}
-	h.log.Debug("会话粘性判定", "stickyKey", stickyKey, "chainKey", turn.chainKey,
-		"hasClientHistory", hasClientHistory, "chainProj", hit.ProjectID, "chainPrevResp", hit.ResponseID)
+	h.log.Debug("会话粘性判定", "stickyKey", stickyKey, "chainKey", turn.chainKey, "chainProj", hit.ProjectID)
 
 	if runReq.ProjectID == "" && hit.ProjectID != "" {
 		runReq.ProjectID = hit.ProjectID
 		runReq.MarkProjectFromChain()
 	}
-	// 续接句柄：客户端显式带的照传（若是我们发出的本地 ID，换成上游真实 ID）；
-	// 会话链里的只在 upstream_continuation 开启时附带。
-	runReq.ConversationID = convIDFromReq
-	runReq.PreviousResponseID = req.PreviousResponseID
-	if found && req.PreviousResponseID != "" && hit.ResponseID != "" {
-		runReq.PreviousResponseID = hit.ResponseID
-	}
-	if h.cfg.Facade.UpstreamContinuation {
-		if runReq.ConversationID == "" {
-			runReq.ConversationID = hit.ConversationID
-		}
-		if runReq.PreviousResponseID == "" {
-			runReq.PreviousResponseID = hit.ResponseID
-		}
-		if len(hit.Snapshot) > 0 {
-			if runReq.Metadata == nil {
-				runReq.Metadata = make(map[string]any, 2)
-			}
-			runReq.Metadata["codex_listen_snapshot"] = string(hit.Snapshot)
-		}
-	}
 	if found && hit.AccountID != "" {
-		// 项目与续接句柄是账号私有的：租到别的账号时 Runner 会整体作废它们。
+		// 项目是账号私有的：租到别的账号时 Runner 会作废它（原生续接随之新建会话）。
 		runReq.BoundAccountID = hit.AccountID
 	}
-	sessionChainBind(turn.chainKey, runReq.ConversationID, runReq.ProjectID)
+	sessionChainBind(turn.chainKey, runReq.ProjectID)
 
-	// 上下文：每轮都发完整上下文。
-	//
-	// 2026-10-03 实测：只发"本轮增量 + previousResponseId"时第二轮必然失忆
-	// （上游不会替我们按句柄拼历史）。客户端自带历史的折叠进唯一一条 system；
-	// 只发本轮消息的客户端，用本地会话链累积的历史注入。
-	switch {
-	case bridge:
-		// Codex 每轮都带完整上下文，一律折叠，也绝不注入会话链：压缩后的替换历史
-		// 只有若干条 user 加一条摘要、没有 assistant，旧判据（见过 assistant 才折叠）
-		// 会漏折，摘要被上游丢掉；回落去注入的会话链又是陈旧的原始工具输出
-		// （2026-10-04 实测：换个空会话链重放压缩后的首个请求，模型答"上下文未提供暗号"）。
-		//
-		// 超过单条上限时裁掉最旧的历史，而不是回 context_length_exceeded 等 Codex 压缩：
-		// 实测 Codex 0.160 收到它只会结束本轮，下一轮照发同样的历史（窗口配成 272k
-		// 时也一样），会话卡死。压缩请求同理 —— 那一轮必须成功，摘要才接得上。
+	// Input 是本轮的全量形态：新建上游会话的首轮（历史一条放得下时）与无法续接时发它
+	// （见 native.go）。客户端的 previous_response_id / conversation_id 只用来找回会话，
+	// 不透传给上游 —— 上游只续接经 Server Action 登记的会话，由 runner 自行登记。
+	if bridge {
+		// Codex 每轮都带完整上下文：折叠成 [system, user]，超过单条上限时裁掉最旧的历史
+		// （放不下时原生续接改为分段补种，裁剪版只作回退）。
 		runReq.Input = foldInputHistory(input, promptLimit)
-		if historyTrimmed(runReq.Input) {
-			h.log.Info("Codex 历史超出上游单条上限，已裁掉最旧部分",
-				"chainKey", turn.chainKey, "compaction", compaction, "limit", promptLimit)
-		}
-	case hasClientHistory:
-		// 非桥：translateChatMessages 已把历史折进 system，再折一次就重复了。
+	} else {
+		// 非桥：translateChatMessages 已把客户端历史折进 system。
 		runReq.Input = input
-	default:
-		runReq.Input = input
-		if hist := sessionChainHistory(turn.chainKey); len(hist) > 0 {
-			runReq.Input = injectChainHistory(input, hist, promptLimit)
+	}
+	if native != nil {
+		// 强会话键（含凭回复句柄 / 会话 ID 找回的链）按键绑定；弱键客户端按会话指纹绑定，
+		// 比对时连助手原文一起比（见 native.go）。
+		key, strong := turn.chainKey, true
+		if !strongKey && !found {
+			key, strong = stickyKey, false
 		}
+		h.attachNative(runReq, &nativeTurn{key: key, strong: strong, compaction: compaction, conv: native})
 	}
 	for idx, it := range runReq.Input {
 		var preview string
@@ -351,81 +319,25 @@ func (h *Handler) writeLocalTitle(w http.ResponseWriter, req *ResponsesRequest, 
 	})
 }
 
-// isContinuationError 判断失败是否由"续接句柄失效"引起（值得丢弃句柄、用全量上下文重试）。
-//
-// 只认这一类：超时、限流、鉴权、风控、客户端断开都与句柄无关，
-// 拿它们重试只会让一个已经很慢的请求再慢一倍、白扣一次额度。
-func isContinuationError(err error) bool {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
-		errors.Is(err, ErrPollTimeout) || errors.Is(err, ErrContextTooLarge) ||
-		creds.IsAuthError(err) || creds.IsRateLimited(err) || isSentinelThrottle(err) {
-		return false
-	}
-	var ae *creds.APIError
-	if errors.As(err, &ae) {
-		switch ae.Status {
-		case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusGone, http.StatusUnprocessableEntity:
-			return true
-		}
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	for _, k := range []string{"previous", "conversation", "not found", "expired", "no longer", "snapshot", "transcript"} {
-		if strings.Contains(msg, k) {
-			return true
-		}
-	}
-	return false
-}
-
-// hasContinuation 报告请求是否携带了续接句柄。
-func hasContinuation(req *RunRequest) bool {
-	if req.PreviousResponseID != "" || req.ConversationID != "" {
-		return true
-	}
-	_, ok := req.Metadata["codex_listen_snapshot"]
-	return ok
-}
-
-// runResponses 执行一轮，并在"续接句柄失效"时丢弃句柄、用完整上下文原地重试一次。
-//
-// canRetry 由调用方决定（流式路径只有在客户端还没收到任何正文时才能重试）。
-func (h *Handler) runResponses(r *http.Request, runReq *RunRequest, turn *responsesTurn, emit func(Delta) error, canRetry func() bool) (*RunResult, error) {
+// runResponses 执行一轮并把结果挂到请求流水上。上游会话失效时的重试在 Runner.Run 里
+// （见 native.go isConversationGone）。
+func (h *Handler) runResponses(r *http.Request, runReq *RunRequest, emit func(Delta) error) (*RunResult, error) {
 	res, err := h.runner.Run(r.Context(), runReq, emit)
-	bindLogResult(r, res)
-	if err == nil || turn.isAux || !hasContinuation(runReq) || !isContinuationError(err) {
-		return res, err
-	}
-	projectGone := strings.Contains(strings.ToLower(err.Error()), "project")
-	sessionChainResetSession(turn.chainKey, projectGone)
-	if canRetry != nil && !canRetry() {
-		return res, err
-	}
-	h.log.Warn("续接句柄失效，丢弃句柄并以完整上下文重试",
-		"err", err, "chainKey", turn.chainKey, "prevResp", runReq.PreviousResponseID, "conv", runReq.ConversationID)
-	runReq.dropContinuation()
-	if projectGone {
-		if runReq.ProjectID != "" && res != nil {
-			h.runner.ForgetProject(res.AccountID, runReq.StickyKey)
-		}
-		runReq.ProjectID = ""
-	}
-	res, err = h.runner.Run(r.Context(), runReq, emit)
 	bindLogResult(r, res)
 	return res, err
 }
 
 // recordResponsesTurn 把成功的一轮写回会话链。
-func recordResponsesTurn(runReq *RunRequest, turn *responsesTurn, res *RunResult) {
+func (h *Handler) recordResponsesTurn(runReq *RunRequest, turn *responsesTurn, res *RunResult) {
 	if turn.isAux || res == nil {
 		return
 	}
 	sessionChainRecord(turn.chainKey, res, runReq.Model)
 	sessionChainRecordLocalID(turn.chainKey, turn.id)
-	// 会话链历史只服务"只发本轮消息"的客户端。Codex 每轮自带完整上下文，
-	// 记下来的只会是工具输出与压缩指令，用不上也不该被注入。
-	if res.Text != "" && !turn.bridge && !turn.compaction {
-		sessionChainAppend(turn.chainKey, lastUserText(runReq.Input), res.Text)
+	// 弱键客户端的上游会话绑在会话指纹上：下一轮凭回复句柄 / 会话 ID 找回的是会话链的键，
+	// 让它也指向同一个绑定。
+	if nt := runReq.Native; nt != nil {
+		h.runner.AliasNative(turn.chainKey, nt.key)
 	}
 }
 
@@ -481,8 +393,8 @@ func responsesConversationKeyBase(r *http.Request, body map[string]json.RawMessa
 
 func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq *RunRequest, turn *responsesTurn) {
 	id, created, publicModel := turn.id, turn.created, turn.publicModel
-	// 流式头必须早于首帧，只能回显客户端带回来的会话 ID（见 streamChat 注释）。
-	setConversationHeader(w, runReq.ConversationID)
+	// 流式头必须早于首帧，只能给出续接中的上游会话（见 streamConversationID）。
+	setConversationHeader(w, streamConversationID(runReq))
 
 	sw, err := sse.New(w)
 	if err != nil {
@@ -557,22 +469,20 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 
 	if turn.bridge {
 		// 桥模式不能边收边发：必须先拿到完整回复才能判断它是
-		// 工具调用（```codex-exec 块）还是纯文本。缓冲后统一输出 ——
-		// 也因此续接失效时总能安全地原地重试（客户端还没收到任何正文）。
+		// 工具调用（```codex-exec 块）还是纯文本，缓冲后统一输出。
 		var sb strings.Builder
 		emit := func(d Delta) error {
 			sb.WriteString(d.Text)
 			return nil
 		}
-		canRetry := func() bool { sb.Reset(); return true }
-		res, runErr := h.runResponses(r, runReq, turn, emit, canRetry)
+		res, runErr := h.runResponses(r, runReq, emit)
 		if runErr != nil {
 			if !errors.Is(runErr, context.Canceled) {
 				fail(runErr)
 			}
 			return
 		}
-		recordResponsesTurn(runReq, turn, res)
+		h.recordResponsesTurn(runReq, turn, res)
 
 		var usage *prism.Usage
 		if res != nil {
@@ -646,26 +556,23 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		return
 	}
 
-	sentText := false
 	emit := func(d Delta) error {
 		if d.Text == "" {
 			return nil
 		}
-		sentText = true
 		buf = AppendResponsesEvent(buf[:0], ResponsesEvent{
 			Type: "response.output_text.delta", ItemID: itemID, Text: d.Text,
 		})
 		return sw.WriteRaw(buf)
 	}
-	// 已经吐过正文就不能重试：客户端会收到两段拼接的回答。
-	res, runErr := h.runResponses(r, runReq, turn, emit, func() bool { return !sentText })
+	res, runErr := h.runResponses(r, runReq, emit)
 	if runErr != nil {
 		if !errors.Is(runErr, context.Canceled) {
 			fail(runErr)
 		}
 		return
 	}
-	recordResponsesTurn(runReq, turn, res)
+	h.recordResponsesTurn(runReq, turn, res)
 
 	text := ""
 	var usage *prism.Usage
@@ -729,7 +636,7 @@ func emitTextResponseEvents(sw *sse.Writer, buf *[]byte, id, publicModel string,
 }
 
 func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *RunRequest, turn *responsesTurn) {
-	res, err := h.runResponses(r, runReq, turn, nil, nil)
+	res, err := h.runResponses(r, runReq, nil)
 	if err != nil {
 		h.log.Error("responses 同步失败", "err", err, "chainKey", turn.chainKey)
 		if writeContextTooLarge(w, err) {
@@ -741,7 +648,7 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 		writeError(w, status, typ, msg)
 		return
 	}
-	recordResponsesTurn(runReq, turn, res)
+	h.recordResponsesTurn(runReq, turn, res)
 
 	text := ""
 	var usage *ResponsesUsage

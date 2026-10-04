@@ -65,8 +65,8 @@ OAIprism 把这些全部收进网关，对外只暴露你已经在用的标准�
       上游负责思考，本地 Codex CLI 负责执行。文件真实落在你的磁盘上，修改按"定位原文 → 替换"安全落地。
     </td>
     <td width="33%" valign="top">
-      <b>🧠 可靠的多轮记忆</b><br><br>
-      每轮发送完整上下文，经真实请求对照实验校准；会话按 API Key 指纹隔离，互不可见。
+      <b>🧠 连续的长窗口记忆</b><br><br>
+      会话历史交给上游原生保管，每轮只发增量：实测同一会话灌到 230 万 tokens，最早的内容仍逐字答对；会话按 API Key 指纹隔离，互不可见。
     </td>
   </tr>
   <tr>
@@ -120,7 +120,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 ```toml
 model_provider = "oaiprism"
 model = "gpt-6.1-sol"
-model_context_window = 20000
+model_context_window = 1000000
 
 [model_providers.oaiprism]
 name = "oaiprism"

@@ -197,37 +197,9 @@ func foldInputHistory(items []prism.InputItem, promptLimit int) []prism.InputIte
 	if len(items) <= 2 {
 		return items
 	}
-	// 最后一条"消息"（跳过收尾的 system 提醒条目）。
-	lastIdx := len(items) - 1
-	for lastIdx > 0 && strings.EqualFold(items[lastIdx].Role, "system") {
-		lastIdx--
-	}
+	turns, lastIdx := itemHistory(items)
 	if lastIdx <= 1 {
 		return items
-	}
-
-	var turns []historyEntry
-	for i := 1; i < lastIdx; i++ {
-		it := items[i]
-		if strings.EqualFold(it.Role, "system") {
-			continue
-		}
-		speaker := speakerOf(it.Role)
-		var txt strings.Builder
-		for _, c := range it.Content {
-			txt.WriteString(c.Text)
-		}
-		contentStr := strings.TrimSpace(txt.String())
-		if contentStr == "" {
-			continue
-		}
-
-		// 过滤客户端静态注入的 AGENTS.md 等规则，不作为用户对话污染历史
-		if speaker == "User" && isStaticInstruction(contentStr) {
-			continue
-		}
-
-		turns = append(turns, historyEntry{speaker: speaker, text: contentStr})
 	}
 
 	// 规整前的 [system, 最后一条 user] 就是这条提示词里历史之外的部分。
@@ -250,6 +222,58 @@ func foldInputHistory(items []prism.InputItem, promptLimit int) []prism.InputIte
 	}
 
 	return out
+}
+
+// itemHistory 取出桥 input（首条 system + 往轮条目 + 最后一条消息 + 收尾 system 提醒）
+// 里的往轮对话，以及最后一条消息的下标（跳过收尾的 system 提醒条目）。
+// 折叠（foldInputHistory）与原生续接（itemsConversation）共用。
+func itemHistory(items []prism.InputItem) (turns []historyEntry, lastIdx int) {
+	lastIdx = len(items) - 1
+	for lastIdx > 0 && strings.EqualFold(items[lastIdx].Role, "system") {
+		lastIdx--
+	}
+	for i := 1; i < lastIdx; i++ {
+		it := items[i]
+		if strings.EqualFold(it.Role, "system") {
+			continue
+		}
+		speaker := speakerOf(it.Role)
+		var txt strings.Builder
+		for _, c := range it.Content {
+			txt.WriteString(c.Text)
+		}
+		contentStr := strings.TrimSpace(txt.String())
+		if contentStr == "" {
+			continue
+		}
+
+		// 过滤客户端静态注入的 AGENTS.md 等规则，不作为用户对话污染历史
+		if speaker == "User" && isStaticInstruction(contentStr) {
+			continue
+		}
+
+		turns = append(turns, historyEntry{speaker: speaker, text: contentStr})
+	}
+	return turns, lastIdx
+}
+
+// itemsConversation 把桥 input 拆成原生续接用的形态（见 native.go）：
+// 全部 system 合并（含收尾提醒）、往轮对话、最后一条消息。拆不出时返回 nil。
+func itemsConversation(items []prism.InputItem) *nativeConversation {
+	if len(items) == 0 {
+		return nil
+	}
+	turns, lastIdx := itemHistory(items)
+	if lastIdx < 0 || isSystemRole(items[lastIdx].Role) {
+		return nil
+	}
+	return &nativeConversation{
+		system:  itemText(mergeSystemItems(items)),
+		history: turns,
+		current: items[lastIdx],
+		// 本轮消息末尾的执行提醒到下一轮就不在了：比对用不带它的文本。
+		currentText: strings.TrimSpace(strings.TrimSuffix(itemText(items[lastIdx]), localExecReminder)),
+	}
 }
 
 // extractIncrementalInput 从全量 input 中提取增量条目。
@@ -580,7 +604,7 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 		if strings.EqualFold(items[i].Role, "user") && len(items[i].Content) > 0 {
 			lastText := items[i].Content[len(items[i].Content)-1].Text
 			if !strings.Contains(lastText, "[LOCAL_EXECUTION_REMINDER]") {
-				items[i].Content[len(items[i].Content)-1].Text += "\n\n[LOCAL_EXECUTION_REMINDER]: You are running in Codex CLI on the user's LOCAL computer. Cloud sandbox tools ('createNewFile', 'updateFile') are completely disabled. If this task creates, edits, or saves files, you MUST emit a ```codex-exec block with the command and full content to write to the user's local disk. Never use 'createNewFile' and NEVER say '已创建' in prose without the code block."
+				items[i].Content[len(items[i].Content)-1].Text += localExecReminder
 			}
 			break
 		}
@@ -588,6 +612,9 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 
 	return items
 }
+
+// localExecReminder 接在最后一条 user 消息末尾（只在本轮出现，进了历史就没有了）。
+const localExecReminder = "\n\n[LOCAL_EXECUTION_REMINDER]: You are running in Codex CLI on the user's LOCAL computer. Cloud sandbox tools ('createNewFile', 'updateFile') are completely disabled. If this task creates, edits, or saves files, you MUST emit a ```codex-exec block with the command and full content to write to the user's local disk. Never use 'createNewFile' and NEVER say '已创建' in prose without the code block."
 
 // bridgeRetryNudge 是"模型没用桥格式"时的自动纠正消息。
 //

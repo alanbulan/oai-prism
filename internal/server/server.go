@@ -123,6 +123,10 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 
 	// 4) 门面与通道。
 	runner := facade.NewRunner(cfg, log, pool, client, app)
+	if sqliteErr == nil {
+		// 原生续接的会话绑定落盘：网关重启后客户端会话接回原来的上游会话（见 facade/native_store.go）。
+		runner.UseNativeStore(sqliteStore)
+	}
 	facadeHandler := facade.NewHandler(cfg, log, runner, app)
 	rawHandler := rawproxy.New(cfg, log, pool, client, app, rec)
 

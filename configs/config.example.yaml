@@ -182,11 +182,6 @@ facade:
 
   default_model: gpt-6.1-sol
 
-  # 是否把会话链里的续接句柄（conversationId / previousResponseId /
-  # codex_listen_snapshot）附带给上游。每轮始终发送完整上下文 —— 实测上游
-  # 不会凭句柄替我们拼历史，只发增量必然失忆；这里只决定是否额外附带句柄。
-  upstream_continuation: false
-
   # 允许 chat 接口按 X-Local-Workspace 头把上游产物写到网关所在机器的目录。
   # 默认关闭（等于让调用方指定网关主机上的写入位置）；开启后也只接受本机请求。
   local_workspace_write: false
@@ -197,9 +192,9 @@ facade:
   platform_notice: true
 
   # 发往上游的单条提示词（合并后的 system + 最后一条 user）的字节上限。
-  # 上游按 UTF-8 字节限长，约 100 KiB（与 token 数无关）：历史（含 Codex 的）超出时
-  # 从最旧处裁剪并注明；本轮内容本身就超出时直接回 context_length_exceeded，不发上游。
-  # -1 关闭检查。
+  # 上游按 UTF-8 字节限长，约 100 KiB（与 token 数无关）。会话历史由上游保管、每轮只发
+  # 增量，这个上限只约束单轮内容：新建上游会话时历史放不下就分段补种；本轮内容本身就
+  # 超出时直接回 context_length_exceeded，不发上游。-1 关闭检查。
   max_prompt_bytes: 98304
 
   # 对外模型名 -> 上游真名 + 推理强度。

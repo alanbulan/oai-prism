@@ -44,10 +44,9 @@ type RunRequest struct {
 	// Metadata 是附加运行上下文，会与 Model/Effort 合并后发送。
 	Metadata map[string]any
 
-	// ConversationID / PreviousResponseID 用于多轮延续。
-	// 留空即"无状态请求"，上下文全靠 Input 自带。
-	ConversationID     string
-	PreviousResponseID string
+	// ConversationID 是发给上游的会话 ID（只用经 Server Action 登记的会话，见 native.go）。
+	// 原生续接的请求由 runner 自行登记并填写；留空即单次请求，上下文全靠 Input 自带。
+	ConversationID string
 
 	// StickyKey 是会话身份，用于账号粘性与项目复用。
 	StickyKey string
@@ -78,10 +77,13 @@ type RunRequest struct {
 	// 不再叠加通用的 platformNotice。
 	Bridge bool
 
-	// BoundAccountID 是 ProjectID / ConversationID / PreviousResponseID / 沙箱快照
-	// 这组续接句柄所属的账号（来自会话链）。项目与会话是账号私有资源：
-	// 实际租到的账号与它不同（粘性过期、原账号冷却、换号重试）时，
-	// 这些句柄在新账号上必然 403/404，必须整体作废（Input 本身已是完整上下文）。
+	// Native 非空时走原生续接（见 native.go）：上游保管会话历史，续接时只发增量。
+	// Input 仍是全量折叠后的条目 —— 新建上游会话的首轮与各种回退都发它。
+	Native *nativeTurn
+
+	// BoundAccountID 是 ProjectID / ConversationID 所属的账号（来自会话链或原生续接的绑定）。
+	// 项目与会话是账号私有资源：实际租到的账号与它不同（粘性过期、原账号冷却、换号重试）时，
+	// 它们在新账号上必然 403/404，必须作废（原生续接随之在新账号上新建会话）。
 	BoundAccountID string
 	// projectFromChain 标记 ProjectID 来自会话链（而不是调用方显式指定）。
 	projectFromChain bool
@@ -97,10 +99,6 @@ func (req *RunRequest) dropContinuation() {
 		req.projectFromChain = false
 	}
 	req.ConversationID = ""
-	req.PreviousResponseID = ""
-	if req.Metadata != nil {
-		delete(req.Metadata, "codex_listen_snapshot")
-	}
 	req.BoundAccountID = ""
 }
 
@@ -168,6 +166,8 @@ type Runner struct {
 	uploads *uploadCache
 	journal *PendingJournal
 	app     *metrics.App
+	// nativeStore 让原生续接的绑定落盘（见 native_store.go）；nil 时只在内存里。
+	nativeStore NativeStore
 
 	bucketSeq atomic.Uint64
 
@@ -245,6 +245,22 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 
 		res, err := r.runOnce(ctx, lease.Account, req, emit)
 		lease.Release()
+
+		if nt := req.Native; nt != nil {
+			if err == nil {
+				nt.commit(res, r)
+			} else {
+				// 续接的上游会话已不可用（被删、超出上游会话上限等）：作废绑定，
+				// 还没吐出内容就用新会话 + 全量上下文原地重来一次。
+				gone := nt.plan != nil && nt.plan.continued && isConversationGone(err)
+				nt.release(gone, r)
+				if gone && (res == nil || res.Text == "") && ctx.Err() == nil && attempt+1 < r.accountRetries {
+					r.log.Warn("原生续接：上游会话不可用，改用新会话全量重试", "key", nt.key, "err", err)
+					lastErr, lastRes = err, res
+					continue
+				}
+			}
+		}
 
 		if err == nil {
 			r.app.FacadeRuns.Inc(api, req.Model, "ok")
@@ -343,8 +359,8 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 
 	result := &RunResult{AccountID: acct.ID, Started: started}
 
-	// 续接句柄属于别的账号（粘性过期 / 原账号冷却后改绑 / 换号重试）：
-	// 在本账号上它们必然 403/404，整体作废（Input 已是完整上下文）。
+	// 项目 / 会话属于别的账号（粘性过期 / 原账号冷却后改绑 / 换号重试）：
+	// 在本账号上它们必然 403/404，整体作废。
 	if req.BoundAccountID != "" && req.BoundAccountID != acct.ID {
 		r.log.Info("续接句柄属于其他账号，已作废",
 			"bound", req.BoundAccountID, "account", acct.ID, "stickyKey", req.StickyKey)
@@ -404,6 +420,21 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	// 2.2) 规整成上游真正会读的形状：唯一一条 system + 最后一条 user（见 upstream_input.go）。
 	// 先于图片上传 —— 被上游丢弃的中间条目里的图片没必要上传；用量也只按这份计。
 	inputItems := r.upstreamPromptItems(req)
+	convIDOut := req.ConversationID
+	if req.Native != nil {
+		// 原生续接：会话 ID 由我们登记，续接时只发增量。
+		inputItems = r.planNative(ctx, p, acct.ID, projectID, req, inputItems)
+		convIDOut = req.Native.plan.cid
+		if len(req.Native.plan.seeds) > 0 {
+			if err := r.seedConversation(ctx, acct, req, projectID); err != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return result, cerr
+				}
+				r.log.Warn("原生续接：历史补种失败，本轮改发全量（裁剪后）", "cid", convIDOut, "err", err)
+				inputItems = req.Native.plan.fallback
+			}
+		}
+	}
 
 	// 2.3) 处理图片上传：必须在沙箱工作区同步之前上传至项目！
 	var hasNewUpload bool
@@ -412,6 +443,11 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	}
 	// 用量按真正发往上游的条目计（图片预处理之后），与上游生成并行计数
 	inputTokens := countInputAsync(inputItems)
+	if req.Native != nil && req.Native.plan.continued {
+		// 增量只是上游会话的一小段：模型每轮读的是整段会话，用量按完整上下文计
+		// （Codex 也据此判断窗口占用、决定何时压缩）。
+		inputTokens = countInputAsync(req.Native.conv.logicalItems())
+	}
 
 	// 2.5) 工作区同步：若上传了新文件，强制失效同步状态，触发沙箱拉取最新文件
 	if hasNewUpload {
@@ -443,6 +479,8 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	if projectID != "" {
 		meta["projectId"] = projectID
 	}
+	// 续接只认登记过的会话 ID：不混用客户端 metadata 里带来的沙箱快照。
+	delete(meta, "codex_listen_snapshot")
 	// frontend_origin 是上游判断"请求来自哪个前端"的依据。
 	// 缺了它请求会看起来像脚本 —— 这是风控最容易抓的点之一。
 	if _, ok := meta["frontend_origin"]; !ok && r.cfg.Upstream.Origin != "" {
@@ -465,26 +503,16 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	)
 	// 沙箱冷启动时上游会回 504 文案并提示 "Please submit prompt again"，
 	// 这是上游自己建议的处理方式 —— 照做即可，不要当成协议错误。
-	var snapLen int
-	if s, ok := meta["codex_listen_snapshot"].(string); ok {
-		snapLen = len(s)
-	}
-	r.log.Info("发给上游的请求参数",
-		"convID", req.ConversationID,
-		"prevRespID", req.PreviousResponseID,
-		"itemsCount", len(inputItems),
-		"snapshotLen", snapLen,
-	)
+	r.log.Info("发给上游的请求参数", "convID", convIDOut, "itemsCount", len(inputItems))
 	for attempt := 1; attempt <= sandboxStartRetries; attempt++ {
 		startResp, err = r.client.StartResponse(ctx, p, &prism.StartRequest{
-			Input:              inputItems,
-			PreviousResponseID: req.PreviousResponseID,
-			ConversationID:     req.ConversationID,
-			Metadata:           meta,
-			Model:              req.Model,
-			ReasoningEffort:    req.Effort,
-			UserID:             userID,
-			Extra:              req.Extra,
+			Input:           inputItems,
+			ConversationID:  convIDOut,
+			Metadata:        meta,
+			Model:           req.Model,
+			ReasoningEffort: req.Effort,
+			UserID:          userID,
+			Extra:           req.Extra,
 		})
 		if err != nil {
 			if isSentinelThrottle(err) && attempt < sandboxStartRetries {
@@ -494,7 +522,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 				}
 				continue
 			}
-			r.log.Error("start 请求上游失败", "attempt", attempt, "err", err, "convID", req.ConversationID, "prevRespID", req.PreviousResponseID)
+			r.log.Error("start 请求上游失败", "attempt", attempt, "err", err, "convID", convIDOut)
 			r.app.ConversationOps.Inc("start", "error")
 			return result, err
 		}
@@ -590,7 +618,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		if st.Fail {
 			r.app.ConversationOps.Inc("start", "failed")
 			err := r.upstreamFailure(st, inputItems, inputTokens)
-			r.log.Error("start 初始状态返回失败", "err", err, "reason", st.ErrorReason, "convID", convID, "prevRespID", req.PreviousResponseID)
+			r.log.Error("start 初始状态返回失败", "err", err, "reason", st.ErrorReason, "convID", convID)
 			r.journal.MarkTerminal(requestID, "failed", "", err)
 			return result, err
 		}

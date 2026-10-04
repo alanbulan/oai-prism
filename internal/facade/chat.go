@@ -53,24 +53,11 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		API:          "chat",
 		ExtraHeaders: extractSentinelToken(r),
 	}
-	// 客户端如果自带上一轮的 response id，就沿用它的会话上下文。
-	runReq.PreviousResponseID = previousResponseIDFrom(r, rawFields)
-	runReq.ConversationID = conversationIDFrom(r, rawFields)
-	// 会话续接链 fill（已废弃）：实测真实 Web 前端从不发 conversationId /
-	// previousResponseId（10-01 抓包 92 条 start 全部 cid=N prev=N），
-	// 上游对带 previous_response_id 的请求把 input 当增量 → 上下文丢失。
-	// 多轮上下文完全靠"全量 input 回传"，见下方历史注入。
-	// 历史注入：上游不代管对话历史，客户端只发本轮 user 消息时
-	// 把链缓存的历史拼进 input（对齐真实前端"全量回传"行为）。
-	// 标准客户端（每次回传完整 messages）会命中 historyCarriesContext，
-	// 直接跳过，避免历史重复。
-	if !historyCarriesContext(req.Messages) {
-		if hist := sessionChainHistory(runReq.StickyKey); len(hist) > 0 {
-			runReq.Input = injectChainHistory(runReq.Input, hist, h.cfg.Facade.PromptByteLimit())
-			runReq.PreviousResponseID = ""
-		}
-	}
 	runReq.Extra = passthroughFields(rawFields, chatKnownFields)
+	// 原生续接：会话历史由上游保管，续接轮次只发增量（见 native.go）。
+	if conv := chatConversation(req.Messages, h.cfg.Facade.DefaultSystemPrompt); conv != nil {
+		h.attachNative(runReq, &nativeTurn{key: runReq.StickyKey, strong: isStrongSessionKey(runReq.StickyKey), conv: conv})
+	}
 
 	// 超过上游单条上限：流开始之前就以 400 context_length_exceeded 回绝（见 context_limit.go）。
 	if err := h.runner.checkPromptSize(runReq); writeContextTooLarge(w, err) {
@@ -103,9 +90,8 @@ func setConversationHeader(w http.ResponseWriter, conversationID string) {
 // 其余字段会被原样透传给上游——这是反代的重要性质：
 // 上游加了新参数、客户端立刻就能用上，不需要我们发版。
 //
-// conversation_id 必须在这里：它已被 conversationIDFrom 翻译成上游的
-// conversationId，若再当"未知字段"透传，请求体顶层会多出一个
-// conversation_id（与上游字段命名不符，属于污染，可能被拒）。
+// conversation_id 必须在这里：它是会话键（见 conversationIDFrom），若再当"未知字段"
+// 透传，请求体顶层会多出一个 conversation_id（与上游字段命名不符，属于污染，可能被拒）。
 var chatKnownFields = map[string]struct{}{
 	"model": {}, "messages": {}, "stream": {}, "stream_options": {},
 	"conversation_id": {}, "conversationId": {},
@@ -143,10 +129,9 @@ func passthroughFields(raw map[string]json.RawMessage, known map[string]struct{}
 
 // streamChat 处理流式返回。
 func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id string, created int64, publicModel string, so *StreamOptions, declaredTools []ChatTool) {
-	// 流式下响应头必须在首帧之前写好，而上游会话 ID 要到 start 之后才知道，
-	// 所以这里只能回显"客户端自己带回来的那个"。新会话的 ID 在流式场景下
-	// 拿不到 —— 这是真流式的固有代价，客户端可用 X-Oaiprism-Session 维持会话。
-	setConversationHeader(w, runReq.ConversationID)
+	// 流式下响应头必须在首帧之前写好：只能给出续接中的上游会话（见 streamConversationID），
+	// 新建会话的 ID 随结束帧给出。
+	setConversationHeader(w, streamConversationID(runReq))
 
 	sw, err := sse.New(w)
 	if err != nil {
@@ -192,13 +177,6 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 
 	res, runErr := h.runner.Run(r.Context(), runReq, emit)
 	bindLogResult(r, res)
-	// 成功回复才记历史：失败（含吐了一半就断）的轮次进历史会把残缺回答教给模型。
-	if runErr == nil {
-		sessionChainPut(runReq.StickyKey, chainConv(res), resReqID(res), resAccount(res), runReq.Model)
-		if res != nil && res.Text != "" {
-			sessionChainAppend(runReq.StickyKey, lastUserText(runReq.Input), res.Text)
-		}
-	}
 
 	if runErr != nil {
 		// 响应头已经发出去了，没法再改状态码。
@@ -273,13 +251,6 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 func (h *Handler) syncChat(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id string, created int64, publicModel string, declaredTools []ChatTool) {
 	res, err := h.runner.Run(r.Context(), runReq, nil)
 	bindLogResult(r, res)
-	// 成功回复才记历史：失败的轮次进历史会把"空回答"教给模型。
-	if err == nil {
-		sessionChainPut(runReq.StickyKey, chainConv(res), resReqID(res), resAccount(res), runReq.Model)
-		if res != nil && res.Text != "" {
-			sessionChainAppend(runReq.StickyKey, lastUserText(runReq.Input), res.Text)
-		}
-	}
 	if err != nil {
 		if writeContextTooLarge(w, err) {
 			middleware.RecordLogError(r, "chat 同步失败: %v", err)

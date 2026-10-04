@@ -84,6 +84,13 @@ type fakeUpstream struct {
 
 	// replyParts 覆盖默认的逐字生成内容（见 parts）。
 	replyParts []string
+
+	// 会话登记（Server Action createProjectConversation）：convs 是登记过的会话 ID，
+	// actionFails 让登记失败，goneConvs 里的会话在 start 时回 conversation_too_large。
+	convs       map[string]bool
+	convSeq     int
+	actionFails bool
+	goneConvs   map[string]bool
 }
 
 // sandboxAlive 报告请求所带的沙箱令牌是否仍可用；不可用时直接回 502。
@@ -181,6 +188,30 @@ func (f *fakeUpstream) handler() http.Handler {
 		f.sandboxRoutes(mux)
 	}
 
+	// --- 会话登记：Next.js Server Action（POST 页面路径 + Next-Action 头，回 RSC 流）---
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" || r.Method != http.MethodPost || r.Header.Get("Next-Action") == "" {
+			http.NotFound(w, r)
+			return
+		}
+		var args []string
+		_ = json.NewDecoder(r.Body).Decode(&args)
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.actionFails || len(args) != 1 || args[0] == "" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		f.convSeq++
+		cid := fmt.Sprintf("cdx1_%04d", f.convSeq)
+		if f.convs == nil {
+			f.convs = map[string]bool{}
+		}
+		f.convs[cid] = true
+		w.Header().Set("Content-Type", "text/x-component")
+		fmt.Fprintf(w, "0:{\"a\":\"$@1\",\"f\":\"\",\"b\":\"build\"}\n1:%q\n", cid)
+	})
+
 	// --- 认证 ---
 	mux.HandleFunc("/api/auth/session", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -274,6 +305,17 @@ func (f *fakeUpstream) handler() http.Handler {
 			_, _ = w.Write([]byte(`{"status":"completed","request_id":"req-big",` +
 				`"response":{"status":"error","payload":{"reason":"unknown","message":"This request is too large to send. Shorten your message or selected text and try again."}}}`))
 			return
+		}
+		if cid, _ := body["conversationId"].(string); cid != "" {
+			f.mu.Lock()
+			gone := f.goneConvs[cid]
+			f.mu.Unlock()
+			if gone {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"status":"completed","request_id":"req-gone",` +
+					`"response":{"status":"error","payload":{"reason":"conversation_too_large","message":"conversation_too_large"}}}`))
+				return
+			}
 		}
 		// 复刻"start 直接返回终态"（短回答或命中缓存）。
 		if model == "instant-model" {
@@ -1269,28 +1311,6 @@ func TestE2E_ResponsesAPI(t *testing.T) {
 	}
 }
 
-// TestE2E_ResponsesPreviousResponseID 验证会话延续字段的映射。
-func TestE2E_ResponsesPreviousResponseID(t *testing.T) {
-	ts, up := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), nil)
-
-	body := `{"model":"gpt-5","input":"继续","previous_response_id":"req-prev"}`
-	resp, err := http.Post(ts.URL+"/v1/responses", "application/json", strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := readBody(resp)
-		t.Fatalf("状态码 %d: %s", resp.StatusCode, b)
-	}
-
-	up.mu.Lock()
-	defer up.mu.Unlock()
-	if got := up.startBodies[0]["previousResponseId"]; got != "req-prev" {
-		t.Fatalf("previous_response_id 未映射到上游的 previousResponseId: %v", got)
-	}
-}
-
 func TestE2E_Models(t *testing.T) {
 	ts, _ := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), nil)
 
@@ -1730,33 +1750,32 @@ func TestE2E_ConversationIDReturned(t *testing.T) {
 	}
 }
 
-// TestE2E_ConversationIDAccepted 验证客户端带回来的会话 ID 会发给上游。
+// TestE2E_ConversationIDAccepted 验证客户端带回来的会话 ID 能找回原来的上游会话。
 //
-// 回传只是半条链路：如果请求侧不认，客户端存了 ID 也续不上。
+// 网关在响应里回传上游会话 ID；只发本轮消息的客户端把它带回来，就续接同一个会话。
+// 不认识的会话 ID 不透传给上游（没登记的会话上游不续接，自造的直接 403）。
 func TestE2E_ConversationIDAccepted(t *testing.T) {
 	ts, up := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), nil)
 
-	body := `{"model":"gpt-5","conversation_id":"conv-back",
-	          "messages":[{"role":"user","content":"继续"}]}`
-	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := readBody(resp)
-		t.Fatalf("状态码 = %d, body=%s", resp.StatusCode, b)
+	postLocal(t, ts.URL+"/v1/chat/completions", `{"model":"gpt-5","messages":[{"role":"user","content":"记住暗号：BACK-12"}]}`)
+	cid := startConv(t, up, 0)
+
+	body := fmt.Sprintf(`{"model":"gpt-5","conversation_id":%q,"messages":[{"role":"user","content":"继续"}]}`, cid)
+	postLocal(t, ts.URL+"/v1/chat/completions", body)
+	_, user := requireSystemUser(t, upstreamInput(t, up, 1))
+	if startConv(t, up, 1) != cid || user != "继续" {
+		t.Fatalf("带回的会话 ID 应续接同一个上游会话、只发本轮: cid=%q user=%q", startConv(t, up, 1), user)
 	}
 
+	postLocal(t, ts.URL+"/v1/chat/completions", `{"model":"gpt-5","conversation_id":"conv-unknown","messages":[{"role":"user","content":"你好"}]}`)
 	up.mu.Lock()
 	defer up.mu.Unlock()
-	if got := up.startBodies[0]["conversationId"]; got != "conv-back" {
-		t.Errorf("上游未收到 conversationId: %+v", up.startBodies[0])
+	if got := up.startBodies[2]["conversationId"]; got == "conv-unknown" {
+		t.Errorf("不认识的会话 ID 不应透传给上游: %+v", up.startBodies[2])
 	}
-	// 客户端用的 snake_case 不能被当"未知字段"原样塞进请求体顶层：
-	// 上游只认 camelCase 的 conversationId，多一个蛇形键属于污染。
-	if _, bad := up.startBodies[0]["conversation_id"]; bad {
-		t.Errorf("conversation_id 已被消费，不该出现在请求体顶层: %+v", up.startBodies[0])
+	// 客户端用的 snake_case 不能被当"未知字段"原样塞进请求体顶层。
+	if _, bad := up.startBodies[2]["conversation_id"]; bad {
+		t.Errorf("conversation_id 已被消费，不该出现在请求体顶层: %+v", up.startBodies[2])
 	}
 }
 

@@ -330,40 +330,18 @@ func TestSessionChain_TenantIsolationAndWeakKeys(t *testing.T) {
 	ka := "k:aaaaaaaaaaaaaaaa|h:same-session"
 	kb := "k:bbbbbbbbbbbbbbbb|h:same-session"
 	sessionChainRecord(ka, &RunResult{ProjectID: "proj-A", ConversationID: "conv-A", ResponseID: "resp-A", AccountID: "acct"}, "m")
-	sessionChainAppend(ka, "secret question", "secret answer")
 
-	if p, _, _, _, _ := sessionChainLookup(kb, "", ""); p != "" {
-		t.Fatalf("不同租户同名会话不应共享状态: %s", p)
+	if h, ok := sessionChainFind(tenantOfKey(kb), kb, "", ""); ok || h.ProjectID != "" {
+		t.Fatalf("不同租户同名会话不应共享状态: %+v", h)
 	}
-	if p, _, _, _, _ := sessionChainLookupT("k:bbbbbbbbbbbbbbbb", "", "resp-A", "conv-A"); p != "" {
-		t.Fatalf("别名不应跨租户命中: %s", p)
+	if h, ok := sessionChainFind("k:bbbbbbbbbbbbbbbb", "", "resp-A", "conv-A"); ok {
+		t.Fatalf("别名不应跨租户命中: %+v", h)
 	}
-	if p, _, _, _, _ := sessionChainLookupT("k:aaaaaaaaaaaaaaaa", "", "resp-A", ""); p != "proj-A" {
-		t.Fatalf("同租户应能凭回复句柄命中: %s", p)
+	if h, _ := sessionChainFind("k:aaaaaaaaaaaaaaaa", "", "resp-A", ""); h.ProjectID != "proj-A" || h.Key != ka {
+		t.Fatalf("同租户应能凭回复句柄命中: %+v", h)
 	}
-	if h := sessionChainHistory(kb); len(h) != 0 {
-		t.Fatalf("不同租户不应读到历史: %v", h)
-	}
-
-	weak := "f:u:ABCDEF"
-	sessionChainRecord(weak, &RunResult{ProjectID: "proj-W"}, "m")
-	sessionChainAppend(weak, "q", "a")
-	if h := sessionChainHistory(weak); len(h) != 0 {
-		t.Fatalf("弱键不应注入历史（撞键即串话）: %v", h)
-	}
-}
-
-// 会话键本身是 "cid:<id>" 时，重置曾把主条目当别名删掉，整段历史丢失。
-func TestSessionChain_ResetKeepsPrimaryEntry(t *testing.T) {
-	key := "cid:conv-reset-1"
-	sessionChainRecord(key, &RunResult{ConversationID: "conv-reset-1", ResponseID: "resp-r1"}, "m")
-	sessionChainAppend(key, "hello", "world")
-	sessionChainResetSession(key, false)
-	if h := sessionChainHistory(key); len(h) != 2 {
-		t.Fatalf("重置续接句柄不应丢失历史: %v", h)
-	}
-	if _, _, prev, _, _ := sessionChainLookup(key, "", ""); prev != "" {
-		t.Fatalf("重置后上一轮句柄应清空: %s", prev)
+	if h, _ := sessionChainFind("k:aaaaaaaaaaaaaaaa", "", "", "conv-A"); h.Key != ka {
+		t.Fatalf("同租户应能凭会话 ID 命中: %+v", h)
 	}
 }
 
@@ -384,11 +362,11 @@ func TestSessionChain_AliasesBounded(t *testing.T) {
 func TestSessionChain_NoRequestIDFallback(t *testing.T) {
 	key := "h:no-reqid"
 	sessionChainRecord(key, &RunResult{RequestID: "req-123"}, "m")
-	if _, _, prev, _, _ := sessionChainLookup(key, "", ""); prev != "" {
-		t.Fatalf("RequestID 不应被记为上一轮句柄: %s", prev)
+	if h, _ := sessionChainFind(tenantOfKey(key), key, "", ""); h.ResponseID != "" {
+		t.Fatalf("RequestID 不应被记为上一轮句柄: %s", h.ResponseID)
 	}
-	if resReqID(&RunResult{RequestID: "req-1"}) != "" {
-		t.Fatal("resReqID 不应回落到 RequestID")
+	if _, ok := sessionChainFind("", "", "req-123", ""); ok {
+		t.Fatal("RequestID 不应成为回复句柄别名")
 	}
 }
 
@@ -408,17 +386,11 @@ func TestScopeKeyAddsTenant(t *testing.T) {
 // ---------------------------- 续接句柄与账号绑定 ----------------------------
 
 func TestDropContinuation(t *testing.T) {
-	req := &RunRequest{
-		ProjectID: "p", ConversationID: "c", PreviousResponseID: "r", BoundAccountID: "acct-A",
-		Metadata: map[string]any{"codex_listen_snapshot": "{}", "keep": 1},
-	}
+	req := &RunRequest{ProjectID: "p", ConversationID: "c", BoundAccountID: "acct-A"}
 	req.MarkProjectFromChain()
 	req.dropContinuation()
-	if req.ProjectID != "" || req.ConversationID != "" || req.PreviousResponseID != "" || req.BoundAccountID != "" {
+	if req.ProjectID != "" || req.ConversationID != "" || req.BoundAccountID != "" {
 		t.Fatalf("续接句柄未清空: %+v", req)
-	}
-	if _, ok := req.Metadata["codex_listen_snapshot"]; ok || req.Metadata["keep"] != 1 {
-		t.Fatalf("snapshot 应删除、其余 metadata 保留: %v", req.Metadata)
 	}
 	// 调用方显式指定的项目不受影响。
 	req2 := &RunRequest{ProjectID: "explicit"}
@@ -433,10 +405,6 @@ func TestFoldInputHistoryDoesNotMutateCaller(t *testing.T) {
 	_ = foldInputHistory(items, 0)
 	if items[0].Content[0].Text != "sys" {
 		t.Fatalf("foldInputHistory 改写了调用方的 input: %q", items[0].Content[0].Text)
-	}
-	_ = injectChainHistory(items, []ChatMessage{{Role: "user", Content: stringContent("x")}}, 0)
-	if items[0].Content[0].Text != "sys" {
-		t.Fatalf("injectChainHistory 改写了调用方的 input: %q", items[0].Content[0].Text)
 	}
 }
 

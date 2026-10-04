@@ -60,20 +60,11 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		ProjectID: projectID,
 		API:       "messages",
 	}
-	// 客户端显式句柄透传（真实前端从不发这两个字段 —— 10-01 抓包
-	// 92 条 start 全部 cid=N prev=N；上游对带 previous_response_id 的
-	// 请求把 input 当增量 → 上下文丢失）。
-	runReq.PreviousResponseID = previousResponseIDFrom(r, rawFields)
-	runReq.ConversationID = conversationIDFrom(r, rawFields)
-	// 历史注入：与 chat.go 同款 —— 上游不代管历史，单条消息客户端
-	// 把链缓存的历史拼进 input（对齐真实前端"全量回传"行为）。
-	if !historyCarriesContextA(req.Messages) {
-		if hist := sessionChainHistory(runReq.StickyKey); len(hist) > 0 {
-			runReq.Input = injectChainHistory(runReq.Input, hist, h.cfg.Facade.PromptByteLimit())
-			runReq.PreviousResponseID = ""
-		}
-	}
 	runReq.Extra = passthroughFields(rawFields, anthropicKnownFields)
+	// 原生续接：会话历史由上游保管，续接轮次只发增量（见 native.go）。
+	if conv := chatConversation(anthropicChatMessages(req.Messages), sys); conv != nil {
+		h.attachNative(runReq, &nativeTurn{key: runReq.StickyKey, strong: isStrongSessionKey(runReq.StickyKey), conv: conv})
+	}
 
 	// 超过上游单条上限：在 message_start 之前以 400 "prompt is too long" 回绝 ——
 	// Claude Code 等客户端认这句文案，据此压缩上下文（见 context_limit.go）。
@@ -95,7 +86,8 @@ var anthropicKnownFields = map[string]struct{}{
 	"model": {}, "messages": {}, "max_tokens": {}, "system": {}, "stream": {},
 	"tools": {}, "tool_choice": {}, "temperature": {}, "top_p": {}, "top_k": {},
 	"stop_sequences": {}, "metadata": {},
-	// 会话延续与前一轮响应 ID：已由 conversationIDFrom / previousResponseIDFrom 消费，不作为未知字段透传。
+	// 会话 ID 是会话键（见 anthropicConversationKey）；previous_response_id 不适用于本协议。
+	// 两者都不作为未知字段透传给上游。
 	"conversation_id": {}, "conversationId": {},
 	"previous_response_id": {}, "previousResponseId": {},
 }
@@ -125,6 +117,9 @@ func anthropicConversationKey(r *http.Request, body map[string]json.RawMessage, 
 	if v := strings.TrimSpace(r.Header.Get(HeaderSession)); v != "" {
 		return scopeKey(r, "h:"+v)
 	}
+	if cid := conversationIDFrom(r, body); cid != "" {
+		return scopeKey(r, "cid:"+cid)
+	}
 	// Anthropic 没有 user 字段，用 metadata.user_id 兜底。
 	if uid := anthropicUserID(body); uid != "" {
 		return scopeKey(r, "u:"+uid)
@@ -137,8 +132,8 @@ func anthropicConversationKey(r *http.Request, body map[string]json.RawMessage, 
 }
 
 func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id, publicModel string) {
-	// 流式头必须早于首帧，只能回显客户端带回来的会话 ID（见 streamChat 注释）。
-	setConversationHeader(w, runReq.ConversationID)
+	// 流式头必须早于首帧，只能给出续接中的上游会话（见 streamConversationID）。
+	setConversationHeader(w, streamConversationID(runReq))
 
 	sw, err := sse.New(w)
 	if err != nil {
@@ -173,13 +168,6 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 
 	res, runErr := h.runner.Run(r.Context(), runReq, emit)
 	bindLogResult(r, res)
-	// 成功回复才记历史（同 chat.go）。
-	if runErr == nil {
-		sessionChainPut(runReq.StickyKey, chainConv(res), resReqID(res), resAccount(res), runReq.Model)
-		if res != nil && res.Text != "" {
-			sessionChainAppend(runReq.StickyKey, lastUserText(runReq.Input), res.Text)
-		}
-	}
 
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {
 		middleware.RecordLogError(r, "anthropic 流式失败: %v", runErr)
@@ -211,13 +199,6 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 func (h *Handler) syncAnthropic(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id, publicModel string) {
 	res, err := h.runner.Run(r.Context(), runReq, nil)
 	bindLogResult(r, res)
-	// 成功回复才记历史（同 chat.go）。
-	if err == nil {
-		sessionChainPut(runReq.StickyKey, chainConv(res), resReqID(res), resAccount(res), runReq.Model)
-		if res != nil && res.Text != "" {
-			sessionChainAppend(runReq.StickyKey, lastUserText(runReq.Input), res.Text)
-		}
-	}
 	if err != nil {
 		if writeAnthropicTooLarge(w, err) {
 			middleware.RecordLogError(r, "anthropic 同步失败: %v", err)

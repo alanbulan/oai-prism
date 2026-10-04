@@ -43,6 +43,9 @@ type Client struct {
 
 	// debug 是可选的调试日志回调，避免 prism 包反向依赖日志库。
 	debug func(string, ...any)
+
+	// actions 是运行期发现的 Server Action ID（见 server_action.go）。
+	actions serverActionIDs
 }
 
 // UpstreamOptions 是客户端需要的上游行为参数。

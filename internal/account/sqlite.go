@@ -68,7 +68,7 @@ func NewSQLiteStore(dbPath string, log *slog.Logger) (*SQLiteStore, error) {
 	return s, nil
 }
 
-// initSchema 创建 accounts、request_logs、chat_sessions 和 chat_messages 表。
+// initSchema 创建 accounts、request_logs、chat_sessions、chat_messages、api_keys 与 native_bindings 表。
 func (s *SQLiteStore) initSchema() error {
 	if !s.ready() {
 		return errSQLiteUnavailable
@@ -132,7 +132,7 @@ func (s *SQLiteStore) initSchema() error {
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);
 	`
-	_, err := s.db.Exec(schema)
+	_, err := s.db.Exec(schema + nativeBindingsSchema)
 	if err != nil {
 		return fmt.Errorf("初始化 sqlite 表结构失败: %w", err)
 	}

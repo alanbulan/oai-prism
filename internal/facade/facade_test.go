@@ -769,36 +769,6 @@ func TestConversationIDFrom(t *testing.T) {
 	}
 }
 
-func TestPreviousResponseIDFrom(t *testing.T) {
-	// 1) 显式头优先
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	r.Header.Set(HeaderPrevious, "prev-header")
-	if got := previousResponseIDFrom(r, nil); got != "prev-header" {
-		t.Errorf("应从 HeaderPrevious 取到，得到 %q", got)
-	}
-
-	// 2) 请求体 previous_response_id
-	r2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	if got := previousResponseIDFrom(r2, rawFields(t, `{"previous_response_id":"prev-snake"}`)); got != "prev-snake" {
-		t.Errorf("应从 previous_response_id 取到，得到 %q", got)
-	}
-
-	// 3) 请求体 previousResponseId (驼峰)
-	if got := previousResponseIDFrom(r2, rawFields(t, `{"previousResponseId":"prev-camel"}`)); got != "prev-camel" {
-		t.Errorf("应从 previousResponseId 取到，得到 %q", got)
-	}
-
-	// 4) metadata.prism_previous_response_id (对照 PrismOpenAIProxy)
-	if got := previousResponseIDFrom(r2, rawFields(t, `{"metadata":{"prism_previous_response_id":"prev-meta"}}`)); got != "prev-meta" {
-		t.Errorf("应从 metadata.prism_previous_response_id 取到，得到 %q", got)
-	}
-
-	// 5) 都没有时为空
-	if got := previousResponseIDFrom(r2, rawFields(t, `{}`)); got != "" {
-		t.Errorf("无来源时应为空，得到 %q", got)
-	}
-}
-
 // ---------------------------- /v1/models 的 label ----------------------------
 
 func TestHandleModels_Label(t *testing.T) {

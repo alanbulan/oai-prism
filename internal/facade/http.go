@@ -61,9 +61,6 @@ const (
 	HeaderProject = "X-Oaiprism-Project"
 	HeaderEffort  = "X-Oaiprism-Effort"
 	HeaderModel   = "X-Oaiprism-Model"
-	// HeaderPrevious 用于把上一轮的 request_id 传回来实现多轮延续。
-	// 不传也能用：那样子上下文完全靠 input 自带（无状态模式）。
-	HeaderPrevious = "X-Oaiprism-Previous"
 )
 
 // readBody 读取并限制请求体。
@@ -222,18 +219,9 @@ func conversationKeyBase(r *http.Request, body map[string]json.RawMessage, msgs 
 		}
 	}
 
-	// 3. conversation_id / session_id / metadata
-	if raw, ok := body["conversation_id"]; ok && len(raw) > 0 {
-		var cid string
-		if err := json.Unmarshal(raw, &cid); err == nil && strings.TrimSpace(cid) != "" {
-			return "cid:" + strings.TrimSpace(cid)
-		}
-	}
-	if raw, ok := body["conversationId"]; ok && len(raw) > 0 {
-		var cid string
-		if err := json.Unmarshal(raw, &cid); err == nil && strings.TrimSpace(cid) != "" {
-			return "cid:" + strings.TrimSpace(cid)
-		}
+	// 3. 会话 ID（客户端带回我们回传的上游会话 ID，见 conversationIDFrom）/ session_id / metadata
+	if cid := conversationIDFrom(r, body); cid != "" {
+		return "cid:" + cid
 	}
 	if raw, ok := body["session_id"]; ok && len(raw) > 0 {
 		var sid string
@@ -372,42 +360,11 @@ func mergeMetadata(client, injected map[string]any) map[string]any {
 	return out
 }
 
-// previousResponseIDFrom 从请求头或请求体里取上一轮的 response id。
+// conversationIDFrom 取客户端带回的会话 ID。
 //
-// 支持来源（对照 PrismOpenAIProxy server.mjs:178）：
-//   - 请求头 X-Oaiprism-Previous（我们自己的约定，最直接）
-//   - 请求体 previous_response_id / previousResponseId（兼容 OpenAI 客户端）
-//   - 请求体 metadata.prism_previous_response_id（部分生态客户端塞在 metadata 里）
-func previousResponseIDFrom(r *http.Request, body map[string]json.RawMessage) string {
-	if v := strings.TrimSpace(r.Header.Get(HeaderPrevious)); v != "" {
-		return v
-	}
-	for _, k := range []string{"previous_response_id", "previousResponseId"} {
-		raw, ok := body[k]
-		if !ok {
-			continue
-		}
-		var v string
-		if err := json.Unmarshal(raw, &v); err == nil && strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
-		}
-	}
-	if rawMD, ok := body["metadata"]; ok && len(rawMD) > 0 {
-		var md struct {
-			PrismPreviousResponseID string `json:"prism_previous_response_id"`
-		}
-		if err := json.Unmarshal(rawMD, &md); err == nil {
-			return strings.TrimSpace(md.PrismPreviousResponseID)
-		}
-	}
-	return ""
-}
-
-// conversationIDFrom 取上游会话 ID（多轮延续的第二条通道）。
-//
-// 与 PreviousResponseID 的分工：后者是"上一轮生成的句柄"（精确续写），
-// 前者是"会话容器的 ID"（上游按会话归档上下文）。两者都来自上游回传，
-// 我们在响应头 x-prism-conversation-id / x-oaiprism-previous 里还回去。
+// 网关在响应头 x-prism-conversation-id 与响应体里回传上游会话 ID；客户端带回来时它就是
+// 会话键（"cid:<ID>"），原生续接凭它找回绑定（见 native.go nativeConvKey）。它不会被
+// 透传给上游：上游只续接经 Server Action 登记的会话，由 runner 自行登记。
 //
 // 读取顺序（对照 PrismOpenAIProxy server.mjs:177，兼容其客户端生态）：
 //  1. 请求头 x-prism-conversation-id

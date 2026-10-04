@@ -92,12 +92,13 @@ func TestE2E_Bridge_PostCompactionKeepsSummary(t *testing.T) {
 	}
 }
 
-// TestE2E_Bridge_CompactionRequestFitsAndStaysText：压缩请求超过单条上限时裁掉最旧的
-// 历史而不是失败（这一轮必须成功，摘要才接得上）；模型就算输出 codex-exec 块，
-// 回给 Codex 的也只能是摘要正文。
+// TestE2E_Bridge_CompactionRequestFitsAndStaysText：登记会话失败、只能单条全量发送时，
+// 压缩请求超过单条上限就裁掉最旧的历史而不是失败（这一轮必须成功，摘要才接得上）；
+// 模型就算输出 codex-exec 块，回给 Codex 的也只能是摘要正文。
 func TestE2E_Bridge_CompactionRequestFitsAndStaysText(t *testing.T) {
 	const limit = 24000
-	up := &fakeUpstream{t: t, replyParts: []string{"## Progress\n- 暗号 COBALT-5521\n", "```codex-exec\nconst out = await tools.exec_command({ cmd: \"ls\" });\ntext(out);\n```"}}
+	up := &fakeUpstream{t: t, actionFails: true, // 登记失败 → 单条全量回退（能登记时走补种，见 native_e2e_test）
+		replyParts: []string{"## Progress\n- 暗号 COBALT-5521\n", "```codex-exec\nconst out = await tools.exec_command({ cmd: \"ls\" });\ntext(out);\n```"}}
 	ts, _ := newTestServer(t, up, goodAccount(), func(c *config.Config) { c.Facade.MaxPromptBytes = limit })
 
 	items := []any{codexMsg("user", "记住本任务的暗号：COBALT-5521")}
@@ -138,12 +139,12 @@ func TestE2E_Bridge_CompactionRequestFitsAndStaysText(t *testing.T) {
 	}
 }
 
-// TestE2E_Bridge_OversizeHistoryTrimmed：普通轮次的历史超过单条上限时裁掉最旧的部分，
-// 而不是回 context_length_exceeded —— 实测 Codex 0.160 收到它只会结束本轮，下一轮
-// 照发同样的历史（窗口配成 272k 也不压缩），会话卡死。
+// TestE2E_Bridge_OversizeHistoryTrimmed：登记会话失败、只能单条全量发送时，历史超过单条
+// 上限就裁掉最旧的部分，而不是回 context_length_exceeded —— 实测 Codex 0.160 收到它只会
+// 结束本轮，下一轮照发同样的历史，会话卡死。
 func TestE2E_Bridge_OversizeHistoryTrimmed(t *testing.T) {
 	const limit = 20000
-	ts, up := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), func(c *config.Config) { c.Facade.MaxPromptBytes = limit })
+	ts, up := newTestServer(t, &fakeUpstream{t: t, actionFails: true}, goodAccount(), func(c *config.Config) { c.Facade.MaxPromptBytes = limit })
 	items := []any{codexMsg("user", "开始")}
 	for k := 1; k <= 8; k++ {
 		items = append(items,

@@ -723,7 +723,7 @@ func TestSafeTruncateOutput(t *testing.T) {
 }
 
 func TestSessionChainLookup(t *testing.T) {
-	sessionChainBind("test-sess-key", "conv-uuid-1", "proj-uuid-1")
+	sessionChainBind("test-sess-key", "proj-uuid-1")
 	sessionChainRecord("test-sess-key", &RunResult{
 		ProjectID:      "proj-uuid-1",
 		ConversationID: "conv-uuid-1",
@@ -731,21 +731,16 @@ func TestSessionChainLookup(t *testing.T) {
 	}, "test-model")
 
 	// 1. 通过原始 key 查找
-	proj, conv, prev, _, _ := sessionChainLookup("test-sess-key", "", "")
-	if proj != "proj-uuid-1" || conv != "conv-uuid-1" || prev != "resp_12345" {
-		t.Fatalf("通过 key 查找失败: proj=%s conv=%s prev=%s", proj, conv, prev)
+	if h, _ := sessionChainFind("", "test-sess-key", "", ""); h.ProjectID != "proj-uuid-1" || h.ConversationID != "conv-uuid-1" || h.ResponseID != "resp_12345" {
+		t.Fatalf("通过 key 查找失败: %+v", h)
 	}
-
-	// 2. 通过 previousResponseId 穿透查找（key 改变时）
-	proj2, conv2, prev2, _, _ := sessionChainLookup("different-key", "resp_12345", "")
-	if proj2 != "proj-uuid-1" || conv2 != "conv-uuid-1" || prev2 != "resp_12345" {
-		t.Fatalf("通过 previousResponseId 穿透查找失败: proj=%s conv=%s prev=%s", proj2, conv2, prev2)
+	// 2. 通过 previousResponseId 穿透查找（key 改变时），命中的是原条目的键
+	if h, _ := sessionChainFind("", "different-key", "resp_12345", ""); h.Key != "test-sess-key" || h.ProjectID != "proj-uuid-1" {
+		t.Fatalf("通过 previousResponseId 穿透查找失败: %+v", h)
 	}
-
 	// 3. 通过 conversationId 查找
-	proj3, conv3, prev3, _, _ := sessionChainLookup("", "", "conv-uuid-1")
-	if proj3 != "proj-uuid-1" || conv3 != "conv-uuid-1" || prev3 != "resp_12345" {
-		t.Fatalf("通过 conversationId 查找失败: proj=%s conv=%s prev=%s", proj3, conv3, prev3)
+	if h, _ := sessionChainFind("", "", "", "conv-uuid-1"); h.Key != "test-sess-key" || h.ProjectID != "proj-uuid-1" {
+		t.Fatalf("通过 conversationId 查找失败: %+v", h)
 	}
 }
 
