@@ -85,15 +85,20 @@ func (h *Handler) readBody(r *http.Request) ([]byte, error) {
 	return b, nil
 }
 
-// writeError 输出 OpenAI 风格错误。
+// writeError 输出 OpenAI 风格错误（code 为状态码）。
 func writeError(w http.ResponseWriter, status int, typ, msg string) {
+	writeErrorCode(w, status, typ, strconv.Itoa(status), msg)
+}
+
+// writeErrorCode 输出带指定 code 的 OpenAI 风格错误（如 context_length_exceeded）。
+func writeErrorCode(w http.ResponseWriter, status int, typ, code, msg string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	body, _ := json.Marshal(ErrorResponse{Error: ErrorPayload{
 		Message: msg,
 		Type:    typ,
-		Code:    strconv.Itoa(status),
+		Code:    code,
 	}})
 	_, _ = w.Write(body)
 }

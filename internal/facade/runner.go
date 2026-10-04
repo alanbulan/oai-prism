@@ -215,6 +215,14 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 		api = "unknown"
 	}
 
+	// 超过上游单条上限的请求发出去必败，还会被当成沙箱未就绪反复重试：
+	// 占用账号、建项目、申请沙箱之前就拦下（见 context_limit.go）。
+	if err := r.checkPromptSize(req); err != nil {
+		r.app.FacadeRuns.Inc(api, req.Model, "too_large")
+		r.log.Warn("提示词超过上游单条上限，未发送", "api", api, "err", err)
+		return nil, err
+	}
+
 	var (
 		lastErr error
 		// lastRes 是最后一次尝试的结果：失败时也要交还调用方，
@@ -260,6 +268,11 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 			return res, err
 		}
 
+		// 超限是请求本身的问题，不记到账号头上。
+		if errors.Is(err, ErrContextTooLarge) {
+			r.app.FacadeRuns.Inc(api, req.Model, "too_large")
+			return res, err
+		}
 		r.pool.MarkResult(lease.Account, err, retryAfter(err))
 
 		// 已经吐过内容就不能换号重试，否则客户端会收到两段拼接的回答。
@@ -390,10 +403,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 
 	// 2.2) 规整成上游真正会读的形状：唯一一条 system + 最后一条 user（见 upstream_input.go）。
 	// 先于图片上传 —— 被上游丢弃的中间条目里的图片没必要上传；用量也只按这份计。
-	inputItems := canonicalUpstreamInput(req.Input)
-	if !req.Bridge && r.cfg.Facade.PlatformNotice {
-		inputItems = prependSystemText(inputItems, platformNotice)
-	}
+	inputItems := r.upstreamPromptItems(req)
 
 	// 2.3) 处理图片上传：必须在沙箱工作区同步之前上传至项目！
 	var hasNewUpload bool
@@ -579,7 +589,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	if st := startResp.Initial; st != nil {
 		if st.Fail {
 			r.app.ConversationOps.Inc("start", "failed")
-			err := upstreamError(st)
+			err := r.upstreamFailure(st, inputItems, inputTokens)
 			r.log.Error("start 初始状态返回失败", "err", err, "reason", st.ErrorReason, "convID", convID, "prevRespID", req.PreviousResponseID)
 			r.journal.MarkTerminal(requestID, "failed", "", err)
 			return result, err
@@ -790,7 +800,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			// 关键：失败也算 Done。上游用 HTTP 200 + response.status=error
 			// 表达失败，漏判就会返回一个"成功的空回答"。
 			if st.Fail {
-				err := upstreamError(st)
+				err := r.upstreamFailure(st, inputItems, inputTokens)
 				r.journal.MarkTerminal(requestID, "failed", "", err)
 				return result, err
 			}
@@ -1155,6 +1165,19 @@ func sandboxReason(resp *prism.StartResponse) string {
 		return resp.Initial.ErrorReason
 	}
 	return resp.Initial.Error
+}
+
+// upstreamFailure 把上游的失败终态转成 Go error：单条超限转成 contextTooLargeError
+// （预检的上限比上游小，正常到不了这里；上游若收紧了限制，客户端照样拿到
+// context_length_exceeded，而不是一个会被无限重试的 server_error）。
+func (r *Runner) upstreamFailure(st *prism.StatusResponse, items []prism.InputItem, tokens func() int) error {
+	if isUpstreamTooLarge(st.Error) {
+		return &contextTooLargeError{
+			Bytes: promptBytes(items), Limit: r.cfg.Facade.PromptByteLimit(),
+			Tokens: tokens(), Upstream: st.Error,
+		}
+	}
+	return upstreamError(st)
 }
 
 // upstreamError 把上游的业务错误转成 Go error。

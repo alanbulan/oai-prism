@@ -196,6 +196,12 @@ facade:
   # Codex 桥请求自带同类条款，并改用本地 Codex CLI 发来的 AGENTS.md。
   platform_notice: true
 
+  # 发往上游的单条提示词（合并后的 system + 最后一条 user）的字节上限。
+  # 上游按 UTF-8 字节限长，约 100 KiB（与 token 数无关）：历史（含 Codex 的）超出时
+  # 从最旧处裁剪并注明；本轮内容本身就超出时直接回 context_length_exceeded，不发上游。
+  # -1 关闭检查。
+  max_prompt_bytes: 98304
+
   # 对外模型名 -> 上游真名 + 推理强度。
   # label 是 /v1/models 里的展示名（可选，不填则不带 name 字段）。
   models:

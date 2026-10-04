@@ -120,7 +120,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 ```toml
 model_provider = "oaiprism"
 model = "gpt-6.1-sol"
-model_context_window = 16384
+model_context_window = 20000
 
 [model_providers.oaiprism]
 name = "oaiprism"

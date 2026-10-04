@@ -124,6 +124,8 @@ type AnthropicEvent struct {
 	StopReason string
 	Usage      *prism.Usage
 	Index      int
+	// ErrorType 是 error 事件的 error.type（默认 api_error）。
+	ErrorType string
 }
 
 // AppendAnthropicEvent 编码一个 Anthropic SSE 事件（含 event: 行）。
@@ -182,7 +184,13 @@ func AppendAnthropicEvent(dst []byte, e AnthropicEvent) []byte {
 		dst = append(dst, `{"type":"message_stop"}`...)
 
 	case "error":
-		dst = append(dst, `{"type":"error","error":{"type":"api_error","message":`...)
+		typ := e.ErrorType
+		if typ == "" {
+			typ = "api_error"
+		}
+		dst = append(dst, `{"type":"error","error":{"type":`...)
+		dst = sse.AppendJSONString(dst, typ)
+		dst = append(dst, `,"message":`...)
 		dst = sse.AppendJSONString(dst, e.Text)
 		dst = append(dst, `}}`...)
 	}

@@ -452,7 +452,7 @@ func TestFoldInputHistory(t *testing.T) {
 		mk("user", "任务二"),
 		prism.NewSystemItem("tail-reminder"),
 	}
-	got := foldInputHistory(items)
+	got := foldInputHistory(items, 0)
 	if len(got) != len(items) {
 		t.Fatalf("期望完整保留所有 %d 条消息条目，实际得到 %d", len(items), len(got))
 	}
@@ -474,7 +474,7 @@ func TestFoldInputHistory(t *testing.T) {
 
 	// 短输入（system + user）不折叠。
 	two := []prism.InputItem{prism.NewSystemItem("s"), mk("user", "hi")}
-	if got2 := foldInputHistory(two); len(got2) != 2 {
+	if got2 := foldInputHistory(two, 0); len(got2) != 2 {
 		t.Fatalf("两条输入不应折叠")
 	}
 }
@@ -497,7 +497,7 @@ func TestFoldInputHistory_FiltersStaticInstructions(t *testing.T) {
 		mk("user", "文件保存在哪里？"),
 		prism.NewSystemItem("tail-reminder"),
 	}
-	got := foldInputHistory(items)
+	got := foldInputHistory(items, 0)
 	if len(got) != len(items) {
 		t.Fatalf("期望完整保留所有 %d 条消息条目，得到 %d", len(items), len(got))
 	}
@@ -529,7 +529,7 @@ func TestBridgeInputItems_And_FoldInputHistory_MultiTurnToolExecution(t *testing
 		t.Fatalf("bridgeInputItems 解析失败")
 	}
 
-	folded := foldInputHistory(items)
+	folded := foldInputHistory(items, 0)
 	if len(folded) != len(items) {
 		t.Fatalf("期望完整保留所有 %d 条消息条目，实际得到 %d 条", len(items), len(folded))
 	}

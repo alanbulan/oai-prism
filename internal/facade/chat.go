@@ -45,7 +45,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		Model:        model,
 		Effort:       effort,
 		UserID:       req.User,
-		Input:        translateChatMessages(req.Messages, h.cfg.Facade.DefaultSystemPrompt),
+		Input:        translateChatMessages(req.Messages, h.cfg.Facade.DefaultSystemPrompt, h.cfg.Facade.PromptByteLimit()),
 		Metadata:     mergeMetadata(clientMetadata(rawFields), metadataWith("tools", toolsMetadata(req.Tools))),
 		StickyKey:    conversationKey(r, rawFields, req.Messages),
 		AccountID:    accountID,
@@ -66,11 +66,17 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	// 直接跳过，避免历史重复。
 	if !historyCarriesContext(req.Messages) {
 		if hist := sessionChainHistory(runReq.StickyKey); len(hist) > 0 {
-			runReq.Input = injectChainHistory(runReq.Input, hist)
+			runReq.Input = injectChainHistory(runReq.Input, hist, h.cfg.Facade.PromptByteLimit())
 			runReq.PreviousResponseID = ""
 		}
 	}
 	runReq.Extra = passthroughFields(rawFields, chatKnownFields)
+
+	// 超过上游单条上限：流开始之前就以 400 context_length_exceeded 回绝（见 context_limit.go）。
+	if err := h.runner.checkPromptSize(runReq); writeContextTooLarge(w, err) {
+		middleware.RecordLogError(r, "chat 提示词超限: %v", err)
+		return
+	}
 
 	started := time.Now()
 	id := newID("chatcmpl-")
@@ -204,7 +210,11 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 			middleware.RecordLogError(r, "chat 流式失败: %v", runErr)
 			buf = append(buf[:0], `{"error":{"message":`...)
 			buf = sse.AppendJSONString(buf, runErr.Error())
-			buf = append(buf, `,"type":"upstream_error"}}`...)
+			if errors.Is(runErr, ErrContextTooLarge) {
+				buf = append(buf, `,"type":"invalid_request_error","code":"context_length_exceeded"}}`...)
+			} else {
+				buf = append(buf, `,"type":"upstream_error"}}`...)
+			}
 			_ = sw.WriteData(buf)
 		}
 		_ = sw.Done()
@@ -271,6 +281,10 @@ func (h *Handler) syncChat(w http.ResponseWriter, r *http.Request, runReq *RunRe
 		}
 	}
 	if err != nil {
+		if writeContextTooLarge(w, err) {
+			middleware.RecordLogError(r, "chat 同步失败: %v", err)
+			return
+		}
 		status, typ, msg := mapError(err)
 		middleware.RecordLogError(r, "chat 同步失败: %s", msg)
 		writeError(w, status, typ, msg)

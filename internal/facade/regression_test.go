@@ -430,11 +430,11 @@ func TestDropContinuation(t *testing.T) {
 
 func TestFoldInputHistoryDoesNotMutateCaller(t *testing.T) {
 	items := []prism.InputItem{prism.NewSystemItem("sys"), prism.NewUserItem("q1"), prism.NewAssistantItem("a1"), prism.NewUserItem("q2")}
-	_ = foldInputHistory(items)
+	_ = foldInputHistory(items, 0)
 	if items[0].Content[0].Text != "sys" {
 		t.Fatalf("foldInputHistory 改写了调用方的 input: %q", items[0].Content[0].Text)
 	}
-	_ = injectChainHistory(items, []ChatMessage{{Role: "user", Content: stringContent("x")}})
+	_ = injectChainHistory(items, []ChatMessage{{Role: "user", Content: stringContent("x")}}, 0)
 	if items[0].Content[0].Text != "sys" {
 		t.Fatalf("injectChainHistory 改写了调用方的 input: %q", items[0].Content[0].Text)
 	}

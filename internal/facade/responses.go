@@ -30,7 +30,44 @@ type responsesTurn struct {
 	execToolName string
 	execKind     string
 	isAux        bool
+
+	// compaction 标识 Codex 的上下文压缩请求（见 codexRequestKind）：
+	// 回复只能是摘要正文，不能变成工具调用。
+	compaction bool
 }
+
+// codexRequestKind 取 Codex 在 x-codex-turn-metadata 里标注的请求种类（turn / compaction …）。
+//
+// 本地 provider 不叫 OpenAI 时，Codex（0.160）在本地做压缩：照常发一次
+// /responses，历史末尾附一条 "You are performing a CONTEXT CHECKPOINT
+// COMPACTION…"，并在元数据里标 request_kind=compaction（strategy=memento），
+// 拿回复正文当摘要。元数据同时出现在 client_metadata 与同名请求头里。
+func codexRequestKind(r *http.Request, raw map[string]json.RawMessage) string {
+	meta := ""
+	if cm, ok := raw["client_metadata"]; ok {
+		var m map[string]any
+		if json.Unmarshal(cm, &m) == nil {
+			meta, _ = m["x-codex-turn-metadata"].(string)
+		}
+	}
+	if meta == "" {
+		meta = r.Header.Get("X-Codex-Turn-Metadata")
+	}
+	var tm struct {
+		RequestKind string `json:"request_kind"`
+	}
+	if meta == "" || json.Unmarshal([]byte(meta), &tm) != nil {
+		return ""
+	}
+	return tm.RequestKind
+}
+
+// compactionDirective 接在压缩请求的桥 system 末尾：桥指令通篇在教模型发
+// codex-exec，压缩这一轮只要摘要正文。
+const compactionDirective = "<context_checkpoint>\n" +
+	"This request is a CONTEXT CHECKPOINT. Reply with the handoff summary as plain text only. " +
+	"Do NOT emit a ```codex-exec block and do not run any command: nothing is executed for this reply.\n" +
+	"</context_checkpoint>"
 
 // handleResponses 实现 POST /v1/responses（OpenAI 新一代 Responses API）。
 //
@@ -65,6 +102,12 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	// （顶层 tools 为 null）。检测到它就切换到桥模式 —— 上游当大脑，
 	// 本地 CLI 当手脚，见 toolbridge.go 顶部注释。
 	bridge := BridgeEnabled(rawFields)
+	compaction := codexRequestKind(r, rawFields) == "compaction"
+	if compaction && !bridge && strings.Contains(string(rawFields["input"]), `"function_call"`) {
+		// 压缩请求不带工具声明；历史里有工具往返时仍按桥翻译，
+		// 否则工具调用与结果被当成非消息条目丢掉，摘要里就没有做过的操作。
+		bridge = true
+	}
 	toolsStr := string(rawFields["tools"])
 	hasTools := toolsStr != "" && toolsStr != "null" && toolsStr != "[]"
 	turn := &responsesTurn{
@@ -75,11 +118,13 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		bridge:       bridge,
 		execToolName: ExecToolName(rawFields),
 		execKind:     ExecToolKind(rawFields),
+		compaction:   compaction,
 	}
 	// 桥判定诊断：CLI 有两条工具声明路径（use_responses_lite 决定）——
 	// true 走 input 里的 additional_tools 条目，false 走顶层 tools 字段。
 	h.log.Debug("桥判定",
 		"bridge", bridge,
+		"compaction", compaction,
 		"tools_bytes", len(toolsStr),
 		"input_bytes", len(rawFields["input"]),
 		"exec_tool_name", turn.execToolName,
@@ -92,10 +137,14 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	promptLimit := h.cfg.Facade.PromptByteLimit()
 	var input []prism.InputItem
 	if bridge {
 		// UA 推断的 OS 事实声明随桥指令一起进首条 system（见 osDirective）。
 		input = bridgeInputItems(req.Input, osDirective(r.UserAgent()))
+		if compaction {
+			input = appendSystemText(input, compactionDirective)
+		}
 	} else {
 		// instructions 就是 Responses API 的 system：与 input 自带的 system、
 		// 折叠的历史合成唯一一条（上游只读最后一条 system，分开发会丢）。
@@ -103,7 +152,12 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		if req.Instructions != "" {
 			fallback = ""
 		}
-		input = messagesFromResponsesInput(req.Input, fallback)
+		// instructions 稍后才前置，历史预算先把它扣掉。
+		histLimit := promptLimit
+		if promptLimit > 0 {
+			histLimit = max(1, promptLimit-len(req.Instructions))
+		}
+		input = messagesFromResponsesInput(req.Input, fallback, histLimit)
 		input = prependSystemText(input, req.Instructions)
 	}
 	if len(input) == 0 {
@@ -207,15 +261,27 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	// （上游不会替我们按句柄拼历史）。客户端自带历史的折叠进唯一一条 system；
 	// 只发本轮消息的客户端，用本地会话链累积的历史注入。
 	switch {
-	case hasClientHistory && bridge:
-		runReq.Input = foldInputHistory(input)
+	case bridge:
+		// Codex 每轮都带完整上下文，一律折叠，也绝不注入会话链：压缩后的替换历史
+		// 只有若干条 user 加一条摘要、没有 assistant，旧判据（见过 assistant 才折叠）
+		// 会漏折，摘要被上游丢掉；回落去注入的会话链又是陈旧的原始工具输出
+		// （2026-10-04 实测：换个空会话链重放压缩后的首个请求，模型答"上下文未提供暗号"）。
+		//
+		// 超过单条上限时裁掉最旧的历史，而不是回 context_length_exceeded 等 Codex 压缩：
+		// 实测 Codex 0.160 收到它只会结束本轮，下一轮照发同样的历史（窗口配成 272k
+		// 时也一样），会话卡死。压缩请求同理 —— 那一轮必须成功，摘要才接得上。
+		runReq.Input = foldInputHistory(input, promptLimit)
+		if historyTrimmed(runReq.Input) {
+			h.log.Info("Codex 历史超出上游单条上限，已裁掉最旧部分",
+				"chainKey", turn.chainKey, "compaction", compaction, "limit", promptLimit)
+		}
 	case hasClientHistory:
 		// 非桥：translateChatMessages 已把历史折进 system，再折一次就重复了。
 		runReq.Input = input
 	default:
 		runReq.Input = input
 		if hist := sessionChainHistory(turn.chainKey); len(hist) > 0 {
-			runReq.Input = injectChainHistory(input, hist)
+			runReq.Input = injectChainHistory(input, hist, promptLimit)
 		}
 	}
 	for idx, it := range runReq.Input {
@@ -291,7 +357,8 @@ func (h *Handler) writeLocalTitle(w http.ResponseWriter, req *ResponsesRequest, 
 // 拿它们重试只会让一个已经很慢的请求再慢一倍、白扣一次额度。
 func isContinuationError(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
-		errors.Is(err, ErrPollTimeout) || creds.IsAuthError(err) || creds.IsRateLimited(err) || isSentinelThrottle(err) {
+		errors.Is(err, ErrPollTimeout) || errors.Is(err, ErrContextTooLarge) ||
+		creds.IsAuthError(err) || creds.IsRateLimited(err) || isSentinelThrottle(err) {
 		return false
 	}
 	var ae *creds.APIError
@@ -355,7 +422,9 @@ func recordResponsesTurn(runReq *RunRequest, turn *responsesTurn, res *RunResult
 	}
 	sessionChainRecord(turn.chainKey, res, runReq.Model)
 	sessionChainRecordLocalID(turn.chainKey, turn.id)
-	if res.Text != "" {
+	// 会话链历史只服务"只发本轮消息"的客户端。Codex 每轮自带完整上下文，
+	// 记下来的只会是工具输出与压缩指令，用不上也不该被注入。
+	if res.Text != "" && !turn.bridge && !turn.compaction {
 		sessionChainAppend(turn.chainKey, lastUserText(runReq.Input), res.Text)
 	}
 }
@@ -480,7 +549,9 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 	fail := func(runErr error) {
 		h.log.Error("responses 流式失败", "err", runErr, "chainKey", turn.chainKey)
 		middleware.RecordLogError(r, "responses 流式失败: %v", runErr)
-		buf = AppendResponsesEvent(buf[:0], ResponsesEvent{Type: "response.failed", ResponseID: id, Model: publicModel, CreatedAt: created, Text: runErr.Error()})
+		// error.code 决定 Codex 怎么处理：context_length_exceeded 触发压缩，其余当断线重连。
+		buf = AppendResponsesEvent(buf[:0], ResponsesEvent{Type: "response.failed", ResponseID: id, Model: publicModel,
+			CreatedAt: created, Text: runErr.Error(), Status: responsesErrorCode(runErr)})
 		_ = sw.WriteRaw(buf)
 	}
 
@@ -508,7 +579,11 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 			usage = res.Usage
 		}
 		text := sb.String()
-		js := h.bridgeExecJS(r, turn, text, res)
+		js := ""
+		if !turn.compaction {
+			// 压缩请求的回复是摘要：Codex 只认一条 assistant 消息，变成工具调用压缩就失败了。
+			js = h.bridgeExecJS(r, turn, text, res)
+		}
 
 		finalRespID := id
 		if res != nil && res.ResponseID != "" {
@@ -657,6 +732,10 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 	res, err := h.runResponses(r, runReq, turn, nil, nil)
 	if err != nil {
 		h.log.Error("responses 同步失败", "err", err, "chainKey", turn.chainKey)
+		if writeContextTooLarge(w, err) {
+			middleware.RecordLogError(r, "responses 同步失败: %v", err)
+			return
+		}
 		status, typ, msg := mapError(err)
 		middleware.RecordLogError(r, "responses 同步失败: %s", msg)
 		writeError(w, status, typ, msg)
@@ -681,7 +760,11 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 	}
 
 	if turn.bridge {
-		if js := h.bridgeExecJS(r, turn, text, res); js != "" {
+		js := ""
+		if !turn.compaction {
+			js = h.bridgeExecJS(r, turn, text, res)
+		}
+		if js != "" {
 			callID := newID("ctc_")
 			setConversationHeader(w, conversationID)
 			var out any

@@ -81,6 +81,9 @@ type fakeUpstream struct {
 	sandboxSeq  int
 	deadSandbox map[string]bool // 已被"回收"的沙箱令牌：代理对它们回 502（空响应体，与实测一致）
 	deadAll     bool            // 沙箱服务整体故障：任何沙箱都回 502
+
+	// replyParts 覆盖默认的逐字生成内容（见 parts）。
+	replyParts []string
 }
 
 // sandboxAlive 报告请求所带的沙箱令牌是否仍可用；不可用时直接回 502。
@@ -139,6 +142,9 @@ type genState struct {
 
 // parts 是假上游"逐字生成"的内容。
 func (f *fakeUpstream) parts() []string {
+	if len(f.replyParts) > 0 {
+		return f.replyParts
+	}
 	return []string{"你好", "，这是", "一段流式回答。", "（完）"}
 }
 
@@ -260,6 +266,13 @@ func (f *fakeUpstream) handler() http.Handler {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"status":"completed","request_id":"req-err",` +
 				`"response":{"status":"error","payload":{"reason":"unknown","message":"User not found"}}}`))
+			return
+		}
+		// 复刻单条消息超限（2026-10-04 实测文案）。
+		if model == "too-large-model" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"completed","request_id":"req-big",` +
+				`"response":{"status":"error","payload":{"reason":"unknown","message":"This request is too large to send. Shorten your message or selected text and try again."}}}`))
 			return
 		}
 		// 复刻"start 直接返回终态"（短回答或命中缓存）。

@@ -162,7 +162,24 @@ func isStaticInstruction(text string) bool {
 		isEnvironmentContext(trimmed)
 }
 
-// foldInputHistory 把 input 的中间历史折叠进首条 system，并实施上下文窗口管理。
+// isUnforwardedDeveloper 判断本地 Codex 的 developer 消息是否不转发给上游。
+//
+//   - 基础提示词（"You are Codex, …"）：Codex 0.160 起不再放顶层 instructions，
+//     而是作为首条 developer 消息发来，约 21.7 KB / 4.2k tokens。沙箱里的 Codex
+//     自带同类基础指令，再带一份只会挤占上游约 100 KiB 的单条上限 ——
+//     2026-10-04 实测桥 system 光固定部分就 37.5 KB，6 轮短对话就触发了压缩；
+//   - <multi_agent_role> / <multi_agent_mode>：教模型派生子代理，
+//     桥只提供 exec_command，用不上。
+//
+// 用户自定义的 developer_instructions、权限与 skills 说明照常转发。
+func isUnforwardedDeveloper(text string) bool {
+	t := strings.TrimSpace(text)
+	return strings.HasPrefix(t, "You are Codex") ||
+		strings.HasPrefix(t, "<multi_agent_role>") ||
+		strings.HasPrefix(t, "<multi_agent_mode>")
+}
+
+// foldInputHistory 把 input 的中间历史折叠进首条 system。
 //
 // 上游只读「最后一条 system + 最后一条 user」，中间的 input 条目
 // 全部丢弃（见 upstream_input.go）。Codex CLI 每轮
@@ -170,12 +187,13 @@ func isStaticInstruction(text string) bool {
 // 工具结果），这些条目排在中间 —— 跨轮时全部被上游丢弃，表现为
 // Codex 失忆："不记得我刚刚让你干什么"（2026-10-03 用户实测）。
 //
-// 上下文窗口与压缩（256K 窗口对齐）：
-// 单次请求输入（如单输入 16K）与连续多轮输入的上下文窗口（256K / 258,400 tokens）
-// 是两个不同维度的概念。Codex 具备 256K 级别上下文窗口，在日常对话中完整保留全部历史
-// 细节（包括写入命令、相对路径、执行结果等）。只有在连续多轮累积真正逼近/达到
-// 256K 窗口上限（由 DefaultContextWindowConfig 定义）时，才触发滑动窗口压缩。
-func foldInputHistory(items []prism.InputItem) []prism.InputItem {
+// Codex 压缩后的替换历史只有若干条 user 消息加一条摘要（没有 assistant），
+// 同样必须折叠，否则摘要被上游丢掉（2026-10-04 实测）—— 所以桥请求一律调用它。
+//
+// promptLimit > 0 时历史按单条上限裁剪最旧的部分（并注明省略）：Codex 收到
+// context_length_exceeded 并不会压缩（2026-10-04 实测），放不下只能由网关裁；
+// 压缩请求尤其如此 —— 那一轮必须成功，摘要才能接上。0 表示不裁。
+func foldInputHistory(items []prism.InputItem, promptLimit int) []prism.InputItem {
 	if len(items) <= 2 {
 		return items
 	}
@@ -188,24 +206,13 @@ func foldInputHistory(items []prism.InputItem) []prism.InputItem {
 		return items
 	}
 
-	type historyTurn struct {
-		speaker string
-		text    string
-	}
-	var turns []historyTurn
-
+	var turns []historyEntry
 	for i := 1; i < lastIdx; i++ {
 		it := items[i]
 		if strings.EqualFold(it.Role, "system") {
 			continue
 		}
-		speaker := "User"
-		switch strings.ToLower(it.Role) {
-		case "assistant":
-			speaker = "Assistant"
-		case "tool", "function":
-			speaker = "Tool"
-		}
+		speaker := speakerOf(it.Role)
 		var txt strings.Builder
 		for _, c := range it.Content {
 			txt.WriteString(c.Text)
@@ -220,26 +227,14 @@ func foldInputHistory(items []prism.InputItem) []prism.InputItem {
 			continue
 		}
 
-		turns = append(turns, historyTurn{speaker: speaker, text: contentStr})
+		turns = append(turns, historyEntry{speaker: speaker, text: contentStr})
 	}
 
-	if len(turns) == 0 {
+	// 规整前的 [system, 最后一条 user] 就是这条提示词里历史之外的部分。
+	history := renderHistory(turns, historyBudget(promptLimit, promptBytes(canonicalUpstreamInput(items))))
+	if history == "" {
 		return items
 	}
-
-	var sb strings.Builder
-	// 完整保留 Codex 传入的往轮历史，不擅自截断或伪压缩；
-	// 压缩操作完全由本地 Codex CLI 依据上下文窗口用量自行触发 compress。
-	for i, t := range turns {
-		if i > 0 {
-			sb.WriteString("\n")
-		}
-		sb.WriteString(t.speaker)
-		sb.WriteString(": ")
-		sb.WriteString(t.text)
-	}
-
-	history := "\n\n[Previous Conversation History]\n" + sb.String()
 
 	// 返回副本：InputItem.Content 是切片，原地拼接会改到调用方手里的 input ——
 	// 调用方同时用它构造增量输入时，增量的 system 会被悄悄塞进全量历史；
@@ -412,8 +407,8 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 	// 预先提取并合并所有来自客户端的 developer/system 消息指令，
 	// 以及客户端注入在 user 层的上下文（AGENTS.md、environment_context）。
 	//
-	// 客户端顶层 instructions（本地 Codex 的基础提示词）有意不带：沙箱 Codex
-	// 已有同类基础指令，再带一份会顶到上游单条消息上限。
+	// 本地 Codex 的基础提示词有意不带（顶层 instructions 与 developer 消息两种
+	// 形态都不带，见 isUnforwardedDeveloper）：沙箱 Codex 已有同类基础指令。
 	var devSystem strings.Builder
 	var clientDocs []string
 	clientEnv := ""
@@ -425,6 +420,8 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 				continue
 			}
 			switch {
+			case (role == "developer" || role == "system") && isUnforwardedDeveloper(txt):
+				// 不转发（见 isUnforwardedDeveloper）
 			case role == "developer" || role == "system":
 				if devSystem.Len() > 0 {
 					devSystem.WriteString("\n\n")

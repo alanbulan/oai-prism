@@ -40,8 +40,11 @@ func doLocal(t *testing.T, method, url, body string, hdr map[string]string) (int
 }
 
 // 审计中间件曾只把前 1MB 交给 handler：大请求一律"不是合法 JSON"。
+// 这里测的是请求体读取，关掉上游单条上限预检（它另有 context_length_exceeded 用例）。
 func TestSecurity_LargeBodyNotTruncated(t *testing.T) {
-	ts, _ := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), nil)
+	ts, _ := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), func(c *config.Config) {
+		c.Facade.MaxPromptBytes = -1
+	})
 	big := strings.Repeat("a", 2<<20)
 	body := `{"model":"gpt-5","messages":[{"role":"user","content":"` + big + `"}]}`
 	code, out := doLocal(t, http.MethodPost, ts.URL+"/v1/chat/completions", body, map[string]string{"Content-Type": "application/json"})

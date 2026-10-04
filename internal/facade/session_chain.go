@@ -251,34 +251,24 @@ func historyCarriesContextA(msgs []AnthropicMessage) bool {
 // 全部丢弃 —— translate.go 头注释早就写了这个缺陷。往轮把历史插成
 // 独立条目（V/W/Y/N 系列实验）全部失忆；折叠进 system（B/B2/K
 // 系列实验，同款 [Previous Conversation History] 格式）全部成功。
-func injectChainHistory(input []prism.InputItem, hist []ChatMessage) []prism.InputItem {
+//
+// promptLimit 是上游单条提示词的字节上限（0 不限）：历史只用本轮内容之外剩下的预算。
+func injectChainHistory(input []prism.InputItem, hist []ChatMessage, promptLimit int) []prism.InputItem {
 	if len(hist) == 0 {
 		return input
 	}
-	var sb strings.Builder
+	entries := make([]historyEntry, 0, len(hist))
 	for _, m := range hist {
-		txt := strings.TrimSpace(m.Content.Text())
-		if txt == "" {
-			continue
-		}
-		var speaker string
 		switch {
-		case strings.EqualFold(m.Role, "user"):
-			speaker = "User"
-		case strings.EqualFold(m.Role, "assistant"):
-			speaker = "Assistant"
-		default:
-			continue // tool/function 等对上游无意义
+		case strings.EqualFold(m.Role, "user"), strings.EqualFold(m.Role, "assistant"):
+			entries = append(entries, historyEntry{speaker: speakerOf(m.Role), text: m.Content.Text()})
 		}
-		sb.WriteString(speaker)
-		sb.WriteString(": ")
-		sb.WriteString(txt)
-		sb.WriteString("\n")
+		// tool/function 等对上游无意义
 	}
-	if sb.Len() == 0 {
+	historyText := renderHistory(entries, historyBudget(promptLimit, promptBytes(canonicalUpstreamInput(input))))
+	if historyText == "" {
 		return input
 	}
-	historyText := "\n\n[Previous Conversation History]\n" + sb.String()
 
 	out := make([]prism.InputItem, 0, len(input)+1)
 	if len(input) > 0 && input[0].Role == "system" {

@@ -99,7 +99,7 @@ func TestTranslateChatMessages_HistoryWithoutSystem(t *testing.T) {
 		{Role: "assistant", Content: mustSA(t, `"已记住"`)},
 		{Role: "user", Content: mustSA(t, `"暗号是什么"`)},
 	}
-	out := canonicalUpstreamInput(translateChatMessages(msgs, ""))
+	out := canonicalUpstreamInput(translateChatMessages(msgs, "", 0))
 	if got := roles(out); len(got) != 2 || got[0] != "system" {
 		t.Fatalf("历史应进唯一一条 system，得到 %v", got)
 	}
@@ -116,7 +116,7 @@ func TestTranslateChatMessages_MultiSystemHistoryOnce(t *testing.T) {
 		{Role: "system", Content: mustSA(t, `"规则 B"`)},
 		{Role: "user", Content: mustSA(t, `"第二问"`)},
 	}
-	out := canonicalUpstreamInput(translateChatMessages(msgs, "兜底"))
+	out := canonicalUpstreamInput(translateChatMessages(msgs, "兜底", 0))
 	sys := textOfItem(out[0])
 	for _, want := range []string{"规则 A", "规则 B", "第一问", "第一答"} {
 		if !strings.Contains(sys, want) {

@@ -47,7 +47,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	if sys == "" {
 		sys = h.cfg.Facade.DefaultSystemPrompt
 	}
-	input := translateAnthropicMessages(req.Messages, sys)
+	input := translateAnthropicMessages(req.Messages, sys, h.cfg.Facade.PromptByteLimit())
 
 	runReq := &RunRequest{
 		Model:     model,
@@ -69,11 +69,18 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	// 把链缓存的历史拼进 input（对齐真实前端"全量回传"行为）。
 	if !historyCarriesContextA(req.Messages) {
 		if hist := sessionChainHistory(runReq.StickyKey); len(hist) > 0 {
-			runReq.Input = injectChainHistory(runReq.Input, hist)
+			runReq.Input = injectChainHistory(runReq.Input, hist, h.cfg.Facade.PromptByteLimit())
 			runReq.PreviousResponseID = ""
 		}
 	}
 	runReq.Extra = passthroughFields(rawFields, anthropicKnownFields)
+
+	// 超过上游单条上限：在 message_start 之前以 400 "prompt is too long" 回绝 ——
+	// Claude Code 等客户端认这句文案，据此压缩上下文（见 context_limit.go）。
+	if err := h.runner.checkPromptSize(runReq); writeAnthropicTooLarge(w, err) {
+		middleware.RecordLogError(r, "anthropic 提示词超限: %v", err)
+		return
+	}
 
 	id := newID("msg_")
 
@@ -176,7 +183,11 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {
 		middleware.RecordLogError(r, "anthropic 流式失败: %v", runErr)
-		buf = AppendAnthropicEvent(buf[:0], AnthropicEvent{Type: "error", Text: runErr.Error()})
+		ev := AnthropicEvent{Type: "error", Text: runErr.Error()}
+		if errors.Is(runErr, ErrContextTooLarge) {
+			ev.ErrorType, ev.Text = "invalid_request_error", anthropicTooLongMessage(runErr)
+		}
+		buf = AppendAnthropicEvent(buf[:0], ev)
 		_ = sw.WriteRaw(buf)
 		return
 	}
@@ -208,6 +219,10 @@ func (h *Handler) syncAnthropic(w http.ResponseWriter, r *http.Request, runReq *
 		}
 	}
 	if err != nil {
+		if writeAnthropicTooLarge(w, err) {
+			middleware.RecordLogError(r, "anthropic 同步失败: %v", err)
+			return
+		}
 		status, typ, msg := mapError(err)
 		middleware.RecordLogError(r, "anthropic 同步失败: %s", msg)
 		writeError(w, status, typ, msg)

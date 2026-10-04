@@ -255,6 +255,14 @@ type FacadeConfig struct {
 	// 条款，不受此开关影响。默认开启。
 	PlatformNotice bool `yaml:"platform_notice"`
 
+	// MaxPromptBytes 是发往上游的单条提示词（合并后的 system + 最后一条 user）的
+	// UTF-8 字节上限。上游按字节而不是 token 限长：2026-10-04 实测合计 102,299 字节
+	// 可过、104,560 字节报 "This request is too large to send"（约 100 KiB），与内容
+	// 是中文还是英文无关。折叠历史（含 Codex 的）时按它裁掉最旧的部分；本轮内容本身
+	// 就超限的请求不再发出，直接以 context_length_exceeded 失败。
+	// 默认 96 KiB，给上游自己的包装文本留余量；设为 -1 关闭检查。
+	MaxPromptBytes int `yaml:"max_prompt_bytes"`
+
 	// Models 把对外模型名映射到 Prism 内部的 model / reasoning effort。
 	// 例：gpt-5-codex-fast -> {model: gpt-5, effort: high}
 	Models map[string]ModelMapping `yaml:"models"`
@@ -307,6 +315,14 @@ type FacadeConfig struct {
 	// 0 表示不限流。这是保护上游账号不被自己的重试打爆的最后一道闸。
 	RatePerSecond float64 `yaml:"rate_per_second"`
 	RateBurst     int     `yaml:"rate_burst"`
+}
+
+// PromptByteLimit 返回生效的单条提示词字节上限；0 表示不限（max_prompt_bytes 设为负数）。
+func (f FacadeConfig) PromptByteLimit() int {
+	if f.MaxPromptBytes < 0 {
+		return 0
+	}
+	return f.MaxPromptBytes
 }
 
 // RateLimitPerSecond 返回全局限流速率。
@@ -539,6 +555,7 @@ func Default() *Config {
 			SandboxReadyWait:    60 * time.Second,
 			DefaultSystemPrompt: DefaultFacadeSystemPrompt,
 			PlatformNotice:      true,
+			MaxPromptBytes:      DefaultFacadeMaxPromptBytes,
 		},
 		RawProxy: RawProxyConfig{
 			Enabled:         true,
@@ -666,6 +683,9 @@ const (
 // 前端的 makeSystemPrompt —— 实测（2026-10-04）上游只读最后一条 system，前端那条
 // 人设根本到不了模型；我们自己反倒给每个请求加上了 LaTeX 编辑器人设。
 const DefaultFacadeSystemPrompt = "You are a helpful assistant. Answer the user's request directly."
+
+// DefaultFacadeMaxPromptBytes 是 facade.max_prompt_bytes 的默认值（见 FacadeConfig.MaxPromptBytes）。
+const DefaultFacadeMaxPromptBytes = 96 << 10
 
 // DefaultPrismModel 是上游对话模型的默认值。
 //
@@ -839,6 +859,9 @@ func (c *Config) normalize() error {
 	}
 	if f.ProjectPoolSize <= 0 {
 		f.ProjectPoolSize = 4
+	}
+	if f.MaxPromptBytes == 0 {
+		f.MaxPromptBytes = DefaultFacadeMaxPromptBytes
 	}
 
 	if c.RawProxy.Prefix == "" {

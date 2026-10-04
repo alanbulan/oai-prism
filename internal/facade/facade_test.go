@@ -69,7 +69,7 @@ func TestTranslateChatMessages(t *testing.T) {
 		{Role: "tool", Content: mustSA(t, `"工具结果"`), ToolCallID: "call_1"},
 	}
 
-	out := translateChatMessages(msgs, "")
+	out := translateChatMessages(msgs, "", 0)
 
 	// system 与 developer 合并成最前面的唯一一条 system：上游只读最后一条
 	// system 当 Context（2026-10-04 双 system 暗号实测），分开发前一条会被丢掉。
@@ -100,7 +100,7 @@ func TestTranslateChatMessages(t *testing.T) {
 func TestTranslateChatMessages_InjectsDefaultSystem(t *testing.T) {
 	msgs := []ChatMessage{{Role: "user", Content: mustSA(t, `"问题"`)}}
 
-	out := translateChatMessages(msgs, "你是 Prism 的助手")
+	out := translateChatMessages(msgs, "你是 Prism 的助手", 0)
 	if len(out) != 2 {
 		t.Fatalf("条目数 = %d, want 2（兜底 system + user）", len(out))
 	}
@@ -113,13 +113,13 @@ func TestTranslateChatMessages_InjectsDefaultSystem(t *testing.T) {
 		{Role: "system", Content: mustSA(t, `"自带"`)},
 		{Role: "user", Content: mustSA(t, `"问题"`)},
 	}
-	out2 := translateChatMessages(withSys, "兜底")
+	out2 := translateChatMessages(withSys, "兜底", 0)
 	if len(out2) != 2 || out2[0].Content[0].Text != "自带" {
 		t.Fatalf("自带 system 时不应再注入兜底: %+v", out2)
 	}
 
 	// 兜底为空则不注入。
-	out3 := translateChatMessages(msgs, "")
+	out3 := translateChatMessages(msgs, "", 0)
 	if len(out3) != 1 {
 		t.Fatalf("兜底为空时不应注入: %+v", out3)
 	}
@@ -130,7 +130,7 @@ func TestTranslateChatMessages_SystemAlwaysPreserved(t *testing.T) {
 		{Role: "system", Content: mustSA(t, `"规则"`)},
 		{Role: "user", Content: mustSA(t, `"问题"`)},
 	}
-	out := translateChatMessages(msgs, "")
+	out := translateChatMessages(msgs, "", 0)
 	if len(out) != 2 {
 		t.Fatalf("条目数 = %d, want 2", len(out))
 	}
@@ -236,7 +236,7 @@ func TestToolMessageAnnotation(t *testing.T) {
 	msgs := []ChatMessage{
 		{Role: "tool", Name: "get_weather", Content: mustSA(t, `"晴, 25度"`)},
 	}
-	out := translateChatMessages(msgs, "")
+	out := translateChatMessages(msgs, "", 0)
 	if len(out) != 1 || out[0].Role != "user" {
 		t.Fatalf("工具结果应作为 user 上下文: %+v", out)
 	}
@@ -331,7 +331,7 @@ func TestMessagesFromResponsesInput(t *testing.T) {
 	}
 
 	t.Run("纯字符串", func(t *testing.T) {
-		items := messagesFromResponsesInput(json.RawMessage(`"你好"`), "")
+		items := messagesFromResponsesInput(json.RawMessage(`"你好"`), "", 0)
 		if len(items) != 1 || textOf(items) != "你好" {
 			t.Fatalf("解析错误: %+v", items)
 		}
@@ -339,7 +339,7 @@ func TestMessagesFromResponsesInput(t *testing.T) {
 
 	t.Run("消息数组", func(t *testing.T) {
 		items := messagesFromResponsesInput(json.RawMessage(
-			`[{"role":"user","content":"a"},{"role":"assistant","content":"b"}]`), "")
+			`[{"role":"user","content":"a"},{"role":"assistant","content":"b"}]`), "", 0)
 		if len(items) != 2 {
 			t.Fatalf("条目数 = %d", len(items))
 		}
@@ -347,14 +347,14 @@ func TestMessagesFromResponsesInput(t *testing.T) {
 
 	t.Run("内容块数组", func(t *testing.T) {
 		items := messagesFromResponsesInput(json.RawMessage(
-			`[{"type":"message","role":"user","content":[{"type":"input_text","text":"块内容"}]}]`), "")
+			`[{"type":"message","role":"user","content":[{"type":"input_text","text":"块内容"}]}]`), "", 0)
 		if len(items) != 1 || textOf(items) != "块内容" {
 			t.Fatalf("解析错误: %+v", items)
 		}
 	})
 
 	t.Run("空输入", func(t *testing.T) {
-		if items := messagesFromResponsesInput(nil, ""); len(items) != 0 {
+		if items := messagesFromResponsesInput(nil, "", 0); len(items) != 0 {
 			t.Fatalf("应为空: %+v", items)
 		}
 	})

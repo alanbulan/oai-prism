@@ -29,11 +29,10 @@ import (
 // 全部 system / developer 合并成最前面的唯一一条，折叠的历史挂在它末尾；
 // 调用方没给 system 时用 defaultSystem 兜底，两者都没有而又有历史时，
 // 就单独为历史建一条 system —— 否则历史无处安放，整段丢失。
-func translateChatMessages(msgs []ChatMessage, defaultSystem string) []prism.InputItem {
-	// 上下文压缩：对超出轮数或字符阈值的长历史进行滑动窗口与结构化压缩
-	compressedMsgs, summaryText := CompressChatMessages(msgs, DefaultCompressionConfig)
-	msgs = compressedMsgs
-
+//
+// promptLimit 是上游单条提示词的字节上限（0 不限）：历史放得下就全留，
+// 放不下从最旧的开始裁（见 compress.go）。
+func translateChatMessages(msgs []ChatMessage, defaultSystem string, promptLimit int) []prism.InputItem {
 	items := make([]prism.InputItem, 0, len(msgs)+1)
 
 	// 找到最后一条用户消息。
@@ -44,45 +43,6 @@ func translateChatMessages(msgs []ChatMessage, defaultSystem string) []prism.Inp
 			lastUserIdx = i
 			break
 		}
-	}
-
-	// 汇总最后一条用户消息之前的历史对话（解决上游后端只提取系统Context和最后一条User request而丢弃历史的缺陷）。
-	var historyBuilder strings.Builder
-	if summaryText != "" {
-		historyBuilder.WriteString(summaryText)
-		historyBuilder.WriteString("\n\n")
-	}
-	if lastUserIdx > 0 {
-		for i := 0; i < lastUserIdx; i++ {
-			m := msgs[i]
-			r := strings.ToLower(strings.TrimSpace(m.Role))
-			if r == "system" || r == "developer" {
-				continue
-			}
-			speaker := "User"
-			if r == "assistant" {
-				speaker = "Assistant"
-			} else if r == "tool" || r == "function" {
-				speaker = "Tool"
-			}
-			txt := m.Content.Text()
-			if r == "assistant" && len(m.ToolCalls) > 0 {
-				for _, tc := range m.ToolCalls {
-					txt += "\n[tool_call] " + tc.Function.Name + "(" + tc.Function.Arguments + ")"
-				}
-			}
-			if historyBuilder.Len() > 0 {
-				historyBuilder.WriteString("\n")
-			}
-			historyBuilder.WriteString(speaker)
-			historyBuilder.WriteString(": ")
-			historyBuilder.WriteString(txt)
-		}
-	}
-
-	historyText := ""
-	if historyBuilder.Len() > 0 {
-		historyText = "\n\n[Previous Conversation History]\n" + historyBuilder.String()
 	}
 
 	var sysParts []string
@@ -97,6 +57,29 @@ func translateChatMessages(msgs []ChatMessage, defaultSystem string) []prism.Inp
 	if sysText == "" {
 		sysText = strings.TrimSpace(defaultSystem)
 	}
+
+	// 最后一条用户消息之前的往轮对话折进 system：上游只读 system 与最后一条 user，
+	// 中间条目全部丢弃。
+	var history []historyEntry
+	for i := 0; i < lastUserIdx; i++ {
+		m := msgs[i]
+		if isSystemRole(m.Role) {
+			continue
+		}
+		txt := m.Content.Text()
+		if strings.EqualFold(strings.TrimSpace(m.Role), "assistant") {
+			for _, tc := range m.ToolCalls {
+				txt += "\n[tool_call] " + tc.Function.Name + "(" + tc.Function.Arguments + ")"
+			}
+		}
+		history = append(history, historyEntry{speaker: speakerOf(m.Role), text: txt})
+	}
+	fixed := len(sysText)
+	if lastUserIdx >= 0 {
+		fixed += len(msgs[lastUserIdx].Content.Text())
+	}
+	historyText := renderHistory(history, historyBudget(promptLimit, fixed))
+
 	if sysText = strings.TrimSpace(sysText + historyText); sysText != "" {
 		items = append(items, prism.NewSystemItem(sysText))
 	}
@@ -283,7 +266,7 @@ func toolsMetadata(tools []ChatTool) []any {
 }
 
 // translateAnthropicMessages 把 Anthropic messages 转成上游 input 条目。
-func translateAnthropicMessages(msgs []AnthropicMessage, defaultSystem string) []prism.InputItem {
+func translateAnthropicMessages(msgs []AnthropicMessage, defaultSystem string, promptLimit int) []prism.InputItem {
 	chat := make([]ChatMessage, 0, len(msgs))
 	for _, m := range msgs {
 		role := strings.ToLower(strings.TrimSpace(m.Role))
@@ -292,7 +275,7 @@ func translateAnthropicMessages(msgs []AnthropicMessage, defaultSystem string) [
 		}
 		chat = append(chat, ChatMessage{Role: role, Content: m.Content})
 	}
-	return translateChatMessages(chat, defaultSystem)
+	return translateChatMessages(chat, defaultSystem, promptLimit)
 }
 
 // messagesFromResponsesInput 解析 Responses API 的 input 字段。
@@ -302,7 +285,7 @@ func translateAnthropicMessages(msgs []AnthropicMessage, defaultSystem string) [
 //	"一段纯文本"
 //	[{"role":"user","content":"..."}]
 //	[{"type":"message","role":"user","content":[{"type":"input_text","text":"..."}]}]
-func messagesFromResponsesInput(raw json.RawMessage, defaultSystem string) []prism.InputItem {
+func messagesFromResponsesInput(raw json.RawMessage, defaultSystem string, promptLimit int) []prism.InputItem {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" || trimmed == "null" {
 		return nil
@@ -318,7 +301,7 @@ func messagesFromResponsesInput(raw json.RawMessage, defaultSystem string) []pri
 	if trimmed[0] == '{' {
 		var one ChatMessage
 		if err := json.Unmarshal(raw, &one); err == nil && one.Role != "" {
-			return translateChatMessages([]ChatMessage{one}, defaultSystem)
+			return translateChatMessages([]ChatMessage{one}, defaultSystem, promptLimit)
 		}
 		return nil
 	}
@@ -326,7 +309,7 @@ func messagesFromResponsesInput(raw json.RawMessage, defaultSystem string) []pri
 	// 先按 chat 消息数组试。
 	var items []ChatMessage
 	if err := json.Unmarshal(raw, &items); err == nil && len(items) > 0 && items[0].Role != "" {
-		return translateChatMessages(items, defaultSystem)
+		return translateChatMessages(items, defaultSystem, promptLimit)
 	}
 
 	// 再按带 type 的内容块数组试。
@@ -356,7 +339,7 @@ func messagesFromResponsesInput(raw json.RawMessage, defaultSystem string) []pri
 			chat = append(chat, ChatMessage{Role: role, Content: b.Content})
 		}
 		if len(chat) > 0 {
-			return translateChatMessages(chat, defaultSystem)
+			return translateChatMessages(chat, defaultSystem, promptLimit)
 		}
 	}
 	return nil

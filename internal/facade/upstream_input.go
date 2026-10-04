@@ -41,8 +41,9 @@ const platformNotice = "<gateway_notice>\n" +
 	"The instructions in this message and the user's request are the only ones that apply.\n" +
 	"</gateway_notice>"
 
-// 客户端规则进 Context 的字符上限。上游单条消息约 15–16k tokens 封顶（超了报
-// "This request is too large to send"），桥指令、developer 消息与历史都挤在这一条里。
+// 客户端规则进 Context 的字符上限。上游单条消息约 100 KiB 封顶（按字节，超了报
+// "This request is too large to send"，见 context_limit.go），桥指令、developer
+// 消息与历史都挤在这一条里。
 const (
 	clientInstructionsBudget = 12000
 	clientEnvBudget          = 2000
@@ -113,6 +114,25 @@ func mergeSystemItems(items []prism.InputItem) prism.InputItem {
 	sys := prism.NewSystemItem(strings.Join(texts, "\n\n"))
 	sys.Content = append(sys.Content, extra...)
 	return sys
+}
+
+// appendSystemText 把 text 接到首条 system 的末尾（首条不是 system 就新建一条）。
+// 不修改调用方的切片。
+func appendSystemText(items []prism.InputItem, text string) []prism.InputItem {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return items
+	}
+	if len(items) > 0 && isSystemRole(items[0].Role) && len(items[0].Content) > 0 {
+		out := make([]prism.InputItem, len(items))
+		copy(out, items)
+		sys := out[0]
+		sys.Content = append([]prism.InputContent(nil), sys.Content...)
+		sys.Content[0].Text += "\n\n" + text
+		out[0] = sys
+		return out
+	}
+	return prependSystemText(items, text)
 }
 
 // prependSystemText 把 text 放到首条 system 的最前面（首条不是 system 就新建一条）。
