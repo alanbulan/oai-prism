@@ -884,8 +884,15 @@ func splitHereStringChunks(content string, size int) []string {
 	return chunks
 }
 
-// singleExecCmd 在"块里只有一次 exec_command 调用"时取出它的 cmd 字面量（已反转义）。
+// singleExecCmd 在"块里只有一次 exec_command 调用"时取出它的 cmd（按 JS 语义求值，见 evalExecJS；
+// 求值不了时退回只认字面量的文本提取）。
 func singleExecCmd(js string) (string, bool) {
+	if calls, err := evalExecJS(js); err == nil {
+		if len(calls) == 1 && calls[0].Tool == "exec_command" {
+			return calls[0].Cmd, true
+		}
+		return "", false
+	}
 	if strings.Count(js, "exec_command(") != 1 {
 		return "", false
 	}

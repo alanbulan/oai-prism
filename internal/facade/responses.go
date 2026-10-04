@@ -504,38 +504,25 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 			finalRespID = res.ResponseID
 		}
 		if js != "" {
-			callID := newID("ctc_")
-			var item string
-			if turn.execKind == "function" {
-				item = functionCallItemJSON(callID, turn.execToolName, toFunctionArguments(js))
-			} else {
-				item = customToolCallItemJSON(callID, js, turn.execToolName)
+			var items []string
+			for _, call := range bridgeToolCalls(turn, js, isWindowsClient(r)) {
+				ev := []ResponsesEvent{{Type: "response.output_item.added", ItemJSON: call.item}}
+				if call.input != "" {
+					// custom_tool_call 专用事件；function_call 没有这一段。
+					ev = append(ev, ResponsesEvent{Type: "response.custom_tool_call_input.done", ItemID: call.id, Text: call.input})
+				}
+				ev = append(ev, ResponsesEvent{Type: "response.output_item.done", ItemJSON: call.item})
+				for _, e := range ev {
+					if err := sw.WriteRaw(AppendResponsesEvent(buf[:0], e)); err != nil {
+						return
+					}
+				}
+				items = append(items, call.item)
 			}
 			done := AppendResponsesEvent(buf[:0], ResponsesEvent{
-				Type: "response.output_item.added", ItemJSON: item,
-			})
-			if err := sw.WriteRaw(done); err != nil {
-				return
-			}
-			if turn.execKind != "function" {
-				// custom_tool_call 专用事件；function_call 没有这一段。
-				done = AppendResponsesEvent(buf[:0], ResponsesEvent{
-					Type: "response.custom_tool_call_input.done", ItemID: callID, Text: js,
-				})
-				if err := sw.WriteRaw(done); err != nil {
-					return
-				}
-			}
-			done = AppendResponsesEvent(buf[:0], ResponsesEvent{
-				Type: "response.output_item.done", ItemJSON: item,
-			})
-			if err := sw.WriteRaw(done); err != nil {
-				return
-			}
-			done = AppendResponsesEvent(buf[:0], ResponsesEvent{
 				Type:       "response.completed",
 				ResponseID: finalRespID, Model: publicModel, CreatedAt: created,
-				OutputJSON: "[" + item + "]",
+				OutputJSON: "[" + strings.Join(items, ",") + "]",
 				Usage:      usage,
 			})
 			_ = sw.WriteRaw(done)
@@ -598,8 +585,11 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 // 把变更合成为本地落盘命令（经 sessionChainFilterNewDeltaFiles 去重，防止跨轮重复合成死循环）。
 func (h *Handler) bridgeExecJS(r *http.Request, turn *responsesTurn, text string, res *RunResult) string {
 	if js0, ok := extractExecBlock(text); ok {
-		isWin := strings.Contains(strings.ToLower(r.UserAgent()), "windows")
-		return ensureExecJS(rewriteApplyPatch(js0, turn.nativePatch, isWin, turn.execKind == "function"))
+		if turn.execKind == "function" {
+			return js0 // 取命令、翻译补丁、超长处理都在 functionCallArgs 里按 JS 语义做
+		}
+		isWin := isWindowsClient(r)
+		return fitExecJS(ensureExecJS(rewriteApplyPatch(js0, turn.nativePatch, isWin, false)), isWin)
 	}
 	if res == nil || len(res.DeltaFiles) == 0 {
 		return ""
@@ -612,12 +602,39 @@ func (h *Handler) bridgeExecJS(r *http.Request, turn *responsesTurn, text string
 	if len(newDeltaFiles) == 0 {
 		return ""
 	}
-	isWin := strings.Contains(strings.ToLower(r.UserAgent()), "windows")
+	isWin := isWindowsClient(r)
 	js := SynthesizeDeltaFilesExecJS(newDeltaFiles, isWin)
 	if js != "" {
 		h.log.Info("已将上游沙箱内的文件变更合成为本地执行命令", "files", len(newDeltaFiles), "isWin", isWin)
 	}
 	return js
+}
+
+// isWindowsClient 按 User-Agent 判断客户端是不是 Windows（Codex 的 UA 带系统名）。
+func isWindowsClient(r *http.Request) bool {
+	return strings.Contains(strings.ToLower(r.UserAgent()), "windows")
+}
+
+// bridgeToolCall 是一条交给客户端的工具调用条目。
+type bridgeToolCall struct {
+	id    string
+	item  string // Responses 协议的 output 条目 JSON
+	input string // custom_tool_call 的源码（function_call 为空）
+}
+
+// bridgeToolCalls 把桥要执行的内容包成客户端工具调用：custom 工具一条（JS 源码原样），
+// function 工具按 functionCallArgs 的结果（一般一条，超长分段时多条）。
+func bridgeToolCalls(turn *responsesTurn, js string, isWindows bool) []bridgeToolCall {
+	if turn.execKind != "function" {
+		id := newID("ctc_")
+		return []bridgeToolCall{{id: id, item: customToolCallItemJSON(id, js, turn.execToolName), input: js}}
+	}
+	var out []bridgeToolCall
+	for _, args := range functionCallArgs(js, isWindows) {
+		id := newID("ctc_")
+		out = append(out, bridgeToolCall{id: id, item: functionCallItemJSON(id, turn.execToolName, args)})
+	}
+	return out
 }
 
 // emitTextResponseEvents 发文本型回复的收尾事件序列：
@@ -677,26 +694,15 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 			js = h.bridgeExecJS(r, turn, text, res)
 		}
 		if js != "" {
-			callID := newID("ctc_")
 			setConversationHeader(w, conversationID)
-			var out any
-			if turn.execKind == "function" {
-				out = map[string]any{
-					"id": callID, "type": "function_call",
-					"status": "completed", "call_id": callID,
-					"name": turn.execToolName, "arguments": toFunctionArguments(js),
-				}
-			} else {
-				out = map[string]any{
-					"id": callID, "type": "custom_tool_call",
-					"status": "completed", "call_id": callID,
-					"name": turn.execToolName, "input": js,
-				}
+			var out []any
+			for _, call := range bridgeToolCalls(turn, js, isWindowsClient(r)) {
+				out = append(out, json.RawMessage(call.item))
 			}
 			respMap := map[string]any{
 				"id": finalRespID, "object": "response", "created_at": turn.created,
 				"status": "completed", "model": turn.publicModel,
-				"output": []any{out},
+				"output": out,
 			}
 			if usage != nil {
 				respMap["usage"] = usage
