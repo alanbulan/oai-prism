@@ -150,6 +150,44 @@ func TestSQLiteStore_HourlySeriesAndStatusClass(t *testing.T) {
 	}
 }
 
+// 流式请求的响应头（200）一旦发出，状态码就改不了；中途失败只能记在 error_message。
+// 这类请求必须算失败 —— 否则统计里成功率虚高，筛"失败"也找不到它们。
+func TestSQLiteStore_StreamFailureCountsAsFailure(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "outcome.db"), slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	now := time.Now().UTC()
+	for _, l := range []RequestLogItem{
+		{ID: "ok", Timestamp: now, StatusCode: 200},
+		{ID: "midstream", Timestamp: now, StatusCode: 200, ErrorMessage: "chat 流式失败: 沙箱工作区同步未就绪"},
+		{ID: "bad", Timestamp: now, StatusCode: 502, ErrorMessage: "上游 502"},
+	} {
+		if err := store.RecordRequestLog(l); err != nil {
+			t.Fatalf("RecordRequestLog: %v", err)
+		}
+	}
+
+	agg, err := store.GetAggregatedStats()
+	if err != nil {
+		t.Fatalf("GetAggregatedStats: %v", err)
+	}
+	if agg.TotalRequests != 3 || agg.Failures != 2 {
+		t.Fatalf("流式中途失败应计入失败: total=%d failures=%d", agg.TotalRequests, agg.Failures)
+	}
+	if ts := hourlySeries(store.db, now); ts[23].Failures != 2 {
+		t.Fatalf("走势图当前小时失败数 = %d，期望 2", ts[23].Failures)
+	}
+	for outcome, want := range map[string]int{"ok": 1, "failed": 2} {
+		_, n, err := store.QueryRequestLogs(RequestLogFilter{Outcome: outcome})
+		if err != nil || n != want {
+			t.Fatalf("%s 过滤: n=%d err=%v，期望 %d", outcome, n, err, want)
+		}
+	}
+}
+
 // 并发回归（2026-10-03 CI 实证）：Close() 与后台写入竞争时不能 panic。
 // 修复前 Close 在锁内把 s.db 置 nil，而写入方法的 ready() 检查在锁外 ——
 // ready() 过后 db 被清空，exec(nil) 直接 panic。

@@ -42,7 +42,7 @@ import {
   normalizeIp,
   parseClient,
 } from '../../utils/format';
-import { latencyTone, statusTagColor, statusText } from './logMeta';
+import { isFailed, isStreamBroken, latencyTone, statusTagColor, statusText } from './logMeta';
 import { RequestLogDrawer } from './RequestLogDrawer';
 
 const { Text } = Typography;
@@ -51,7 +51,8 @@ const POLL_MS = 8000;
 
 const STATUS_OPTIONS = [
   { label: '全部', value: '' },
-  { label: '成功', value: '2xx' },
+  { label: '成功', value: 'ok' },
+  { label: '失败', value: 'failed' },
   { label: '4xx', value: '4xx' },
   { label: '5xx', value: '5xx' },
 ];
@@ -222,13 +223,20 @@ export const StatisticsPage: React.FC = () => {
       dataIndex: 'statusCode',
       key: 'statusCode',
       width: 72,
-      render: (code: number) => (
-        <Tooltip title={statusText(code) || undefined}>
-          <Tag color={statusTagColor(code)} style={{ marginInlineEnd: 0, ...tabular }}>
-            {code}
-          </Tag>
-        </Tooltip>
-      ),
+      render: (code: number, r) =>
+        isStreamBroken(r) ? (
+          <Tooltip title={`生成中途失败（响应头已发出，HTTP ${code}）`}>
+            <Tag color="error" style={{ marginInlineEnd: 0 }}>
+              中断
+            </Tag>
+          </Tooltip>
+        ) : (
+          <Tooltip title={statusText(code) || undefined}>
+            <Tag color={statusTagColor(code)} style={{ marginInlineEnd: 0, ...tabular }}>
+              {code}
+            </Tag>
+          </Tooltip>
+        ),
     },
     {
       // 推理入口全是 POST，方法不单独占位（详情里有）
@@ -282,7 +290,7 @@ export const StatisticsPage: React.FC = () => {
         const total = r.promptTokens + r.completionTokens;
         if (total === 0) {
           return (
-            <Tooltip title={r.statusCode >= 400 ? '失败请求不计用量' : '未记录：用量统计上线前的请求'}>
+            <Tooltip title={isFailed(r) ? '失败请求不计用量' : '未记录：用量统计上线前的请求'}>
               <Text type="secondary">—</Text>
             </Tooltip>
           );
@@ -377,7 +385,16 @@ export const StatisticsPage: React.FC = () => {
                     </Text>{' '}
                     次 ·{' '}
                     <Tooltip
-                      title={`输入 ${(summary?.promptTokens || 0).toLocaleString()} · 输出 ${(summary?.completionTokens || 0).toLocaleString()}（o200k_base 精确计数）`}
+                      title={
+                        <>
+                          输入 {(summary?.promptTokens || 0).toLocaleString()} · 输出{' '}
+                          {(summary?.completionTokens || 0).toLocaleString()}
+                          <div style={{ marginTop: 4, opacity: 0.75 }}>
+                            o200k_base 精确计数网关实际收发的内容。上游不回报用量：其内置提示词与隐藏推理不在其中，
+                            用量统计上线前的请求也记为 0。
+                          </div>
+                        </>
+                      }
                     >
                       <span>Token {formatTokens((summary?.promptTokens || 0) + (summary?.completionTokens || 0))}</span>
                     </Tooltip>

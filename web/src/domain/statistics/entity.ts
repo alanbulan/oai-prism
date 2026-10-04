@@ -72,7 +72,7 @@ export interface RequestLogFilter {
   pageSize: number;
   model?: string;
   accountId?: string;
-  /** 精确状态码（"429"）或状态码段（"2xx" / "4xx" / "5xx"） */
+  /** 结果（"ok" / "failed"，失败含流式中途失败）、精确状态码（"429"）或状态码段（"4xx" / "5xx"） */
   status?: string;
 }
 

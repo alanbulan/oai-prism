@@ -376,7 +376,13 @@ type RequestLogFilter struct {
 	StatusCode int
 	// StatusClass 按状态码段过滤：2 → 2xx，4 → 4xx，5 → 5xx（与 StatusCode 二选一）。
 	StatusClass int
+	// Outcome 按结果过滤："ok" 成功 / "failed" 失败（含流式中途失败，见 failedExpr）。
+	Outcome string
 }
+
+// failedExpr 判定一条流水是否失败：4xx/5xx，或响应头（200）已发出后流式中途失败 ——
+// 后者状态码已改不了，失败原因记在 error_message（只有失败路径会写它）。
+const failedExpr = `(status_code >= 400 OR COALESCE(error_message, '') <> '')`
 
 // ModelUsageStat 真实模型使用占比
 type ModelUsageStat struct {
@@ -499,6 +505,12 @@ func (s *SQLiteStore) QueryRequestLogs(filter RequestLogFilter) ([]RequestLogIte
 		conditions = append(conditions, "status_code >= ? AND status_code < ?")
 		args = append(args, filter.StatusClass*100, filter.StatusClass*100+100)
 	}
+	switch filter.Outcome {
+	case "ok":
+		conditions = append(conditions, "NOT "+failedExpr)
+	case "failed":
+		conditions = append(conditions, failedExpr)
+	}
 
 	whereClause := ""
 	if len(conditions) > 0 {
@@ -589,7 +601,7 @@ func (s *SQLiteStore) GetAggregatedStats() (*AggregatedStats, error) {
 	var avgLatency sql.NullFloat64
 	err := s.db.QueryRow(`
 		SELECT COUNT(*),
-		       COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN `+failedExpr+` THEN 1 ELSE 0 END), 0),
 		       AVG(duration_ms),
 		       COALESCE(SUM(prompt_tokens), 0),
 		       COALESCE(SUM(completion_tokens), 0)
@@ -660,7 +672,7 @@ func hourlySeries(db *sql.DB, now time.Time) []TimeSeriesPoint {
 		SELECT strftime('%Y-%m-%d %H:00:00', timestamp) AS bucket,
 		       COUNT(*),
 		       COALESCE(AVG(duration_ms), 0),
-		       COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN `+failedExpr+` THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(prompt_tokens + completion_tokens), 0)
 		FROM request_logs
 		WHERE timestamp >= ?

@@ -313,8 +313,14 @@ pre.op-code code {
 .op-html-box {
   position: relative;
   max-width: 100%;
-  overflow: hidden;
   transition: opacity 0.2s ease-out;
+}
+
+/* 显示区域：圆角与内容一致（由探针上报），工具栏放在外面，不会被圆弧裁掉 */
+.op-html-clip {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
 }
 
 .op-html-tools {

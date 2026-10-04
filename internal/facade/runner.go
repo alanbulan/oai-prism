@@ -203,6 +203,7 @@ func (r *Runner) ProjectCacheSize() int { return r.projects.Size() }
 //
 // emit 为 nil 表示同步模式：不回调，只返回最终结果。
 // emit 返回 error 会立即中止流程（用于下游断连）。
+// 失败时结果也可能非 nil（带着实际使用的账号），调用方须先判 error。
 func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) error) (*RunResult, error) {
 	started := time.Now()
 	api := req.API
@@ -212,6 +213,9 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 
 	var (
 		lastErr error
+		// lastRes 是最后一次尝试的结果：失败时也要交还调用方，
+		// 请求流水才知道这次失败落在哪个账号上（否则只能显示"未分配"）。
+		lastRes *RunResult
 		emitted bool
 	)
 
@@ -241,6 +245,9 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 		}
 
 		lastErr = err
+		if res != nil {
+			lastRes = res
+		}
 
 		// 客户端主动断开：不重试，取消已经传给上游。
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -273,7 +280,7 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 	}
 	r.app.FacadeRuns.Inc(api, req.Model, status)
 	r.app.FacadeLatency.Observe(time.Since(started).Seconds(), api)
-	return nil, lastErr
+	return lastRes, lastErr
 }
 
 // acquire 选账号。
@@ -391,7 +398,9 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		r.sandboxes.InvalidateProject(acct.ID, projectID)
 	}
 	if sb.Usable() && projectID != "" {
-		if !r.syncSandboxWorkspace(ctx, acct, sb, projectID) {
+		var outcome syncOutcome
+		sb, outcome = r.syncOrRebuild(ctx, acct, sb, projectID)
+		if outcome != syncReady {
 			// 同步未就绪还硬上 start，上游**必然**回
 			// "Project file synchronization timed out"（122 秒后 504）——
 			// 用户白等两分钟，看到的还是一个伪装成流断的错误。
@@ -512,7 +521,11 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			}
 		}
 		if sb.Usable() && projectID != "" && !r.sandboxes.Synced(acct.ID, projectID) {
-			_ = r.syncSandboxWorkspace(ctx, acct, sb, projectID)
+			sb, _ = r.syncOrRebuild(ctx, acct, sb, projectID)
+			if sb.Usable() {
+				meta["sandbox_url"] = sb.URL
+				meta["sandbox_token"] = sb.Token
+			}
 		}
 	}
 	r.app.ConversationOps.Inc("start", "ok")
@@ -875,6 +888,57 @@ func isSentinelThrottle(err error) bool {
 	return apiErr.Status == 403 && strings.Contains(apiErr.Body, "verification")
 }
 
+// syncOutcome 是一次工作区同步的结果。
+type syncOutcome int
+
+const (
+	syncReady       syncOutcome = iota // 已同步（含缓存命中）
+	syncFailed                         // 未就绪：保留沙箱，下次只重做同步
+	syncSandboxGone                    // 沙箱容器已不可用：须丢弃、换新容器
+)
+
+// isSandboxGone 判断沙箱代理的报错是否意味着容器已不在。
+//
+// 实测（2026-10-04）：沙箱空闲约 20 分钟后被上游回收，代理对它的令牌一律回
+// 502（空响应体），而后端签发资源令牌照常 200 —— 缓存里的沙箱看起来完好，
+// 实际上再也连不上。404/410/503/504 同理：都不是"再等等就好"的状态。
+// 401/403 不算：那是 Cookie 或风控问题，换容器无济于事。
+func isSandboxGone(err error) bool {
+	var apiErr *creds.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.Status {
+	case 404, 410, 502, 503, 504:
+		return true
+	}
+	return false
+}
+
+// syncOrRebuild 做工作区同步；沙箱容器已被回收时丢弃它、换一个新容器再同步一次。
+//
+// 只重置项目同步不够：之后每个请求都会撞上同一个死容器，直到 sandbox_ttl 到期。
+// 返回最终使用的沙箱（换新失败时为 nil）。只换一次：新容器也不通，说明是上游
+// 沙箱服务整体故障，再换只会白白消耗容器额度。
+func (r *Runner) syncOrRebuild(ctx context.Context, acct *account.Account, sb *prism.Sandbox, projectID string) (*prism.Sandbox, syncOutcome) {
+	outcome := r.syncSandboxWorkspace(ctx, acct, sb, projectID)
+	if outcome != syncSandboxGone {
+		return sb, outcome
+	}
+	r.sandboxes.InvalidateIf(acct.ID, sb)
+	r.app.SandboxOps.Inc("sync", "sandbox_gone")
+	r.log.Warn("沙箱容器已失效（上游已回收），重新申请", "account", acct.ID, "project", projectID)
+	fresh, err := r.ensureSandbox(ctx, acct, projectID)
+	if err != nil || !fresh.Usable() {
+		r.log.Warn("重新申请沙箱失败", "account", acct.ID, "err", err)
+		return nil, outcome
+	}
+	if outcome = r.syncSandboxWorkspace(ctx, acct, fresh, projectID); outcome == syncSandboxGone {
+		r.sandboxes.InvalidateIf(acct.ID, fresh)
+	}
+	return fresh, outcome
+}
+
 // syncSandboxWorkspace 保证沙箱已为该项目完成工作区同步。
 //
 // 这是整条链路里最容易漏、也最难定位的一步。完整四步（都已实测）：
@@ -892,13 +956,13 @@ func isSentinelThrottle(err error) bool {
 //
 // 认证是双重的（Cookie + X-Crixet-Sandbox-Token），
 // 只带后者会 401 且响应体为空，非常难排查。
-func (r *Runner) syncSandboxWorkspace(ctx context.Context, acct *account.Account, sb *prism.Sandbox, projectID string) bool {
+func (r *Runner) syncSandboxWorkspace(ctx context.Context, acct *account.Account, sb *prism.Sandbox, projectID string) syncOutcome {
 	if !r.cfg.Facade.UseSandbox || !sb.Usable() || projectID == "" {
-		return false
+		return syncFailed
 	}
 	if r.sandboxes.Synced(acct.ID, projectID) {
 		r.app.SandboxOps.Inc("sync", "hit")
-		return true
+		return syncReady
 	}
 
 	// 同一项目只允许一个在飞的同步：并发的相同请求应该**等**前一个完成，
@@ -907,7 +971,7 @@ func (r *Runner) syncSandboxWorkspace(ctx context.Context, acct *account.Account
 	defer unlock()
 	if r.sandboxes.Synced(acct.ID, projectID) {
 		r.app.SandboxOps.Inc("sync", "hit")
-		return true
+		return syncReady
 	}
 
 	cred := acct.Credential()
@@ -931,7 +995,7 @@ func (r *Runner) syncSandboxWorkspace(ctx context.Context, acct *account.Account
 		if attempt > 1 {
 			select {
 			case <-ctx.Done():
-				return false
+				return syncFailed
 			case <-time.After(time.Duration(attempt-1) * 2000 * time.Millisecond):
 			}
 			r.log.Info("重试资源令牌签发/交付", "account", acct.ID, "project", projectID, "attempt", attempt)
@@ -961,11 +1025,14 @@ func (r *Runner) syncSandboxWorkspace(ctx context.Context, acct *account.Account
 		if tokenStage == "交付" {
 			r.log.Warn("交付资源令牌失败", "account", acct.ID, "err", tokenErr)
 			r.app.SandboxOps.Inc("sync", "deliver_error")
+			if isSandboxGone(tokenErr) {
+				return syncSandboxGone
+			}
 		} else {
 			r.log.Warn("签发沙箱资源令牌失败", "account", acct.ID, "project", projectID, "err", tokenErr)
 			r.app.SandboxOps.Inc("sync", "token_error")
 		}
-		return false
+		return syncFailed
 	}
 
 	// 3)+4) 取与交付 Y-Sweet 协作文档凭证（带风控 403 自动重试自愈）
@@ -976,7 +1043,7 @@ func (r *Runner) syncSandboxWorkspace(ctx context.Context, acct *account.Account
 		if attempt > 1 {
 			select {
 			case <-ctx.Done():
-				return false
+				return syncFailed
 			case <-time.After(time.Duration(attempt-1) * 2000 * time.Millisecond):
 			}
 			r.log.Info("重试 Y-Sweet 凭证签发/交付", "account", acct.ID, "project", projectID, "attempt", attempt)
@@ -1002,7 +1069,10 @@ func (r *Runner) syncSandboxWorkspace(ctx context.Context, acct *account.Account
 	if ysweetErr != nil {
 		r.log.Warn("交付 Y-Sweet 凭证失败", "account", acct.ID, "err", ysweetErr)
 		r.app.SandboxOps.Inc("sync", "ysweet_deliver_error")
-		return false
+		if isSandboxGone(ysweetErr) {
+			return syncSandboxGone
+		}
+		return syncFailed
 	}
 
 	// 5) 等同步完成（判定规则与真实前端一致）
@@ -1014,7 +1084,7 @@ func (r *Runner) syncSandboxWorkspace(ctx context.Context, acct *account.Account
 		r.app.SandboxOps.Inc("sync", "timeout")
 		// 只让这个项目失效，保留沙箱：重试时不必再花一次容器分配。
 		r.sandboxes.InvalidateProject(acct.ID, projectID)
-		return false
+		return syncFailed
 	}
 
 	// 用资源令牌的过期时间做缓存失效点：令牌一过期，沙箱就读不到
@@ -1023,7 +1093,7 @@ func (r *Runner) syncSandboxWorkspace(ctx context.Context, acct *account.Account
 	r.log.Info("沙箱工作区已就绪",
 		"account", acct.ID, "project", projectID, "耗时", time.Since(started).Round(time.Millisecond))
 	r.app.SandboxOps.Inc("sync", "ok")
-	return true
+	return syncReady
 }
 
 // describeSyncStatus 把同步状态压成一行，用于排查"卡在哪一项"。

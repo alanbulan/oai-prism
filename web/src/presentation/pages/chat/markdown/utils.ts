@@ -91,6 +91,9 @@ export function previewKind(lang: string, code: string): PreviewKind | null {
  *            更小的可见子元素，这层就是舞台，继续向内找，直到内容本体；
  *   transparent —— 内容自带底色（或本身就是 svg/canvas/img）时把舞台底色设为透明，
  *            圆角处不再露出舞台颜色。内容依赖舞台底色时（深色底上的白字）保留，避免看不清。
+ *            同时去掉内容的外阴影（内阴影保留）：外阴影画在内容盒外，裁切后只剩
+ *            四角弧线外的一块深色和左右边缘的一像素细线；
+ *   radius —— 内容四角的圆角半径，父页面按同样的弧度裁剪显示区域，与内容圆角严丝合缝。
  */
 const PROBE_SOURCE = `function(id,clearStage){
   var SKIP={SCRIPT:1,STYLE:1,LINK:1,META:1,TEMPLATE:1,NOSCRIPT:1,TITLE:1};
@@ -129,13 +132,33 @@ const PROBE_SOURCE = `function(id,clearStage){
     }
     return false;
   }
+  // 只保留内阴影：外阴影画在内容盒外，裁切后只剩四角弧线外的一块和边缘一像素
+  function innerShadows(v){
+    if(!v||v==="none")return "none";
+    var parts=[],depth=0,start=0;
+    for(var i=0;i<v.length;i++){var c=v.charAt(i);if(c==="(")depth++;else if(c===")")depth--;else if(c===","&&!depth){parts.push(v.slice(start,i));start=i+1}}
+    parts.push(v.slice(start));
+    var keep=[];
+    for(var j=0;j<parts.length;j++)if(parts[j].indexOf("inset")>=0)keep.push(parts[j].trim());
+    return keep.length?keep.join(","):"none";
+  }
+  function radii(el,w,h){
+    var cs=getComputedStyle(el),m=Math.min(w,h),out=[];
+    var ps=["borderTopLeftRadius","borderTopRightRadius","borderBottomRightRadius","borderBottomLeftRadius"];
+    for(var i=0;i<4;i++){
+      var v=cs[ps[i]]||"0",n=parseFloat(v)||0;
+      if(v.indexOf("%")>=0)n=n*m/100;
+      out.push(Math.min(n,m/2));
+    }
+    return out;
+  }
   function measure(){
     var d=document.documentElement,b=document.body;
     var w=Math.ceil(Math.max(d.scrollWidth,b?b.scrollWidth:0));
     var h=d.getBoundingClientRect().height;
     if(b){var bs=getComputedStyle(b);h=Math.max(h,b.scrollHeight+parseFloat(bs.marginTop)+parseFloat(bs.marginBottom))}
     h=Math.ceil(h);
-    var crop=null,transparent=false;
+    var crop=null,transparent=false,radius=null;
     if(b&&!hasText(b)){
       var node=b,stages=[d,b];
       for(var guard=0;guard<12;guard++){
@@ -165,14 +188,16 @@ const PROBE_SOURCE = `function(id,clearStage){
         crop={x:Math.max(0,Math.floor(rect.left+scrollX)),y:Math.max(0,Math.floor(rect.top+scrollY)),w:Math.ceil(rect.width),h:Math.ceil(rect.height)};
         if(clearStage&&paints){
           transparent=true;
+          radius=radii(node,rect.width,rect.height);
           if(!cleared){
             cleared=true;
             for(var t=0;t<stages.length;t++)stages[t].style.setProperty("background","transparent","important");
+            node.style.setProperty("box-shadow",innerShadows(getComputedStyle(node).boxShadow),"important");
           }
         }
       }
     }
-    var msg={oaiprismPreview:id,width:w,height:h,crop:crop,transparent:transparent};
+    var msg={oaiprismPreview:id,width:w,height:h,crop:crop,transparent:transparent,radius:radius};
     var key=JSON.stringify(msg);
     if(h&&key!==last){last=key;parent.postMessage(msg,"*")}
   }

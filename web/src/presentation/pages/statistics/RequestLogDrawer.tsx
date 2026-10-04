@@ -5,7 +5,7 @@ import type { RequestLog } from '../../../domain/statistics/entity';
 import { useAccountStore } from '../../../application/account/store';
 import { MONO_FAMILY } from '../../theme/tokens';
 import { formatDateTime, formatDuration, formatRelative, normalizeIp, parseClient } from '../../utils/format';
-import { latencyTone, statusTagColor, statusText } from './logMeta';
+import { isFailed, isStreamBroken, latencyTone, statusTagColor, statusText } from './logMeta';
 
 const { Text } = Typography;
 
@@ -59,7 +59,8 @@ const LogDetail: React.FC<{ log: RequestLog }> = ({ log }) => {
     content: { color: token.colorText, minWidth: 0, paddingBottom: 6 },
   };
 
-  const ok = log.statusCode >= 200 && log.statusCode < 300;
+  const ok = !isFailed(log);
+  const broken = isStreamBroken(log);
   const client = parseClient(log.userAgent);
   const { ip, local } = normalizeIp(log.clientIp);
   const accountName = log.accountId ? accountNameMap.get(log.accountId) : undefined;
@@ -76,8 +77,8 @@ const LogDetail: React.FC<{ log: RequestLog }> = ({ log }) => {
     <>
       {/* 摘要：状态 + 接口 + 时间 */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        <Tag color={statusTagColor(log.statusCode)} style={{ marginInlineEnd: 0, fontWeight: 600 }}>
-          {log.statusCode} {statusText(log.statusCode)}
+        <Tag color={broken ? 'error' : statusTagColor(log.statusCode)} style={{ marginInlineEnd: 0, fontWeight: 600 }}>
+          {broken ? '生成中断' : `${log.statusCode} ${statusText(log.statusCode)}`}
         </Tag>
         <Tag bordered={false} style={{ marginInlineEnd: 0, fontFamily: MONO_FAMILY, fontSize: 11 }}>
           {log.method}
@@ -176,9 +177,9 @@ const LogDetail: React.FC<{ log: RequestLog }> = ({ log }) => {
 
       {!ok && log.errorMessage && (
         <Alert
-          type={log.statusCode >= 500 ? 'error' : 'warning'}
+          type={broken || log.statusCode >= 500 ? 'error' : 'warning'}
           showIcon
-          title="错误信息"
+          title={broken ? '生成中途失败（响应头已发出，状态码仍为 200）' : '错误信息'}
           description={<div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{log.errorMessage}</div>}
           style={{ marginTop: 16 }}
         />
@@ -196,6 +197,7 @@ const LogDetail: React.FC<{ log: RequestLog }> = ({ log }) => {
         </Descriptions.Item>
         <Descriptions.Item label="状态码">
           {log.statusCode} {statusText(log.statusCode)}
+          {broken && <Text type="danger"> · 流式中途失败</Text>}
         </Descriptions.Item>
         <Descriptions.Item label="Token 用量">
           {tokens > 0 ? (
@@ -206,7 +208,6 @@ const LogDetail: React.FC<{ log: RequestLog }> = ({ log }) => {
             <Text type="secondary">{noUsageHint}</Text>
           )}
         </Descriptions.Item>
-        {ok && log.errorMessage && <Descriptions.Item label="备注">{log.errorMessage}</Descriptions.Item>}
       </Descriptions>
 
       {sectionTitle('客户端')}

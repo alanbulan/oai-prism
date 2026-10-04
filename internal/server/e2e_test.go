@@ -74,6 +74,61 @@ type fakeUpstream struct {
 
 	// noUsage 模拟真实上游：终态 payload 里没有 usage（抓包实证），网关须自行计数。
 	noUsage bool
+
+	// sandbox 打开沙箱链路（申请、资源令牌、Y-Sweet 凭证、同步状态）。默认关闭：
+	// 关闭时申请沙箱 404，网关不带沙箱继续，其余测试不受影响。
+	sandbox     bool
+	sandboxSeq  int
+	deadSandbox map[string]bool // 已被"回收"的沙箱令牌：代理对它们回 502（空响应体，与实测一致）
+	deadAll     bool            // 沙箱服务整体故障：任何沙箱都回 502
+}
+
+// sandboxAlive 报告请求所带的沙箱令牌是否仍可用；不可用时直接回 502。
+func (f *fakeUpstream) sandboxAlive(w http.ResponseWriter, r *http.Request) bool {
+	f.mu.Lock()
+	dead := f.deadAll || f.deadSandbox[r.Header.Get("X-Crixet-Sandbox-Token")]
+	f.mu.Unlock()
+	if dead {
+		w.WriteHeader(http.StatusBadGateway)
+		return false
+	}
+	return true
+}
+
+func (f *fakeUpstream) sandboxRoutes(mux *http.ServeMux) {
+	writeJSON := func(w http.ResponseWriter, v any) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(v)
+	}
+	mux.HandleFunc("/api/backend/1/new", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.sandboxSeq++
+		tok := fmt.Sprintf("sbtok-%d", f.sandboxSeq)
+		f.mu.Unlock()
+		writeJSON(w, map[string]any{"url": "https://prism.test/s/sandboxes/proxy", "token": tok})
+	})
+	mux.HandleFunc("/api/projects/", func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/sandbox/resources-token") {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, map[string]any{"access_token": "rt", "expires_at": time.Now().Add(time.Hour).Unix(), "max_age_seconds": 3600})
+	})
+	mux.HandleFunc("/api/y", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"docId": "doc", "url": "wss://y.test/d/doc/ws", "token": "yt"})
+	})
+	for _, p := range []string{"/s/sandboxes/proxy/resources-token", "/s/sandboxes/proxy/token"} {
+		mux.HandleFunc(p, func(w http.ResponseWriter, r *http.Request) {
+			if f.sandboxAlive(w, r) {
+				writeJSON(w, map[string]any{"success": true})
+			}
+		})
+	}
+	mux.HandleFunc("/s/sandboxes/proxy/wait-for-sync", func(w http.ResponseWriter, r *http.Request) {
+		if f.sandboxAlive(w, r) {
+			http.NotFound(w, r) // 404 = 该沙箱无需同步（与真实前端判定一致）
+		}
+	})
 }
 
 // genState 是单个生成请求的状态。
@@ -116,6 +171,9 @@ func (f *fakeUpstream) payloadOutput(text string, withReasoning bool) map[string
 
 func (f *fakeUpstream) handler() http.Handler {
 	mux := http.NewServeMux()
+	if f.sandbox {
+		f.sandboxRoutes(mux)
+	}
 
 	// --- 认证 ---
 	mux.HandleFunc("/api/auth/session", func(w http.ResponseWriter, r *http.Request) {
@@ -2111,5 +2169,89 @@ func TestE2E_MeasuredUsageRecorded(t *testing.T) {
 	}
 	if got := logged.Items[0]; got.PromptTokens != u.PromptTokens || got.CompletionTokens != u.CompletionTokens {
 		t.Fatalf("流水用量 %+v 与响应 usage %+v 不一致", got, u)
+	}
+}
+
+// ---------------------------- 沙箱回收 ----------------------------
+
+// 沙箱空闲被上游回收后，代理对旧令牌一律回 502（后端签发资源令牌照常 200）。
+// 网关须当场换新容器，而不是把同一个死沙箱一直用到缓存过期 ——
+// 2026-10-04 实测：两个请求先后各等 8 秒后报"沙箱工作区同步未就绪"。
+func TestE2E_ReclaimedSandboxIsReplaced(t *testing.T) {
+	up := &fakeUpstream{t: t, sandbox: true, deadSandbox: map[string]bool{}}
+	ts, _ := newTestServer(t, up, goodAccount(), nil)
+
+	chat := func(session string) (int, string) {
+		return doLocal(t, http.MethodPost, ts.URL+"/v1/chat/completions",
+			`{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`,
+			map[string]string{"Content-Type": "application/json", "X-Oaiprism-Session": session})
+	}
+	if code, out := chat("s1"); code != http.StatusOK {
+		t.Fatalf("首个请求失败: %d %s", code, out)
+	}
+	up.mu.Lock()
+	if up.sandboxSeq != 1 {
+		up.mu.Unlock()
+		t.Fatalf("首个请求应申请 1 个沙箱，实际 %d 个", up.sandboxSeq)
+	}
+	up.deadSandbox["sbtok-1"] = true // 上游回收了它，网关缓存里却还在
+	up.mu.Unlock()
+
+	// 新会话 = 新项目，必须重新同步工作区，撞上死沙箱
+	if code, out := chat("s2"); code != http.StatusOK {
+		t.Fatalf("沙箱被回收后请求失败（应自动换新容器）: %d %s", code, out)
+	}
+	up.mu.Lock()
+	defer up.mu.Unlock()
+	if up.sandboxSeq != 2 {
+		t.Fatalf("应重新申请 1 个沙箱（共 2 个），实际 %d 个", up.sandboxSeq)
+	}
+	last, _ := json.Marshal(up.startBodies[len(up.startBodies)-1])
+	if !strings.Contains(string(last), "sbtok-2") || strings.Contains(string(last), "sbtok-1") {
+		t.Fatalf("start 应改用新沙箱: %s", last)
+	}
+}
+
+// 沙箱服务整体故障：只换一次容器就放弃（不无限申请），不发 start（否则上游 122 秒后 504），
+// 且请求流水记下实际使用的账号 —— 失败请求此前一律显示"未分配"。
+func TestE2E_SandboxDownFailsFastWithAccountLogged(t *testing.T) {
+	up := &fakeUpstream{t: t, sandbox: true, deadAll: true}
+	ts, _ := newTestServer(t, up, goodAccount(), nil)
+
+	code, out := doLocal(t, http.MethodPost, ts.URL+"/v1/chat/completions",
+		`{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`,
+		map[string]string{"Content-Type": "application/json"})
+	if code == http.StatusOK {
+		t.Fatalf("沙箱服务整体故障时不应成功: %s", out)
+	}
+	up.mu.Lock()
+	acquired, starts := up.sandboxSeq, len(up.startBodies)
+	up.mu.Unlock()
+	if acquired != 2 {
+		t.Fatalf("应只换一次容器（共申请 2 个），实际 %d 个", acquired)
+	}
+	if starts != 0 {
+		t.Fatalf("工作区未就绪不应发起 start，实际 %d 次", starts)
+	}
+
+	var logged struct {
+		Items []struct {
+			AccountID    string `json:"account_id"`
+			ErrorMessage string `json:"error_message"`
+		} `json:"items"`
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		code, body := doLocal(t, http.MethodGet, ts.URL+"/admin/requests?page=1&page_size=1", "", nil)
+		if code == http.StatusOK && json.Unmarshal([]byte(body), &logged) == nil && len(logged.Items) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("请求流水未落库: %d %s", code, body)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := logged.Items[0]; got.AccountID != "main" || got.ErrorMessage == "" {
+		t.Fatalf("失败请求的流水应记下账号与原因，得到 %+v", got)
 	}
 }

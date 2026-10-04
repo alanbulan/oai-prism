@@ -40,9 +40,11 @@ interface Measure {
   crop: Rect | null;
   /** 舞台底色已透明化：iframe 背景也随之透明 */
   transparent: boolean;
+  /** 内容四角圆角半径（左上、右上、右下、左下，文档像素）：显示区域按同样弧度裁剪 */
+  radius: number[] | null;
 }
 
-const EMPTY: Measure = { width: null, height: null, crop: null, transparent: false };
+const EMPTY: Measure = { width: null, height: null, crop: null, transparent: false, radius: null };
 
 const ToolButton: React.FC<{ title: string; icon: React.ReactNode; onClick: () => void }> = ({ title, icon, onClick }) => (
   <Tooltip title={title}>
@@ -106,6 +108,10 @@ export const HtmlPreview: React.FC<HtmlPreviewProps> = ({ code, kind, source, la
     fit === 'content' && measure.crop ? measure.crop : { x: 0, y: 0, w: frameWidth, h: frameHeight };
   const scale = boxWidth && region.w ? Math.min(1, boxWidth / region.w) : 1;
   const transparentBg = fit === 'content' && measure.transparent;
+  // 裁到内容本体时，显示区域与内容同弧度：圆角外不留方角
+  const corners = fit === 'content' && measure.crop && measure.radius ? measure.radius.map((r) => r * scale) : null;
+  // 工具栏避开右上角的圆弧（圆角在 45° 方向内收约 0.29r）
+  const toolsInset = 8 + Math.round((corners?.[1] ?? 0) * 0.29);
 
   // 探针迟迟不回时兜底显示
   useEffect(() => {
@@ -123,6 +129,7 @@ export const HtmlPreview: React.FC<HtmlPreviewProps> = ({ code, kind, source, la
         height?: number;
         crop?: Rect | null;
         transparent?: boolean;
+        radius?: number[] | null;
       } | null;
       if (!data || data.oaiprismPreview !== probeId || typeof data.height !== 'number') return;
       const reportedW = Math.ceil(data.width || 0);
@@ -148,7 +155,8 @@ export const HtmlPreview: React.FC<HtmlPreviewProps> = ({ code, kind, source, la
           }
           if (width !== prev.width || height !== prev.height) adjustments.current += 1;
         }
-        return { width, height, crop: data.crop ?? null, transparent: Boolean(data.transparent) };
+        const radius = Array.isArray(data.radius) && data.radius.length === 4 ? data.radius : null;
+        return { width, height, crop: data.crop ?? null, transparent: Boolean(data.transparent), radius };
       });
       setRevealed(true);
     };
@@ -225,30 +233,38 @@ export const HtmlPreview: React.FC<HtmlPreviewProps> = ({ code, kind, source, la
           opacity: revealed ? 1 : 0,
         }}
       >
-        {boxWidth > 0 && (
-          <iframe
-            key={runKey}
-            ref={frameRef}
-            srcDoc={srcDoc}
-            title={`${label} 渲染结果`}
-            sandbox="allow-scripts allow-modals"
-            scrolling="no"
-            style={{
-              position: 'absolute',
-              left: 0,
-              top: 0,
-              width: frameWidth,
-              height: frameHeight,
-              border: 'none',
-              display: 'block',
-              background: transparentBg ? 'transparent' : '#fff',
-              colorScheme: 'light',
-              transformOrigin: '0 0',
-              transform: `scale(${scale}) translate(${-region.x}px, ${-region.y}px)`,
-            }}
-          />
-        )}
-        <div className="op-html-tools" style={{ background: token.colorBgElevated }}>
+        <div
+          className="op-html-clip"
+          style={corners ? { borderRadius: corners.map((r) => `${r.toFixed(2)}px`).join(' ') } : undefined}
+        >
+          {boxWidth > 0 && (
+            <iframe
+              key={runKey}
+              ref={frameRef}
+              srcDoc={srcDoc}
+              title={`${label} 渲染结果`}
+              sandbox="allow-scripts allow-modals"
+              scrolling="no"
+              style={{
+                position: 'absolute',
+                left: 0,
+                top: 0,
+                width: frameWidth,
+                height: frameHeight,
+                border: 'none',
+                display: 'block',
+                background: transparentBg ? 'transparent' : '#fff',
+                colorScheme: 'light',
+                transformOrigin: '0 0',
+                transform: `scale(${scale}) translate(${-region.x}px, ${-region.y}px)`,
+              }}
+            />
+          )}
+        </div>
+        <div
+          className="op-html-tools"
+          style={{ background: token.colorBgElevated, top: toolsInset, right: toolsInset }}
+        >
           {cropped && (
             <ToolButton
               title={fit === 'content' ? '显示整页（含页面背景）' : '只显示内容'}

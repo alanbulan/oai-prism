@@ -540,10 +540,13 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 		q := r.URL.Query()
 		page, _ := strconv.Atoi(q.Get("page"))
 		pageSize, _ := strconv.Atoi(q.Get("page_size"))
-		// status 支持精确状态码（429）与状态码段（2xx / 4xx / 5xx）
+		// status 支持结果（ok / failed）、精确状态码（429）与状态码段（2xx / 4xx / 5xx）
 		status := strings.ToLower(strings.TrimSpace(q.Get("status")))
 		var statusCode, statusClass int
-		if len(status) == 3 && strings.HasSuffix(status, "xx") {
+		var outcome string
+		if status == "ok" || status == "failed" {
+			outcome = status
+		} else if len(status) == 3 && strings.HasSuffix(status, "xx") {
 			statusClass, _ = strconv.Atoi(status[:1])
 		} else {
 			statusCode, _ = strconv.Atoi(status)
@@ -556,6 +559,7 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 			AccountID:   strings.TrimSpace(q.Get("account_id")),
 			StatusCode:  statusCode,
 			StatusClass: statusClass,
+			Outcome:     outcome,
 		}
 
 		if s.sqlite == nil {

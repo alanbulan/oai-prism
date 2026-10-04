@@ -30,6 +30,24 @@ export function statusTagColor(code: number): string {
   return 'error';
 }
 
+interface LogOutcome {
+  statusCode: number;
+  errorMessage?: string;
+}
+
+/**
+ * 流式中途失败：响应头（200）已经发出，状态码改不了，失败原因只记在 errorMessage。
+ * 网关只在失败路径写 errorMessage，所以"2xx + 有错误信息"就是这一类。
+ */
+export function isStreamBroken(log: LogOutcome): boolean {
+  return log.statusCode < 400 && !!log.errorMessage;
+}
+
+/** 失败：4xx / 5xx，或流式中途失败（与后端统计口径一致） */
+export function isFailed(log: LogOutcome): boolean {
+  return log.statusCode >= 400 || !!log.errorMessage;
+}
+
 export type LatencyTone = 'fast' | 'normal' | 'slow' | 'very-slow';
 
 /** 耗时分级：流式长回复动辄几十秒，阈值按对话场景设定而非普通 API */
