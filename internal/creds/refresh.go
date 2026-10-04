@@ -185,10 +185,10 @@ func (r *Refresher) RefreshOAuth(ctx context.Context, cur *Credential) (*Credent
 	if clientID == "" {
 		clientID = config.DefaultOAuthClientID
 	}
-	// refresh_token 与签发它的 client 绑定：OAuth 导入的账号在 Headers 里
-	// 记录了自己的 oauth_client_id，刷新时逐账号覆盖，避免全局混用导致
+	// refresh_token 与签发它的 client 绑定：OAuth 导入的账号记录了自己的
+	// oauth_client_id，刷新时逐账号覆盖，避免全局混用导致
 	// invalid_grant（不同 client 的 refresh_token 不互通）。
-	if v := strings.TrimSpace(cur.Headers["oauth_client_id"]); v != "" {
+	if v := strings.TrimSpace(cur.OAuthClientID); v != "" {
 		clientID = v
 	}
 

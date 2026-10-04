@@ -51,6 +51,7 @@ type fakeUpstream struct {
 	lastAuth     string
 	lastOrigin   string
 	lastReferer  string
+	reqHeaders   []http.Header // 每个上游请求的头（按到达顺序）
 
 	// gens 按 request_id 保存每个请求自己的轮询状态。
 	//
@@ -477,11 +478,23 @@ func (f *fakeUpstream) handler() http.Handler {
 		})
 	})
 
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.reqHeaders = append(f.reqHeaders, r.Header.Clone())
+		f.mu.Unlock()
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // newTestServer 起一个完整代理实例，指向假上游。
 func newTestServer(t *testing.T, up *fakeUpstream, accounts []config.AccountConfig, tune func(*config.Config)) (*httptest.Server, *fakeUpstream) {
+	t.Helper()
+	ts, up, _ := newTestServerWithSrv(t, up, accounts, tune)
+	return ts, up
+}
+
+// newTestServerWithSrv 同 newTestServer，另外返回 *Server，供需要直接操作账号池的测试使用。
+func newTestServerWithSrv(t *testing.T, up *fakeUpstream, accounts []config.AccountConfig, tune func(*config.Config)) (*httptest.Server, *fakeUpstream, *Server) {
 	t.Helper()
 
 	upstream := httptest.NewServer(up.handler())
@@ -521,7 +534,7 @@ func newTestServer(t *testing.T, up *fakeUpstream, accounts []config.AccountConf
 		ts.Close()
 		_ = srv.Close()
 	})
-	return ts, up
+	return ts, up, srv
 }
 
 func goodAccount() []config.AccountConfig {

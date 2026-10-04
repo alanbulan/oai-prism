@@ -155,8 +155,8 @@ type CredsConfig struct {
 	OAuthTokenURL     string        `yaml:"oauth_token_url"`  // refresh_token 换发地址
 	OAuthClientID     string        `yaml:"oauth_client_id"`  // 默认 codex 客户端
 	OAuthScope        string        `yaml:"oauth_scope"`
-	PersistRefresh    bool          `yaml:"persist_refresh"`     // 刷新结果写回文件
-	PersistRefreshMin time.Duration `yaml:"persist_refresh_min"` // 写回节流
+	PersistRefresh    bool          `yaml:"persist_refresh"`     // 刷新结果写回 JSON 凭据文件（未实现）；SQLite 回写不受此开关控制，始终开启
+	PersistRefreshMin time.Duration `yaml:"persist_refresh_min"` // 同一账号两次回写 SQLite 的最小间隔；refresh_token 轮换时不受限
 
 	Accounts []AccountConfig `yaml:"accounts"`
 }
@@ -180,6 +180,10 @@ type AccountConfig struct {
 	AccessToken  string            `yaml:"access_token"`
 	RefreshToken string            `yaml:"refresh_token"`
 	ExpiresAt    *time.Time        `yaml:"expires_at"`
+
+	// OAuthClientID 是签发该账号 refresh_token 的 OAuth client（为空则用 creds.oauth_client_id）。
+	// refresh_token 与 client 绑定，混用会 invalid_grant。读取请走 EffectiveOAuthClientID。
+	OAuthClientID string `yaml:"oauth_client_id"`
 
 	AccountID string `yaml:"account_id"`
 	Email     string `yaml:"email"`
@@ -205,6 +209,28 @@ type AccountConfig struct {
 // IsEnabled 处理 *bool 的三态。
 func (a AccountConfig) IsEnabled() bool {
 	return a.Enabled == nil || *a.Enabled
+}
+
+// LegacyOAuthClientIDHeader 是早期版本存放 oauth_client_id 的 Headers 键名。
+//
+// 那时它混在账号级附加头里，而 Headers 会原样转发给上游 —— 等于每个请求都多带
+// 一个浏览器不会发的 Oauth_client_id 头。现在只作旧 accounts.json 的读取兜底，
+// 并在构造凭据时从 Headers 中剔除（见 creds.FromAccountConfig）。
+const LegacyOAuthClientIDHeader = "oauth_client_id"
+
+// EffectiveOAuthClientID 返回账号的 OAuth client：专用字段优先，其次旧版 Headers 兜底。
+func (a AccountConfig) EffectiveOAuthClientID() string {
+	if v := strings.TrimSpace(a.OAuthClientID); v != "" {
+		return v
+	}
+	for k, v := range a.Headers {
+		if strings.EqualFold(k, LegacyOAuthClientIDHeader) {
+			if v = strings.TrimSpace(v); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
 }
 
 // PoolConfig 描述账号池调度。

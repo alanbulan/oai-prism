@@ -137,9 +137,57 @@ func (s *SQLiteStore) initSchema() error {
 		return fmt.Errorf("初始化 sqlite 表结构失败: %w", err)
 	}
 
+	// 后加的列走 ALTER TABLE：CREATE TABLE IF NOT EXISTS 对已有库是空操作。
+	//
+	// oauth_client_id：refresh_token 与签发它的 OAuth client 绑定（见 creds.RefreshOAuth），
+	// 对应 AccountConfig / Credential 的 OAuthClientID。早期表结构没有这一列，
+	// 重启后该值丢失，刷新只能退回全局 creds.oauth_client_id —— 两者不一致就是 invalid_grant。
+	if err := s.addColumnIfMissing("accounts", "oauth_client_id", "TEXT"); err != nil {
+		return err
+	}
+
 	// 不再内置默认密钥：写死在源码里的 Key 对所有人公开，等于没有鉴权。
 	// 没有任何 Key 时鉴权中间件只放行本机请求，用户在 Dashboard 生成
 	// 第一把 Key 后自动转为全量校验。
+	return nil
+}
+
+// addColumnIfMissing 在列不存在时追加一列（可空，旧行取 NULL）。
+// 仅在 initSchema 内调用，表名/列名均为常量，不存在注入面。
+func (s *SQLiteStore) addColumnIfMissing(table, column, decl string) error {
+	rows, err := s.db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return fmt.Errorf("读取 %s 表结构失败: %w", table, err)
+	}
+	found := false
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			typ     string
+			notNull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("读取 %s 表结构失败: %w", table, err)
+		}
+		if strings.EqualFold(name, column) {
+			found = true
+		}
+	}
+	// 必须先关游标再 ALTER：连接池只有一条连接（SetMaxOpenConns(1)）。
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("读取 %s 表结构失败: %w", table, err)
+	}
+	if found {
+		return nil
+	}
+	if _, err := s.db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + decl); err != nil {
+		return fmt.Errorf("为 %s 表追加 %s 列失败: %w", table, column, err)
+	}
 	return nil
 }
 
@@ -189,7 +237,8 @@ func (s *SQLiteStore) Load() ([]config.AccountConfig, error) {
 	}
 
 	rows, err := s.db.Query(`
-		SELECT id, name, plan, email, cookies, access_token, refresh_token, max_concurrency, tags
+		SELECT id, name, plan, email, cookies, access_token, refresh_token, max_concurrency, tags,
+		       COALESCE(oauth_client_id, '')
 		FROM accounts
 		ORDER BY updated_at DESC
 	`)
@@ -201,7 +250,7 @@ func (s *SQLiteStore) Load() ([]config.AccountConfig, error) {
 	var list []config.AccountConfig
 	for rows.Next() {
 		var a config.AccountConfig
-		var tagsStr string
+		var tagsStr, clientID string
 		err := rows.Scan(
 			&a.ID,
 			&a.Name,
@@ -212,6 +261,7 @@ func (s *SQLiteStore) Load() ([]config.AccountConfig, error) {
 			&a.RefreshToken,
 			&a.MaxConcurrency,
 			&tagsStr,
+			&clientID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("读取账号行失败: %w", err)
@@ -219,6 +269,7 @@ func (s *SQLiteStore) Load() ([]config.AccountConfig, error) {
 		if tagsStr != "" {
 			_ = json.Unmarshal([]byte(tagsStr), &a.Tags)
 		}
+		a.OAuthClientID = clientID
 		list = append(list, a)
 	}
 	return list, rows.Err()
@@ -259,9 +310,10 @@ func (s *SQLiteStore) SaveAccount(a config.AccountConfig) error {
 		}
 	}
 
+	// oauth_client_id 与 token 同理：Dashboard 编辑不会带它，空值时保留库内原值。
 	query := `
-	INSERT INTO accounts (id, name, plan, email, cookies, access_token, refresh_token, max_concurrency, tags, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	INSERT INTO accounts (id, name, plan, email, cookies, access_token, refresh_token, max_concurrency, tags, oauth_client_id, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 	ON CONFLICT(id) DO UPDATE SET
 		name = excluded.name,
 		plan = excluded.plan,
@@ -271,6 +323,7 @@ func (s *SQLiteStore) SaveAccount(a config.AccountConfig) error {
 		refresh_token = CASE WHEN excluded.refresh_token != '' THEN excluded.refresh_token ELSE accounts.refresh_token END,
 		max_concurrency = excluded.max_concurrency,
 		tags = excluded.tags,
+		oauth_client_id = COALESCE(excluded.oauth_client_id, accounts.oauth_client_id),
 		updated_at = CURRENT_TIMESTAMP;
 	`
 	_, err := s.db.Exec(query,
@@ -283,11 +336,72 @@ func (s *SQLiteStore) SaveAccount(a config.AccountConfig) error {
 		a.RefreshToken,
 		a.MaxConcurrency,
 		tagsJSON,
+		nullIfEmpty(a.EffectiveOAuthClientID()), // 兼容旧 accounts.json 迁移进来的 Headers 写法
 	)
 	if err != nil {
 		return fmt.Errorf("保存账号 %s 至 SQLite 失败: %w", a.ID, err)
 	}
 	return nil
+}
+
+// TokenUpdate 是凭据刷新后要回写的字段。空串表示"不改"，库内原值保持不动。
+type TokenUpdate struct {
+	AccessToken   string
+	RefreshToken  string
+	Plan          string
+	Email         string
+	OAuthClientID string
+}
+
+// ErrAccountNotInStore 表示 UpdateTokens 的目标账号不在 SQLite 里
+// （来自 config.yaml 的静态账号，或刷新途中已被删除）。
+var ErrAccountNotInStore = errors.New("账号不在 SQLite 中")
+
+// UpdateTokens 只回写凭据相关列，供后台刷新使用。
+//
+// 刻意不走 SaveAccount：那是"整行 upsert"，会用调用方手里的 name / tags /
+// max_concurrency 覆盖 Dashboard 上的编辑，而刷新流程手里只有凭据。
+// 也不改 updated_at：Load 按它排序（进而决定池内平票顺序与 Dashboard 列表顺序），
+// 后台续期不该让账号顺序跳动。目标行不存在时返回 ErrAccountNotInStore，不会凭空插入。
+func (s *SQLiteStore) UpdateTokens(id string, t TokenUpdate) error {
+	if s == nil {
+		return errSQLiteUnavailable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db == nil {
+		return errSQLiteUnavailable
+	}
+
+	res, err := s.db.Exec(`
+		UPDATE accounts SET
+			access_token    = COALESCE(?, access_token),
+			refresh_token   = COALESCE(?, refresh_token),
+			plan            = COALESCE(?, plan),
+			email           = COALESCE(?, email),
+			oauth_client_id = COALESCE(?, oauth_client_id)
+		WHERE id = ?`,
+		nullIfEmpty(t.AccessToken),
+		nullIfEmpty(t.RefreshToken),
+		nullIfEmpty(t.Plan),
+		nullIfEmpty(t.Email),
+		nullIfEmpty(t.OAuthClientID),
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("回写账号 %s 凭据失败: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("%w: %s", ErrAccountNotInStore, id)
+	}
+	return nil
+}
+
+// nullIfEmpty 把空串（含纯空白）映射为 SQL NULL，配合 COALESCE 表达"不改"。
+func nullIfEmpty(v string) sql.NullString {
+	v = strings.TrimSpace(v)
+	return sql.NullString{String: v, Valid: v != ""}
 }
 
 // DeleteAccount 从 SQLite 中物理删除账号 (Delete)。

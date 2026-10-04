@@ -160,6 +160,7 @@ func (s *Store) Persist(list []config.AccountConfig) error {
 			SessionToken:   a.SessionToken,
 			AccessToken:    a.AccessToken,
 			RefreshToken:   a.RefreshToken,
+			OAuthClientID:  a.OAuthClientID,
 			AccountID:      a.AccountID,
 			Email:          a.Email,
 			Plan:           a.Plan,
@@ -224,6 +225,7 @@ type fileAccount struct {
 	SessionToken   string            `json:"session_token"`
 	AccessToken    string            `json:"access_token"`
 	RefreshToken   string            `json:"refresh_token"`
+	OAuthClientID  string            `json:"oauth_client_id,omitempty"`
 	ExpiresAt      string            `json:"expires_at"`
 	AccountID      string            `json:"account_id"`
 	Email          string            `json:"email"`
@@ -265,7 +267,7 @@ func ParseAccounts(raw []byte) ([]config.AccountConfig, error) {
 // ParseAccountList 与 ParseAccounts 相同，但不补默认 id / 名字（由调用方决定，见管理端导入）。
 //
 // 认得 sub2api 一类网关的导出格式：账号的凭据放在嵌套的 credentials 对象里
-//（access_token、refresh_token、email、plan_type…），platform 标明平台。
+// （access_token、refresh_token、email、plan_type…），platform 标明平台。
 func ParseAccountList(raw []byte) ([]config.AccountConfig, error) {
 	raw = []byte(strings.TrimSpace(string(raw)))
 	if len(raw) == 0 || string(raw) == "null" {
@@ -323,6 +325,12 @@ func accountFromMap(m map[string]any) (config.AccountConfig, error) {
 		for k, v := range creds {
 			flat[normKey(k)] = v
 		}
+		// 导出文件把签发 refresh_token 的 OAuth client 记作 client_id
+		if _, ok := flat["oauthclientid"]; !ok {
+			if v, ok := flat["clientid"]; ok {
+				flat["oauthclientid"] = v
+			}
+		}
 		for _, k := range []string{"id", "name", "enabled", "tags", "proxy"} {
 			if v, ok := m[k]; ok {
 				flat[k] = v
@@ -341,6 +349,7 @@ func accountFromMap(m map[string]any) (config.AccountConfig, error) {
 		SessionToken:   str(m, "sessiontoken", "session"),
 		AccessToken:    str(m, "accesstoken", "token", "jwt", "bearertoken"),
 		RefreshToken:   str(m, "refreshtoken"),
+		OAuthClientID:  str(m, "oauthclientid"),
 		AccountID:      str(m, "accountid", "chatgptaccountid", "deviceid"),
 		Email:          str(m, "email"),
 		Plan:           str(m, "plan", "plantype"),

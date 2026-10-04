@@ -123,7 +123,12 @@ creds:
   oauth_client_id: app_EMoamEEZ73f0CkXaXp7hrann
   oauth_scope: openid profile email offline_access
 
+  # 刷新后的凭据始终写回 SQLite（secrets/accounts.db）—— refresh_token 每次刷新
+  # 都会轮换，不落盘的话重启后账号直接报废。persist_refresh 只预留给 JSON 凭据文件
+  # （尚未实现），与 SQLite 回写无关。
   persist_refresh: false
+  # 同一账号两次回写的最小间隔（0 = 每次刷新都写）。refresh_token 轮换时不受此限。
+  # persist_refresh_min: 1m
 
   # 直接写在配置里的账号（mode 为 static/hybrid 时生效）。
   # 更推荐用 `oaiprism import` 命令写入 secrets/accounts.json。

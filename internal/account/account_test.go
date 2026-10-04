@@ -75,6 +75,23 @@ func TestParseAccounts_BareArray(t *testing.T) {
 	}
 }
 
+// accounts.json 两种写法都要认：专用字段 oauth_client_id，以及旧版塞在 headers 里的。
+func TestParseAccounts_OAuthClientID(t *testing.T) {
+	list, err := ParseAccounts([]byte(`[
+	  {"id":"new","oauthClientId":"app_field"},
+	  {"id":"old","headers":{"oauth_client_id":"app_legacy"}}
+	]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := list[0].EffectiveOAuthClientID(); got != "app_field" {
+		t.Errorf("专用字段未识别: %q", got)
+	}
+	if got := list[1].EffectiveOAuthClientID(); got != "app_legacy" {
+		t.Errorf("旧版 headers 写法未兜底: %q", got)
+	}
+}
+
 func TestParseAccounts_Empty(t *testing.T) {
 	for _, in := range []string{"", "   ", "null"} {
 		list, err := ParseAccounts([]byte(in))
