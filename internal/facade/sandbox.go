@@ -35,6 +35,12 @@ type sandboxEntry struct {
 	// 令牌过期后沙箱就读不到项目资源了，再发请求必然失败，
 	// 与其等失败再重试，不如到点就重新同步一遍。
 	projects map[string]time.Time
+
+	// filesProject / filesAt：这个沙箱的工作区里落的是哪个项目、哪个时刻的文件。
+	// 沙箱只在第一次同步项目时把文件树落成工作区文件，之后在文档里新增的文件、
+	// 以及再同步的别的项目的文件，都不会出现在工作区（2026-10-04 实测）。
+	filesProject string
+	filesAt      time.Time
 }
 
 func newSandboxCache(ttl time.Duration) *sandboxCache {
@@ -70,15 +76,23 @@ func (c *sandboxCache) Put(accountID string, sb *prism.Sandbox) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	projects := map[string]time.Time{}
+	e := &sandboxEntry{sb: sb, expires: time.Now().Add(c.ttl), projects: map[string]time.Time{}}
 	if old, ok := c.items[accountID]; ok && old.sb != nil && old.sb.Token == sb.Token {
-		projects = old.projects
+		e.projects, e.filesProject, e.filesAt = old.projects, old.filesProject, old.filesAt
 	}
-	c.items[accountID] = &sandboxEntry{
-		sb:       sb,
-		expires:  time.Now().Add(c.ttl),
-		projects: projects,
+	c.items[accountID] = e
+}
+
+// HoldsFiles 报告当前沙箱的工作区能否看到项目 projectID 在 since 之前登记的文件：
+// 还没同步过任何项目的新沙箱算能（第一次同步就会落下它们）。
+func (c *sandboxCache) HoldsFiles(accountID, projectID string, since time.Time) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	e, ok := c.items[accountID]
+	if !ok || e.filesProject == "" {
+		return true
 	}
+	return e.filesProject == projectID && !e.filesAt.Before(since)
 }
 
 // Synced 报告该沙箱是否已为该项目完成工作区同步且令牌仍有效。
@@ -109,6 +123,9 @@ func (c *sandboxCache) MarkSynced(accountID, projectID string, until time.Time) 
 			e.projects = make(map[string]time.Time, 2)
 		}
 		e.projects[projectID] = until
+		if e.filesProject == "" {
+			e.filesProject, e.filesAt = projectID, time.Now()
+		}
 	}
 	c.mu.Unlock()
 }

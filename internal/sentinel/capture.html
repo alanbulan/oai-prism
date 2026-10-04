@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>OAIprism 浏览器指纹采集</title>
+<style>
+  html { line-height: 1.5; }
+  body { font: 15px system-ui, sans-serif; margin: 3em auto; max-width: 40em; color: #222; }
+  .ok { color: #1a7f37; } .err { color: #cf222e; }
+</style>
+</head>
+<body>
+<h2>OAIprism 浏览器指纹采集</h2>
+<p class="status">正在采集，几秒钟就好……</p>
+<p>采集的是 Sentinel SDK 在 Prism 页面上能读到的浏览器环境（版本、屏幕、语言、时区、字体宽度等），
+  只发回本机的 oaiprism，不含任何 Cookie、历史记录或账号信息。</p>
+<script>
+(() => {
+  "use strict";
+  const TOKEN = "{{TOKEN}}";
+  const TLS_PORT = "{{TLS_PORT}}";
+  const status = document.querySelector(".status");
+  const show = (cls, text) => { status.className = "status " + cls; status.textContent = text; };
+
+  // 页面自己不留任何全局变量：Object.keys(window) 要和 Chrome 里干净的页面一致
+  const winKeys = Object.keys(window);
+
+  async function collect() {
+    const tag = (v) => Object.prototype.toString.call(v).slice(8, -1);
+    const navProto = Object.keys(Object.getPrototypeOf(navigator)).map((k) => {
+      let v;
+      try { v = navigator[k]; } catch (e) { return [k, "val", null]; }
+      if (typeof v === "function") return [k, "fn", null];
+      if (k === "languages") return [k, "val", null];
+      if (v !== null && typeof v === "object") return [k, "obj", tag(v)];
+      return [k, "val", v === undefined ? null : v];
+    });
+    const windowTypes = {};
+    for (const k of winKeys) {
+      if (/^on/.test(k) || /^\d+$/.test(k)) continue;
+      let v;
+      try { v = window[k]; } catch (e) { windowTypes[k] = "object"; continue; }
+      windowTypes[k] = v === null ? "null" : typeof v;
+    }
+    const widths = {};
+    const probe = (ch) => {
+      const d = document.createElement("div");
+      d.style.visibility = "hidden"; d.style.position = "fixed";
+      d.style.fontFamily = "Helvetica"; d.style.fontSize = "100px"; d.innerText = ch;
+      document.body.appendChild(d);
+      widths[ch] = d.getBoundingClientRect().width;
+      document.body.removeChild(d);
+    };
+    const chars = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~ƯĂÂÊÔƠĐăâêôơđÀÁ中";
+    for (const ch of chars) if (ch !== " ") probe(ch);
+
+    let uaData = null;
+    if (navigator.userAgentData) {
+      const u = navigator.userAgentData;
+      let he = {};
+      try {
+        he = await u.getHighEntropyValues(["architecture", "bitness", "formFactors", "fullVersionList", "model", "platformVersion", "uaFullVersion", "wow64"]);
+      } catch (e) {}
+      delete he.brands; delete he.mobile; delete he.platform;
+      uaData = { brands: u.brands.map((b) => ({ brand: b.brand, version: b.version })), platform: u.platform, highEntropy: he };
+    }
+    const c = navigator.connection;
+    const m = performance.memory;
+    const d = new Date();
+    const tz = String(d).match(/\(([^)]+)\)$/);
+    return {
+      navProto,
+      languages: navigator.languages.slice(),
+      plugins: Array.from(navigator.plugins || []).map((p) => p.name),
+      mimeTypes: Array.from(navigator.mimeTypes || []).map((p) => p.type),
+      uaData,
+      connection: c ? { effectiveType: c.effectiveType, rtt: c.rtt, downlink: c.downlink, saveData: c.saveData } : null,
+      screen: { availWidth: screen.availWidth, availHeight: screen.availHeight, width: screen.width, height: screen.height,
+        colorDepth: screen.colorDepth, pixelDepth: screen.pixelDepth, availLeft: screen.availLeft, availTop: screen.availTop,
+        orientation: screen.orientation && screen.orientation.type, isExtended: screen.isExtended },
+      memory: m ? { jsHeapSizeLimit: m.jsHeapSizeLimit, totalJSHeapSize: m.totalJSHeapSize, usedJSHeapSize: m.usedJSHeapSize } : null,
+      timezone: { offset: d.getTimezoneOffset(), name: tz ? tz[1] : "", iana: Intl.DateTimeFormat().resolvedOptions().timeZone },
+      windowKeys: winKeys,
+      windowTypes,
+      geometry: { innerWidth, innerHeight, outerWidth, outerHeight, screenX, screenY, screenLeft, screenTop, devicePixelRatio,
+        scrollX: 0, scrollY: 0, pageXOffset: 0, pageYOffset: 0, originAgentCluster: window.originAgentCluster },
+      widths,
+      hidden: !visible(),
+    };
+  }
+
+  // 让 Chrome 向本机发起一次 TLS 握手：oaiprism 只记下 ClientHello 用来和网关的比对，握手本身会失败，属正常
+  async function tlsProbe() {
+    if (!TLS_PORT) return;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 5000);
+    try { await fetch("https://localhost:" + TLS_PORT + "/", { mode: "no-cors", cache: "no-store", signal: ac.signal }); } catch (e) {}
+    clearTimeout(timer);
+  }
+
+  // 后台标签页里窗口尺寸读不准（outerWidth 为 0），等用户切过来再采；一分钟还没切就照常采，尺寸沿用旧指纹
+  const visible = () => document.visibilityState === "visible";
+  function waitVisible(ms) {
+    if (visible()) return Promise.resolve();
+    show("", "请切到这个标签页，切过来后自动开始采集……");
+    return new Promise((resolve) => {
+      const t = setTimeout(resolve, ms);
+      document.addEventListener("visibilitychange", () => { if (visible()) { clearTimeout(t); resolve(); } });
+    });
+  }
+
+  (async () => {
+    try {
+      await waitVisible(60000);
+      show("", "正在采集，几秒钟就好……");
+      const data = await collect();
+      await tlsProbe();
+      const r = await fetch("/result?token=" + TOKEN, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
+      const text = await r.text();
+      show(r.ok ? "ok" : "err", text);
+    } catch (e) {
+      show("err", "采集失败：" + e);
+    }
+  })();
+})();
+</script>
+</body>
+</html>

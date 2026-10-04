@@ -18,6 +18,7 @@ import (
 
 	"github.com/oai-prism/oaiprism/internal/creds"
 	"github.com/oai-prism/oaiprism/internal/httpc"
+	"github.com/oai-prism/oaiprism/internal/ydoc"
 )
 
 // Principal 是一次上游调用所需的"身份 + 传输通道"。
@@ -1717,8 +1718,9 @@ func (c *Client) UploadFile(ctx context.Context, p Principal, up FileUpload) (js
 	return raw, nil
 }
 
-// UploadRawProjectFile 直接以原始二进制流上传项目文件（完全对齐官方 WebUI /api/project-files/upload）
-func (c *Client) UploadRawProjectFile(ctx context.Context, p Principal, projectID, filename, contentType string, data []byte) error {
+// UploadRawProjectFile 直接以原始二进制流上传项目文件（完全对齐官方 WebUI /api/project-files/upload），
+// 返回文件 id（x-prism-file-id）。只上传不会出现在项目文件树里，要再用 RegisterProjectFile 登记。
+func (c *Client) UploadRawProjectFile(ctx context.Context, p Principal, projectID, filename, contentType string, data []byte) (string, error) {
 	fileID := newUUID()
 	if contentType == "" {
 		contentType = "application/octet-stream"
@@ -1734,15 +1736,75 @@ func (c *Client) UploadRawProjectFile(ctx context.Context, p Principal, projectI
 
 	resp, err := c.Do(ctx, p, http.MethodPost, PathProjectFilesUpload, headerFromMap(hdr), data, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return &creds.APIError{Op: "upload_raw_project_file", Status: resp.StatusCode, Body: truncate(string(raw), 400)}
+		return "", &creds.APIError{Op: "upload_raw_project_file", Status: resp.StatusCode, Body: truncate(string(raw), 400)}
 	}
-	return nil
+	return fileID, nil
+}
+
+// UploadDir 是官方前端放聊天附件的项目目录（前端常量 "prism-uploads"）。
+const UploadDir = "prism-uploads"
+
+// RegisterProjectFile 把已上传的文件登记进项目文件树：<UploadDir>/<filename>，返回项目内路径
+// （"/prism-uploads/<filename>"，即官方 input_file 的 project_path）。
+//
+// 文件树是 Y-Sweet 托管的 Yjs 文档，沙箱按它同步工作区 —— 不登记，沙箱里就没有这个文件，
+// 模型"打开附件"只会得到"文件不存在"。官方前端上传后也是往文档里加节点（addProjectFiles）。
+func (c *Client) RegisterProjectFile(ctx context.Context, p Principal, projectID, fileID, filename string) (string, error) {
+	tk, err := c.AcquireYSweetToken(ctx, p, projectID)
+	if err != nil {
+		return "", err
+	}
+	state, err := c.yDoc(ctx, p, tk, http.MethodGet, "/as-update", nil)
+	if err != nil {
+		return "", err
+	}
+	doc, err := ydoc.Decode(state)
+	if err != nil {
+		return "", fmt.Errorf("解析项目文档: %w", err)
+	}
+	update, err := ydoc.AddFile(doc, UploadDir, fileID, filename)
+	if err != nil {
+		return "", err
+	}
+	if _, err := c.yDoc(ctx, p, tk, http.MethodPost, "/update", update); err != nil {
+		return "", err
+	}
+	return "/" + UploadDir + "/" + filename, nil
+}
+
+// yDoc 调 Y-Sweet 的文档 HTTP 接口（{baseUrl}/as-update、{baseUrl}/update），以文档令牌鉴权。
+func (c *Client) yDoc(ctx context.Context, p Principal, tk *YSweetToken, method, suffix string, body []byte) ([]byte, error) {
+	u, err := url.Parse(tk.BaseURL)
+	if err != nil || u.Path == "" || !strings.HasPrefix(u.Path, "/y/") {
+		return nil, fmt.Errorf("Y-Sweet 地址不对: %q", tk.BaseURL)
+	}
+	hdr := map[string]string{
+		"Accept":        "*/*",
+		"Authorization": "Bearer " + tk.Token,
+	}
+	if body != nil {
+		hdr["Content-Type"] = "application/octet-stream"
+	}
+	// 文档接口不认账号凭据：不带 Principal 的 Cookie / access token
+	resp, err := c.Do(ctx, Principal{Client: p.Client, AccountID: p.AccountID}, method, strings.TrimRight(u.Path, "/")+suffix, headerFromMap(hdr), body, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, &creds.APIError{Op: "ysweet " + method + " " + suffix, Status: resp.StatusCode, Body: truncate(string(raw), 300)}
+	}
+	return raw, nil
 }
 
 // PatchThumbnail 更新项目缩略图（文档：PATCH /api/projects/{uuid}/thumbnail）。

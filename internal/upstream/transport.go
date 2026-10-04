@@ -24,7 +24,6 @@ import (
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
-	"github.com/bogdanfinn/tls-client/profiles"
 
 	"github.com/oai-prism/oaiprism/internal/sentinel"
 )
@@ -72,26 +71,24 @@ func New(o Options) (*Transport, error) {
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
-	prof := o.Profile
-	if prof == nil && o.ProfilePath != "" {
-		p, err := sentinel.LoadProfile(o.ProfilePath)
+	var prof *sentinel.Profile
+	if o.Signer != nil {
+		prof = o.Signer.Profile()
+	} else {
+		p, err := loadProfile(o)
 		if err != nil {
-			return nil, fmt.Errorf("读取 Sentinel 指纹失败: %w", err)
+			return nil, err
 		}
 		prof = p
 	}
-	if prof == nil {
-		prof = sentinel.DefaultProfile()
-	}
-	api, err := newClient(o.Proxy, nil)
+	api, err := newClient(o.Proxy, nil, prof)
 	if err != nil {
 		return nil, err
 	}
 	t := &Transport{api: api, profile: prof, log: o.Logger, sessions: map[string]*session{}}
 	t.signer = o.Signer
 	if t.signer == nil {
-		jar := tls_client.NewCookieJar()
-		sc, err := newClient(o.Proxy, jar)
+		sc, err := newClient(o.Proxy, tls_client.NewCookieJar(), prof)
 		if err != nil {
 			return nil, err
 		}
@@ -101,15 +98,31 @@ func New(o Options) (*Transport, error) {
 		if err != nil {
 			return nil, err
 		}
-	} else {
-		t.profile = t.signer.Profile()
 	}
 	return t, nil
 }
 
-func newClient(proxy string, jar tls_client.CookieJar) (tls_client.HttpClient, error) {
+func loadProfile(o Options) (*sentinel.Profile, error) {
+	if o.Profile != nil {
+		return o.Profile, nil
+	}
+	if o.ProfilePath != "" {
+		p, err := sentinel.LoadProfile(o.ProfilePath)
+		if err != nil {
+			return nil, fmt.Errorf("读取 Sentinel 指纹失败: %w", err)
+		}
+		return p, nil
+	}
+	return sentinel.DefaultProfile(), nil
+}
+
+// newClient 建一个与指纹同版本的 Chrome TLS 客户端。扩展顺序每个连接随机打乱：
+// Chrome 110 起就是这样（JA3 每次都变，JA4 不变），固定顺序反而一眼看出不是 Chrome。
+func newClient(proxy string, jar tls_client.CookieJar, p *sentinel.Profile) (tls_client.HttpClient, error) {
+	_, tmpl := tlsTemplate(p)
 	opts := []tls_client.HttpClientOption{
-		tls_client.WithClientProfile(profiles.Chrome_152),
+		tls_client.WithClientProfile(tmpl),
+		tls_client.WithRandomTLSExtensionOrder(),
 		tls_client.WithNotFollowRedirects(),
 		tls_client.WithTimeoutSeconds(0), // 流式与长轮询由 context 控制
 		tls_client.WithTransportOptions(&tls_client.TransportOptions{DisableCompression: true}),
@@ -174,7 +187,9 @@ func (t *Transport) header(req *http.Request) (http.Header, error) {
 		hdr[k] = append([]string(nil), vs...)
 	}
 	t.browserHeaders(hdr)
-	if !isPrismHost(req.URL) {
+	if !isPrismHost(req.URL) || strings.HasPrefix(req.URL.Path, "/y/") {
+		// 别家站点不带 Prism 的 Cookie；Y-Sweet 文档接口（/y/d/<id>/…）只认文档令牌
+		// （Authorization: Bearer），也不要 Sentinel
 		hdr.Del("Cookie")
 		return hdr, nil
 	}
@@ -448,19 +463,16 @@ func Shared(o Options) (*Transport, error) {
 		return t, nil
 	}
 	if shared.signer == nil {
-		prof := o.Profile
-		if prof == nil && o.ProfilePath != "" {
-			p, err := sentinel.LoadProfile(o.ProfilePath)
-			if err != nil {
-				return nil, fmt.Errorf("读取 Sentinel 指纹失败: %w", err)
-			}
-			prof = p
-		}
-		if prof == nil {
-			prof = sentinel.DefaultProfile()
+		prof, err := loadProfile(o)
+		if err != nil {
+			return nil, err
 		}
 		if o.Logger == nil {
 			o.Logger = slog.Default()
+		}
+		o.Logger.Info("浏览器指纹", "profile", sentinel.Describe(prof), "tls", TLSTemplate(prof))
+		if msg := sentinel.Staleness(prof, time.Now()); msg != "" {
+			o.Logger.Warn(msg)
 		}
 		cacheDir := o.CacheDir
 		if cacheDir == "" {
@@ -468,7 +480,7 @@ func Shared(o Options) (*Transport, error) {
 				cacheDir = filepath.Join(d, "oaiprism")
 			}
 		}
-		sc, err := newClient(o.Proxy, tls_client.NewCookieJar())
+		sc, err := newClient(o.Proxy, tls_client.NewCookieJar(), prof)
 		if err != nil {
 			return nil, err
 		}

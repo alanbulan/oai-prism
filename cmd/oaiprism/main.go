@@ -44,6 +44,7 @@ const usage = `oaiprism - OpenAI Prism 高性能反向代理
   import           把 Cookie / Token 写入凭据文件并验证
   capture-summary  汇总抓包文件，输出各端点的协议字段清单
   sentinel         自检纯 Go 的 Sentinel 签发（只连 sentinel.openai.com，不用账号）
+  profile          查看 / 更新浏览器指纹（-capture 用本机 Chrome 重新采集，-bump 只改版本号）
   version          打印版本
 
 示例:
@@ -52,6 +53,7 @@ const usage = `oaiprism - OpenAI Prism 高性能反向代理
   oaiprism import -access-token "eyJhbGci..." -id main2
   oaiprism probe -config configs/config.yaml
   oaiprism capture-summary -file captures/capture-2026-09-16.jsonl
+  oaiprism profile -capture
 `
 
 func main() {
@@ -74,6 +76,8 @@ func main() {
 		err = cmdSummary(args)
 	case "sentinel":
 		err = cmdSentinel(args)
+	case "profile":
+		err = cmdProfile(args)
 	case "version", "-v", "--version":
 		fmt.Printf("oaiprism %s\n", version)
 	case "help", "-h", "--help":

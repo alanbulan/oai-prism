@@ -30,6 +30,9 @@ type responsesTurn struct {
 	execKind     string
 	isAux        bool
 
+	// nativePatch：客户端在 exec 脚本里提供 tools.apply_patch（见 applypatch.go）。
+	nativePatch bool
+
 	// compaction 标识 Codex 的上下文压缩请求（见 codexRequestKind）：
 	// 回复只能是摘要正文，不能变成工具调用。
 	compaction bool
@@ -118,6 +121,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		execToolName: ExecToolName(rawFields),
 		execKind:     ExecToolKind(rawFields),
 		compaction:   compaction,
+		nativePatch:  hasNativeApplyPatch(rawFields),
 	}
 	// 桥判定诊断：CLI 有两条工具声明路径（use_responses_lite 决定）——
 	// true 走 input 里的 additional_tools 条目，false 走顶层 tools 字段。
@@ -594,7 +598,8 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 // 把变更合成为本地落盘命令（经 sessionChainFilterNewDeltaFiles 去重，防止跨轮重复合成死循环）。
 func (h *Handler) bridgeExecJS(r *http.Request, turn *responsesTurn, text string, res *RunResult) string {
 	if js0, ok := extractExecBlock(text); ok {
-		return ensureExecJS(js0)
+		isWin := strings.Contains(strings.ToLower(r.UserAgent()), "windows")
+		return ensureExecJS(rewriteApplyPatch(js0, turn.nativePatch, isWin, turn.execKind == "function"))
 	}
 	if res == nil || len(res.DeltaFiles) == 0 {
 		return ""

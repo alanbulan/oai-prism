@@ -125,6 +125,13 @@ func TestHeaderNoProofAndOtherHosts(t *testing.T) {
 	if h.Get("Cookie") != "" || h.Get(SentinelHeader) != "" {
 		t.Fatal("其他域名不该带 Prism 的 Cookie 与 Sentinel token")
 	}
+	// Y-Sweet 文档接口：保留文档令牌，不拼账号 Cookie
+	req, _ = http.NewRequest("POST", "https://prism.openai.com/y/d/doc1/update", nil)
+	req.Header.Set("Authorization", "Bearer ysweet-token")
+	h, _ = tr.header(req)
+	if h.Get("Authorization") != "Bearer ysweet-token" || h.Get("Cookie") != "" || h.Get(SentinelHeader) != "" {
+		t.Fatalf("Y-Sweet 请求头不对: %v", h)
+	}
 }
 
 func TestToResponseDecompresses(t *testing.T) {

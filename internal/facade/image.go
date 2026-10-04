@@ -12,6 +12,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path"
+	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -211,18 +214,21 @@ type uploadCache struct {
 	ttl time.Duration
 	mu  sync.Mutex
 	m   map[string]uploadEntry
+
+	// projects：项目 → 最近一次登记新文件的时刻（决定沙箱要不要换新，见 Runner.runOnce）。
+	projects map[string]time.Time
 }
 
 type uploadEntry struct {
-	filename string
-	expires  time.Time
+	projectPath string
+	expires     time.Time
 }
 
 func newUploadCache(ttl time.Duration) *uploadCache {
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
 	}
-	return &uploadCache{ttl: ttl, m: make(map[string]uploadEntry, 16)}
+	return &uploadCache{ttl: ttl, m: make(map[string]uploadEntry, 16), projects: map[string]time.Time{}}
 }
 
 func uploadKey(accountID, projectID string, data []byte) string {
@@ -241,10 +247,10 @@ func (c *uploadCache) Get(key string) (string, bool) {
 		delete(c.m, key)
 		return "", false
 	}
-	return e.filename, true
+	return e.projectPath, true
 }
 
-func (c *uploadCache) Put(key, filename string) {
+func (c *uploadCache) Put(key, projectPath string) {
 	if c == nil {
 		return
 	}
@@ -258,99 +264,145 @@ func (c *uploadCache) Put(key, filename string) {
 			}
 		}
 	}
-	c.m[key] = uploadEntry{filename: filename, expires: now.Add(c.ttl)}
+	c.m[key] = uploadEntry{projectPath: projectPath, expires: now.Add(c.ttl)}
 }
 
-// preprocessInputImages 将输入中的图片（data URI / 公网 URL）上传至项目工作区，
-// 并按官方 WebUI 规范转换为 input_file（路径为 /prism-uploads/<filename>），使上游模型能完整读取图片像素。
+// MarkProject 记下项目刚登记了新文件。
+func (c *uploadCache) MarkProject(projectID string) {
+	if c == nil {
+		return
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for p, at := range c.projects {
+		if now.Sub(at) > c.ttl {
+			delete(c.projects, p)
+		}
+	}
+	c.projects[projectID] = now
+}
+
+// LastUpload 返回项目最近一次登记新文件的时刻。
+func (c *uploadCache) LastUpload(projectID string) (time.Time, bool) {
+	if c == nil {
+		return time.Time{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	at, ok := c.projects[projectID]
+	return at, ok
+}
+
+// attachImages 把输入里的图片（data URI / 公网 URL）按官方前端的做法交给上游：
+// 上传到项目、登记进项目文件树的 prism-uploads/ 目录，再以 input_file 引用
+// （project_path 为 /prism-uploads/<文件名>）。
+//
+// 上游不会把 input_image 的像素交给模型（会话里只剩一个 "[image]" 占位），模型看图
+// 靠的是用沙箱工具打开项目里的这个文件；所以文件必须真的出现在沙箱工作区 —— 只上传
+// 不登记的话，沙箱里没有它，模型会说"文件不存在"。登记成功后不再附带 input_image。
+//
 // 返回值 hasUpload 仅在本轮确有**新**上传时为 true（调用方据此重做沙箱同步）。
-func preprocessInputImages(ctx context.Context, client *prism.Client, p prism.Principal, cache *uploadCache, accountID, projectID string, items []prism.InputItem) ([]prism.InputItem, bool) {
-	if len(items) == 0 {
+func (r *Runner) attachImages(ctx context.Context, p prism.Principal, accountID, projectID string, items []prism.InputItem) ([]prism.InputItem, bool) {
+	if len(items) == 0 || projectID == "" || r.client == nil {
 		return items, false
 	}
-
 	var hasUpload bool
 	outItems := make([]prism.InputItem, len(items))
 	for i, item := range items {
 		outItems[i] = item
-		hasImage := false
-		for _, c := range item.Content {
-			if c.Type == "input_image" && c.ImageURL != "" {
-				hasImage = true
-				break
-			}
-		}
-		if !hasImage {
+		if !slices.ContainsFunc(item.Content, func(c prism.InputContent) bool { return c.Type == "input_image" && c.ImageURL != "" }) {
 			continue
 		}
-
 		newContents := make([]prism.InputContent, 0, len(item.Content))
 		for _, c := range item.Content {
 			if c.Type != "input_image" || c.ImageURL == "" {
 				newContents = append(newContents, c)
 				continue
 			}
-
 			data, ext, ok := extractImageData(ctx, c.ImageURL)
 			if !ok || len(data) == 0 {
 				// 取不到（含被安全策略拒绝）就原样交给上游，由上游决定能否访问。
 				newContents = append(newContents, c)
 				continue
 			}
-
-			mime := "image/png"
-			switch ext {
-			case ".jpg", ".jpeg":
-				mime = "image/jpeg"
-			case ".webp":
-				mime = "image/webp"
-			case ".gif":
-				mime = "image/gif"
-			case ".bmp":
-				mime = "image/bmp"
-			}
-
-			// 若当前具备 projectID，上传到项目存储并注入官方 input_file（已传过的直接复用）。
-			if projectID != "" && client != nil {
-				key := uploadKey(accountID, projectID, data)
-				if filename, ok := cache.Get(key); ok {
+			key := uploadKey(accountID, projectID, data)
+			projectPath, cached := r.uploads.Get(key)
+			if !cached {
+				var err error
+				projectPath, err = r.uploadImage(ctx, p, projectID, data, ext)
+				if err != nil {
+					r.log.Warn("图片登记进项目失败，改为内联发送（上游可能看不到图片）", "project", projectID, "err", err)
 					newContents = append(newContents, prism.InputContent{
-						Type: "input_file", Filename: filename, ProjectPath: filename,
+						Type: "input_image", ImageURL: "data:" + imageMIME(ext) + ";base64," + base64.StdEncoding.EncodeToString(data), Detail: c.Detail,
 					})
-				} else {
-					filename := "image_" + randHex(6) + ext
-					err := client.UploadRawProjectFile(ctx, p, projectID, filename, mime, data)
-					if err != nil {
-						// 兜底回退到 multipart 上传
-						_, err = client.UploadFile(ctx, p, prism.FileUpload{
-							ProjectID:   projectID,
-							Path:        filename,
-							Filename:    filename,
-							ContentType: mime,
-							Data:        data,
-						})
-					}
-					if err == nil {
-						hasUpload = true
-						cache.Put(key, filename)
-						newContents = append(newContents, prism.InputContent{
-							Type: "input_file", Filename: filename, ProjectPath: filename,
-						})
-					}
+					continue
 				}
+				hasUpload = true
+				r.uploads.Put(key, projectPath)
+				r.uploads.MarkProject(projectID)
 			}
-
-			// 同时保留原生 input_image（Base64 Data URI），兼顾纯视觉模型与沙箱环境
-			b64 := base64.StdEncoding.EncodeToString(data)
-			newContents = append(newContents, prism.InputContent{
-				Type:     "input_image",
-				ImageURL: "data:" + mime + ";base64," + b64,
-				Detail:   c.Detail,
-			})
+			stripLocalImagePath(newContents)
+			newContents = append(newContents,
+				prism.InputContent{Type: "input_file", Filename: path.Base(projectPath), ProjectPath: projectPath},
+				// 上游把它渲染成 "[project file: /prism-uploads/x.png]"，模型会照字面去开文件系统根下的
+				// /prism-uploads（不存在）；文件其实在沙箱工作目录下
+				prism.InputContent{Type: prism.BlockInputText, Text: attachmentHint(projectPath)},
+			)
 		}
 		outItems[i].Content = newContents
 	}
 	return outItems, hasUpload
+}
+
+// uploadImage 上传图片并登记进项目文件树，返回项目内路径。
+func (r *Runner) uploadImage(ctx context.Context, p prism.Principal, projectID string, data []byte, ext string) (string, error) {
+	filename := "image_" + randHex(6) + ext
+	fileID, err := r.client.UploadRawProjectFile(ctx, p, projectID, filename, imageMIME(ext), data)
+	if err != nil {
+		return "", fmt.Errorf("上传: %w", err)
+	}
+	projectPath, err := r.client.RegisterProjectFile(ctx, p, projectID, fileID, filename)
+	if err != nil {
+		return "", fmt.Errorf("登记进文件树: %w", err)
+	}
+	return projectPath, nil
+}
+
+func imageMIME(ext string) string {
+	switch ext {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
+	case ".gif":
+		return "image/gif"
+	case ".bmp":
+		return "image/bmp"
+	}
+	return "image/png"
+}
+
+// attachmentHint 告诉模型附件在沙箱工作区里的实际位置。
+func attachmentHint(projectPath string) string {
+	rel := strings.TrimPrefix(projectPath, "/")
+	return "(Attached image: view it with your view_image tool at the workspace-relative path `" + rel +
+		"` — relative to your current working directory, not `/" + rel + "` at the filesystem root.)"
+}
+
+// localImagePathRe 匹配 Codex 给图片加的标签里的本机路径：<image name=[Image #1] path="F:\...">。
+var localImagePathRe = regexp.MustCompile(`(<image\b[^>\n]*?)\s+path="[^"\n]*"`)
+
+// stripLocalImagePath 去掉图片标签里的本机路径：上游模型看图只能用沙箱里的项目文件，
+// 看到一个 Windows 本地路径反而会去沙箱里打开它，得到"文件不存在"。
+func stripLocalImagePath(contents []prism.InputContent) {
+	for i := len(contents) - 1; i >= 0; i-- {
+		if contents[i].Type != prism.BlockInputText {
+			continue
+		}
+		contents[i].Text = localImagePathRe.ReplaceAllString(contents[i].Text, "$1")
+		return
+	}
 }
 
 // extractImageData 取图片字节。只支持 data:image/* 与公网 http(s) 链接；

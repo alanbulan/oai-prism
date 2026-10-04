@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/oai-prism/oaiprism/internal/prism"
 )
@@ -105,7 +108,7 @@ func hasPriorToolResult(raw map[string]json.RawMessage) bool {
 		strings.Contains(s, `"function_call_output"`)
 }
 
-func bridgePrompt() string {
+func bridgePrompt(nativePatch bool) string {
 	return strings.Join([]string{
 		"<local_tool_bridge>",
 		`You are the reasoning engine for a LOCAL coding agent (Codex CLI). The client executes ALL tools locally on the user's machine.`,
@@ -115,6 +118,7 @@ func bridgePrompt() string {
 		`2. NEVER USE 'createNewFile' OR BUILT-IN SANDBOX TOOLS: You are strictly forbidden from calling 'createNewFile', 'updateFile', or any internal sandbox tools to create or edit files.`,
 		`3. MANDATORY LOCAL WRITING VIA codex-exec: All requested code, HTML, SVG, scripts, and documents MUST be written directly to the user's LOCAL disk by emitting EXACTLY ONE ` + "```codex-exec" + ` block. This runs locally on the user's client machine.`,
 		`4. ABSOLUTE PROHIBITION ON PROSE COMPLETION CLAIMS: NEVER announce '已创建 <filename>', 'Created <filename>:1', or claim completion without emitting the ` + "```codex-exec" + ` block. Saying a file was created without emitting the exec block is a fatal failure because the user's disk remains completely empty. When a previous tool call was executed and succeeded in [CLIENT RESULT] (such as exit code 0 or "exited successfully with no output"), you MUST recognize that the command ran and its file changes took effect locally on the user's client machine.`,
+		`5. USER ATTACHMENTS ARE THE EXCEPTION: images and files the user attaches are uploaded into the cloud project under /prism-uploads/ and appear as "[project file: /prism-uploads/<name>]". They are NOT on the user's disk. To see an attached image or read an attached file, open it with your built-in read-only tools (view_image / read the file) at the path RELATIVE to your sandbox working directory (e.g. prism-uploads/<name>, not /prism-uploads/<name> at the filesystem root) — that is the only way to see it. Never answer about an attachment without opening it, and never ask the user to upload it again.`,
 		``,
 		`To run any command or create/edit/delete files on the user's machine, output EXACTLY ONE fenced block:`,
 		"```codex-exec",
@@ -129,9 +133,7 @@ func bridgePrompt() string {
 		`- You may await multiple exec_command calls in one block; keep the script small and focused.`,
 		``,
 		`Command recipes (the exec_command cmd runs in the CLIENT's native shell — determine the user's OS from the conversation context; Windows uses PowerShell 7 (pwsh), macOS/Linux use bash):`,
-		`- PREFERRED for creating/editing files: the client's built-in apply_patch. It is intercepted by the CLIENT, so its heredoc is parsed by the client — not by the shell — and behaves identically on every OS. Prefer it over shell redirection:`,
-		"  apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: <path>\n+<line 1>\n+<line 2>\n*** End Patch\nPATCH",
-		`  (every content line must begin with '+'; use '*** Update File: <path>' with @@ hunks to edit an existing file)`,
+		patchRecipe(nativePatch),
 		`- Create/overwrite a file, Windows/PowerShell (single cmd string, newlines allowed):`,
 		"  $c = @'\n<FULL FILE CONTENT>\n'@; Set-Content -LiteralPath '<path>' -Value $c -NoNewline",
 		`  (single-quoted here-string @'...'@ does NOT interpolate; always include the FULL file content)`,
@@ -146,6 +148,27 @@ func bridgePrompt() string {
 		`Output rules: outside the block write at most one short sentence of prose. If no tool is needed, reply normally with no block. Always emit the FULL file content in the command — never abbreviate.`,
 		`Do NOT emit a block for greetings, questions, or small talk, and do NOT run environment checks or "test" commands (like true/echo/ls) to probe the client — emit a block ONLY when the task itself requires an operation on the user's machine.`,
 		"</local_tool_bridge>",
+	}, "\n")
+}
+
+// patchRecipe 是写文件的首选做法。客户端有原生 tools.apply_patch 时直接调它（不经 shell，
+// 任何系统都一样）；没有时 apply_patch 的 heredoc 只有 bash 下会被客户端拦截。
+// 早期这里写的是"apply_patch <<'PATCH' 由客户端拦截、各系统一致"—— Windows 上并不成立，
+// 命令直接进了 PowerShell，报"重定向运算符后缺少文件规范"。
+func patchRecipe(nativePatch bool) string {
+	if nativePatch {
+		return strings.Join([]string{
+			`- PREFERRED for creating/editing files on every OS: the client's native patch tool, called from the block — NOT through the shell:`,
+			"  const patch = String.raw`*** Begin Patch\n*** Add File: <path>\n+<line 1>\n+<line 2>\n*** End Patch`;\n  text(await tools.apply_patch(patch));",
+			"  (write real newlines inside the String.raw template; every added line starts with '+'; edit an existing file with '*** Update File: <path>' and @@ hunks of ' ' context / '-' removed / '+' added lines; if the content itself contains a backtick or ${, build the patch from an array of JSON strings joined with \"\\n\" instead)",
+			"- NEVER run apply_patch as a shell command (`apply_patch <<'PATCH'`): PowerShell has no heredocs and rejects it.",
+		}, "\n")
+	}
+	return strings.Join([]string{
+		"- macOS/Linux only: the client intercepts `apply_patch <<'PATCH'` heredocs (they never reach the shell):",
+		"  apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: <path>\n+<line 1>\n+<line 2>\n*** End Patch\nPATCH",
+		`  (every content line must begin with '+'; use '*** Update File: <path>' with @@ hunks to edit an existing file)`,
+		"- On Windows NEVER use apply_patch heredocs — PowerShell rejects them; use the PowerShell recipe below.",
 	}, "\n")
 }
 
@@ -348,7 +371,7 @@ func osDirective(ua string) string {
 			"Wherever it conflicts with this CLIENT OS FACT, THIS FACT wins. Its shell claim is void for exec_command."
 		return "CLIENT OS FACT: the client machine is Windows. " +
 			"exec_command runs on the CLIENT in Windows PowerShell, which does NOT support bash syntax. " +
-			"NEVER use `cat > file`, `<<'EOF'` heredocs, or `printf >` — they fail instantly with " +
+			"NEVER use `cat > file`, `<<'EOF'` heredocs (including `apply_patch <<'PATCH'`), or `printf >` — they fail instantly with " +
 			"\"重定向运算符后缺少文件规范\". To create/overwrite a file use: " +
 			"`$c = @'...content...'@; Set-Content -LiteralPath '<path>' -Value $c -NoNewline`. " +
 			"CRITICAL WINDOWS LIMIT: Windows CreateProcess fails with 'os error 206 (文件名或扩展名太长)' if a single command line exceeds 32KB. " +
@@ -467,7 +490,7 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 
 	items := make([]prism.InputItem, 0, len(blocks)+2)
 	// OS 事实声明（可能为空）拼在桥指令最前面 —— 越靠前越是"背景事实"。
-	head := bridgePrompt()
+	head := bridgePrompt(strings.Contains(string(raw), "apply_patch(input: string)"))
 	if strings.TrimSpace(defaultSystem) != "" {
 		head = defaultSystem + "\n\n" + head
 	}
@@ -614,7 +637,7 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 }
 
 // localExecReminder 接在最后一条 user 消息末尾（只在本轮出现，进了历史就没有了）。
-const localExecReminder = "\n\n[LOCAL_EXECUTION_REMINDER]: You are running in Codex CLI on the user's LOCAL computer. Cloud sandbox tools ('createNewFile', 'updateFile') are completely disabled. If this task creates, edits, or saves files, you MUST emit a ```codex-exec block with the command and full content to write to the user's local disk. Never use 'createNewFile' and NEVER say '已创建' in prose without the code block."
+const localExecReminder = "\n\n[LOCAL_EXECUTION_REMINDER]: You are running in Codex CLI on the user's LOCAL computer. Cloud sandbox file-writing tools ('createNewFile', 'updateFile') are completely disabled (opening attachments under /prism-uploads/ with your built-in tools is fine). If this task creates, edits, or saves files, you MUST emit a ```codex-exec block with the command and full content to write to the user's local disk. Never use 'createNewFile' and NEVER say '已创建' in prose without the code block."
 
 // bridgeRetryNudge 是"模型没用桥格式"时的自动纠正消息。
 //
@@ -1080,8 +1103,17 @@ func extractQuotedString(s string) (string, bool) {
 				sb.WriteByte('\t')
 			case 'r':
 				sb.WriteByte('\r')
-			case '\\', '"', '\'':
+			case '\\', '"', '\'', '/':
 				sb.WriteByte(c)
+			case 'u':
+				// \uXXXX（JSON 序列化常把 < > & 写成这样），含代理对
+				r, n := decodeUnicodeEscape(s[i+1:])
+				if n == 0 {
+					sb.WriteString(`\u`)
+					break
+				}
+				sb.WriteRune(r)
+				i += n
 			default:
 				sb.WriteByte('\\')
 				sb.WriteByte(c)
@@ -1441,4 +1473,28 @@ func patchFileCmd(rel string, hunks []editHunk, isWindows bool) string {
 		"open(p,'wb').write((b'\\xef\\xbb\\xbf' if bom else b'')+t.encode('utf-8'))\n" +
 		"print('patched',p)\n" +
 		"OAIPRISM_PATCH"
+}
+
+// decodeUnicodeEscape 解析 \u 之后的 4 位十六进制（高代理后紧跟 \uDCxx 时合成一个字符），
+// 返回字符与消耗的字节数；不是合法转义时返回 0。
+func decodeUnicodeEscape(s string) (rune, int) {
+	hex4 := func(h string) (rune, bool) {
+		if len(h) < 4 {
+			return 0, false
+		}
+		v, err := strconv.ParseUint(h[:4], 16, 32)
+		return rune(v), err == nil
+	}
+	r, ok := hex4(s)
+	if !ok {
+		return 0, 0
+	}
+	if utf16.IsSurrogate(r) && len(s) >= 10 && s[4] == '\\' && s[5] == 'u' {
+		if r2, ok := hex4(s[6:]); ok {
+			if c := utf16.DecodeRune(r, r2); c != utf8.RuneError {
+				return c, 10
+			}
+		}
+	}
+	return r, 4
 }

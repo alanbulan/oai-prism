@@ -11,6 +11,9 @@ oaiprism.exe~
 configs/config.yaml
 secrets/*.json
 !secrets/accounts.example.json
+# oaiprism profile 覆盖指纹前留的备份
+secrets/*.bak
+*.json.bak
 # cookies.txt 是浏览器导出的真实登录凭据，同样绝不入库
 secrets/cookies.txt
 secrets/*.txt

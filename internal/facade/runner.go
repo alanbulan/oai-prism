@@ -439,7 +439,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	// 2.3) 处理图片上传：必须在沙箱工作区同步之前上传至项目！
 	var hasNewUpload bool
 	if projectID != "" {
-		inputItems, hasNewUpload = preprocessInputImages(ctx, r.client, p, r.uploads, acct.ID, projectID, inputItems)
+		inputItems, hasNewUpload = r.attachImages(ctx, p, acct.ID, projectID, inputItems)
 	}
 	// 用量按真正发往上游的条目计（图片预处理之后），与上游生成并行计数
 	inputTokens := countInputAsync(inputItems)
@@ -449,9 +449,22 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		inputTokens = countInputAsync(req.Native.conv.logicalItems())
 	}
 
-	// 2.5) 工作区同步：若上传了新文件，强制失效同步状态，触发沙箱拉取最新文件
+	// 2.5) 工作区同步。沙箱只把它第一次同步的那个项目、当时已登记的文件落进工作区 ——
+	// 之后登记的文件、再同步的别的项目的文件都不会出现（2026-10-04 实测：图片登记后重新
+	// 同步，模型 view_image 仍是"文件不存在"；换新沙箱立刻能看到，同一会话也行）。
+	// 所以本项目有图片登记在当前沙箱落盘之后（或沙箱落的是别的项目），就换一个新沙箱。
 	if hasNewUpload {
 		r.sandboxes.InvalidateProject(acct.ID, projectID)
+	}
+	if at, ok := r.uploads.LastUpload(projectID); ok && sb.Usable() && !r.sandboxes.HoldsFiles(acct.ID, projectID, at) {
+		r.sandboxes.InvalidateIf(acct.ID, sb)
+		if fresh, err := r.ensureSandbox(ctx, acct, projectID); err == nil && fresh.Usable() {
+			r.log.Info("项目有新登记的附件，换新沙箱以便它落进工作区", "account", acct.ID, "project", projectID)
+			r.app.SandboxOps.Inc("acquire", "attachments")
+			sb = fresh
+		} else {
+			r.log.Warn("为附件换新沙箱失败，沿用旧沙箱（模型可能看不到附件）", "account", acct.ID, "err", err)
+		}
 	}
 	if sb.Usable() && projectID != "" {
 		var outcome syncOutcome

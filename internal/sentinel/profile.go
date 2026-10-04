@@ -1,10 +1,13 @@
 package sentinel
 
 import (
+	"bytes"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -21,6 +24,15 @@ type Profile struct {
 	Window         Window          `json:"window"`
 	FontMetrics    json.RawMessage `json:"fontMetrics"`
 	SentinelOrigin string          `json:"sentinelOrigin"`
+	CapturedAt     string          `json:"capturedAt,omitempty"` // 采集日期 2006-01-02，用来提醒指纹过时
+	TLS            *TLSInfo        `json:"tls,omitempty"`
+}
+
+// TLSInfo 是 TLS 握手里随这台浏览器而变、模板给不准的部分（采集时从 Chrome 的 ClientHello 里取）。
+type TLSInfo struct {
+	// TrustAnchors 是 trust_anchors 扩展（0xca34）的内容（十六进制，含开头的长度）：Chrome 根证书库
+	// 里的信任锚 ID 列表。它随根证书库更新而变，与 Chrome 版本无关，所以按本机实测的原样发。
+	TrustAnchors string `json:"trustAnchors,omitempty"`
 }
 
 type Timezone struct {
@@ -109,11 +121,42 @@ func parseProfile(raw []byte) (*Profile, error) {
 	if len(p.Window.Keys) == 0 || len(p.Navigator.Languages) == 0 || p.Page.Href == "" {
 		return nil, fmt.Errorf("缺少 window.keys / navigator.languages / page.href")
 	}
+	if p.TLS != nil && p.TLS.TrustAnchors != "" {
+		if b, err := hex.DecodeString(p.TLS.TrustAnchors); err != nil || len(b) < 2 || int(b[0])<<8|int(b[1]) != len(b)-2 {
+			return nil, fmt.Errorf("tls.trustAnchors 格式不对")
+		}
+	}
 	if p.SentinelOrigin == "" {
 		p.SentinelOrigin = "https://sentinel.openai.com"
 	}
 	return &p, nil
 }
+
+// Save 把指纹写成 JSON（覆盖前把旧文件留作 .bak）。
+func (p *Profile) Save(path string) error {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", " ")
+	if err := enc.Encode(p); err != nil {
+		return err
+	}
+	if _, err := parseProfile(b.Bytes()); err != nil {
+		return fmt.Errorf("生成的指纹不完整: %w", err)
+	}
+	if old, err := os.ReadFile(path); err == nil {
+		if err := os.WriteFile(path+".bak", old, 0o600); err != nil {
+			return err
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, b.Bytes(), 0o600)
+}
+
+// Clone 返回一份深拷贝。
+func (p *Profile) Clone() *Profile { return p.clone() }
 
 func (p *Profile) clone() *Profile {
 	raw, _ := json.Marshal(p)

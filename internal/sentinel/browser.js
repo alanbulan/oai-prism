@@ -282,7 +282,13 @@ globalThis.__sentinelBoot = function (profileJSON, host) {
         define(o, "brands", { get: () => ua.brands.map((b) => Object.assign({}, b)), enumerable: true });
         define(o, "mobile", { get: () => false, enumerable: true });
         define(o, "platform", { get: () => ua.platform, enumerable: true });
-        define(o, "getHighEntropyValues", { value: fnLike("getHighEntropyValues", (hints) => Promise.resolve(Object.assign({ brands: ua.brands, mobile: false, platform: ua.platform }, ua.highEntropy || {}))) });
+        // 与 Chrome 一样：总带 brands / mobile / platform，其余只给请求了的
+        define(o, "getHighEntropyValues", { value: fnLike("getHighEntropyValues", (hints) => {
+          const out = { brands: ua.brands.map((b) => Object.assign({}, b)), mobile: false, platform: ua.platform };
+          const he = ua.highEntropy || {};
+          for (const h of Array.from(hints || [])) if (Object.prototype.hasOwnProperty.call(he, h)) out[h] = JSON.parse(JSON.stringify(he[h]));
+          return Promise.resolve(out);
+        }) });
         define(o, "toJSON", { value: fnLike("toJSON", () => ({ brands: ua.brands, mobile: false, platform: ua.platform })) });
         return o;
       }
