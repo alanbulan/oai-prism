@@ -91,7 +91,11 @@ type Credential struct {
 	// ExpiresAt 是 access token 的过期时间；零值表示未知。
 	ExpiresAt time.Time
 
-	// Headers 是账号级附加头（设备指纹等）。
+	// OAuthClientID 是签发 RefreshToken 的 OAuth client；空值时刷新用全局 creds.oauth_client_id。
+	// 只用于本地刷新，绝不随请求发往上游。
+	OAuthClientID string
+
+	// Headers 是账号级附加头（设备指纹等），会原样转发给上游。
 	Headers map[string]string
 
 	// Source 记录凭据来源，便于排障：static / file / env / passthrough / oauth。
@@ -190,16 +194,17 @@ func (c *Credential) Clone() *Credential {
 // FromAccountConfig 把配置里的账号定义转成初始凭据。
 func FromAccountConfig(a config.AccountConfig) *Credential {
 	c := &Credential{
-		AccountID:    a.AccountID,
-		Email:        a.Email,
-		Plan:         a.Plan,
-		AccessToken:  strings.TrimSpace(a.AccessToken),
-		RefreshToken: strings.TrimSpace(a.RefreshToken),
-		SessionToken: strings.TrimSpace(a.SessionToken),
-		CookieHeader: strings.TrimSpace(a.Cookies),
-		Headers:      a.Headers,
-		Source:       "static",
-		UpdatedAt:    time.Now(),
+		AccountID:     a.AccountID,
+		Email:         a.Email,
+		Plan:          a.Plan,
+		AccessToken:   strings.TrimSpace(a.AccessToken),
+		RefreshToken:  strings.TrimSpace(a.RefreshToken),
+		SessionToken:  strings.TrimSpace(a.SessionToken),
+		CookieHeader:  strings.TrimSpace(a.Cookies),
+		OAuthClientID: a.EffectiveOAuthClientID(),
+		Headers:       upstreamHeaders(a.Headers),
+		Source:        "static",
+		UpdatedAt:     time.Now(),
 	}
 	if c.RefreshToken != "" {
 		c.Source = "oauth"
@@ -255,6 +260,32 @@ func FromAccountConfig(a config.AccountConfig) *Credential {
 		c.applyJWT(strings.TrimPrefix(c.AccessToken, "Bearer "))
 	}
 	return c
+}
+
+// upstreamHeaders 返回要随请求转发给上游的账号级附加头：剔除旧版混在里面的
+// oauth_client_id（本地刷新用的元数据，已由 EffectiveOAuthClientID 读走）。
+// 不修改入参 —— 它可能是配置里共享的 map。
+func upstreamHeaders(h map[string]string) map[string]string {
+	drop := false
+	for k := range h {
+		if strings.EqualFold(k, config.LegacyOAuthClientIDHeader) {
+			drop = true
+			break
+		}
+	}
+	if !drop {
+		return h
+	}
+	out := make(map[string]string, len(h))
+	for k, v := range h {
+		if !strings.EqualFold(k, config.LegacyOAuthClientIDHeader) {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // applyJWT 解析 JWT payload（不验签，只取声明）。

@@ -36,6 +36,28 @@ type Pool struct {
 	sticky   *stickyMap
 
 	rr atomic.Uint64
+
+	// onRefreshed 在凭据刷新成功后同步调用（见 SetOnRefreshed）。
+	onRefreshed atomic.Pointer[RefreshHook]
+}
+
+// RefreshHook 接收刷新成功后的新凭据。id 为账号 ID。
+type RefreshHook func(id string, c *creds.Credential)
+
+// SetOnRefreshed 注册刷新成功回调（传 nil 取消）。
+//
+// 用于把新凭据写回持久化存储：OpenAI 每次刷新都会轮换 refresh_token，
+// 只放内存的话，重启后读回的是已被消费的旧 refresh_token，账号直接报废。
+//
+// 回调在刷新所在的 goroutine 内、单飞标记释放之前同步执行 —— 同一账号的
+// 回调因此严格串行、按刷新先后落盘，不会出现旧 token 后写覆盖新 token。
+// 回调应尽快返回（一次单行 UPDATE 量级），期间同账号的刷新等待者会被阻塞。
+func (p *Pool) SetOnRefreshed(fn RefreshHook) {
+	if fn == nil {
+		p.onRefreshed.Store(nil)
+		return
+	}
+	p.onRefreshed.Store(&fn)
 }
 
 // NewPool 按配置构建账号池。
@@ -566,6 +588,23 @@ func (p *Pool) RefreshAccount(ctx context.Context, r *creds.Refresher, a *Accoun
 		"source", next.Source,
 		"expires_at", next.ExpiresAt.UTC().Format(time.RFC3339),
 		"plan", next.Plan)
+
+	if fn := p.onRefreshed.Load(); fn != nil {
+		(*fn)(a.ID, next)
+	}
+
+	// 刷新途中池可能被整体重建（Dashboard 编辑账号会从 SQLite 重新 Build），
+	// 新池里同 ID 的账号读到的是回写之前的库内值，仍持有刚被消费掉的
+	// refresh_token —— 它下次刷新必然 invalid_grant。把新凭据移植过去。
+	// 仅在对方持有的恰好是"刚花掉的那枚"时才移植：用户在此期间手工换了
+	// refresh_token 的话不能覆盖。
+	if cur != nil && cur.RefreshToken != "" {
+		if b := p.Get(a.ID); b != nil && b != a {
+			if bc := b.Credential(); bc != nil && bc.RefreshToken == cur.RefreshToken {
+				b.StoreCredential(next)
+			}
+		}
+	}
 	return next, nil
 }
 

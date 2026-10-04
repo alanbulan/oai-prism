@@ -393,7 +393,8 @@ func (s *Server) completeOAuthLogin(sess *oauthSession, code string) (string, er
 		Tags:         []string{"oauth"},
 		// refresh_token 与签发它的 client 绑定：导入用的哪个 client，
 		// 这个账号的刷新也必须用哪个 —— 逐账号记录，避免全局混用。
-		Headers: map[string]string{"oauth_client_id": sess.ClientID},
+		// 不放进 Headers：Headers 会原样转发给上游。
+		OAuthClientID: sess.ClientID,
 	}
 	if email != "" {
 		acct.Name = email

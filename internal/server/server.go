@@ -81,6 +81,10 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		if dbAccounts, err := sqliteStore.Load(); err == nil && len(dbAccounts) > 0 {
 			fileAccounts = dbAccounts
 		}
+		// 刷新后的凭据写回 SQLite：refresh_token 每次刷新都会轮换，不落盘的话
+		// 重启（或 Dashboard 编辑触发的整池重建）后读回的是已作废的旧值。
+		// 只 UPDATE token 列，不碰 Dashboard 编辑的 name / tags / max_concurrency。
+		pool.SetOnRefreshed(account.NewRefreshPersister(sqliteStore, cfg.Creds.PersistRefreshMin, log).Persist)
 	}
 
 	if len(fileAccounts) > 0 {

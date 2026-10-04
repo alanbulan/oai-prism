@@ -160,6 +160,7 @@ func (s *Store) Persist(list []config.AccountConfig) error {
 			SessionToken:   a.SessionToken,
 			AccessToken:    a.AccessToken,
 			RefreshToken:   a.RefreshToken,
+			OAuthClientID:  a.OAuthClientID,
 			AccountID:      a.AccountID,
 			Email:          a.Email,
 			Plan:           a.Plan,
@@ -224,6 +225,7 @@ type fileAccount struct {
 	SessionToken   string            `json:"session_token"`
 	AccessToken    string            `json:"access_token"`
 	RefreshToken   string            `json:"refresh_token"`
+	OAuthClientID  string            `json:"oauth_client_id,omitempty"`
 	ExpiresAt      string            `json:"expires_at"`
 	AccountID      string            `json:"account_id"`
 	Email          string            `json:"email"`
@@ -284,6 +286,7 @@ func ParseAccounts(raw []byte) ([]config.AccountConfig, error) {
 			SessionToken:   str(m, "sessiontoken", "session"),
 			AccessToken:    str(m, "accesstoken", "token", "jwt", "bearertoken"),
 			RefreshToken:   str(m, "refreshtoken"),
+			OAuthClientID:  str(m, "oauthclientid"),
 			AccountID:      str(m, "accountid", "chatgptaccountid", "deviceid"),
 			Email:          str(m, "email"),
 			Plan:           str(m, "plan", "plantype"),
