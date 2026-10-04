@@ -238,13 +238,35 @@ type fileAccount struct {
 	UpdatedAt      string            `json:"updated_at,omitempty"`
 }
 
-// ParseAccounts 同时接受两种写法：
-//   - {"accounts":[...]}   推荐，可带元数据
+// ParseAccounts 解析凭据文件，同时接受几种写法：
+//   - {"accounts":[...]}   推荐，可带元数据（其它网关的导出文件也是这个形状）
 //   - [...]                裸数组，手写更省事
+//   - {...}                单个账号
 //
 // 并且字段名大小写/下划线不敏感，"access_token" / "accessToken" / "Access-Token" 都能识别。
 // 这是刻意的宽容：凭据文件是用户手写的，让人对着文档数下划线是糟糕的体验。
+// 没写 id 的账号按位置编号（file-1、file-2…），没写名字的用 id。
 func ParseAccounts(raw []byte) ([]config.AccountConfig, error) {
+	list, err := ParseAccountList(raw)
+	if err != nil {
+		return nil, err
+	}
+	for i := range list {
+		if list[i].ID == "" {
+			list[i].ID = fmt.Sprintf("file-%d", i+1)
+		}
+		if list[i].Name == "" {
+			list[i].Name = list[i].ID
+		}
+	}
+	return list, nil
+}
+
+// ParseAccountList 与 ParseAccounts 相同，但不补默认 id / 名字（由调用方决定，见管理端导入）。
+//
+// 认得 sub2api 一类网关的导出格式：账号的凭据放在嵌套的 credentials 对象里
+//（access_token、refresh_token、email、plan_type…），platform 标明平台。
+func ParseAccountList(raw []byte) ([]config.AccountConfig, error) {
 	raw = []byte(strings.TrimSpace(string(raw)))
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
@@ -258,11 +280,14 @@ func ParseAccounts(raw []byte) ([]config.AccountConfig, error) {
 	case '[':
 		err = json.Unmarshal(raw, &rawAccounts)
 	case '{':
-		var probe struct {
-			Accounts []json.RawMessage `json:"accounts"`
+		var probe map[string]json.RawMessage
+		if err = json.Unmarshal(raw, &probe); err != nil {
+			break
 		}
-		if err = json.Unmarshal(raw, &probe); err == nil {
-			rawAccounts = probe.Accounts
+		if list, ok := probe["accounts"]; ok {
+			err = json.Unmarshal(list, &rawAccounts)
+		} else if len(probe) > 0 {
+			rawAccounts = []json.RawMessage{raw}
 		}
 	default:
 		return nil, fmt.Errorf("无法识别的 JSON 结构")
@@ -277,44 +302,123 @@ func ParseAccounts(raw []byte) ([]config.AccountConfig, error) {
 		if err != nil {
 			return nil, fmt.Errorf("第 %d 个账号: %w", i+1, err)
 		}
-		ac := config.AccountConfig{
-			ID:             str(m, "id"),
-			Name:           str(m, "name"),
-			Cookies:        str(m, "cookies", "cookie"),
-			SessionToken:   str(m, "sessiontoken", "session"),
-			AccessToken:    str(m, "accesstoken", "token", "jwt", "bearertoken"),
-			RefreshToken:   str(m, "refreshtoken"),
-			AccountID:      str(m, "accountid", "chatgptaccountid", "deviceid"),
-			Email:          str(m, "email"),
-			Plan:           str(m, "plan", "plantype"),
-			Proxy:          str(m, "proxy"),
-			MaxConcurrency: integer(m, "maxconcurrency", "concurrency"),
-			RatePerSecond:  number(m, "ratepersecond", "rate"),
-			RateBurst:      integer(m, "rateburst", "burst"),
-			Weight:         integer(m, "weight"),
-			Tags:           strs(m, "tags"),
-		}
-		if ac.ID == "" {
-			ac.ID = fmt.Sprintf("file-%d", i+1)
-		}
-		if ac.Name == "" {
-			ac.Name = ac.ID
-		}
-		if v, ok := boolp(m, "enabled"); ok {
-			ac.Enabled = &v
-		}
-		if cm := strmap(m, "cookiemap"); cm != nil {
-			ac.CookieMap = cm
-		}
-		if hm := strmap(m, "headers"); hm != nil {
-			ac.Headers = hm
-		}
-		if ts := str(m, "expiresat"); ts != "" {
-			if t, err := time.Parse(time.RFC3339, ts); err == nil {
-				ac.ExpiresAt = &t
-			}
+		ac, err := accountFromMap(m)
+		if err != nil {
+			return nil, fmt.Errorf("第 %d 个账号: %w", i+1, err)
 		}
 		out = append(out, ac)
+	}
+	return out, nil
+}
+
+// accountFromMap 把归一化 key 的账号对象转成配置。
+func accountFromMap(m map[string]any) (config.AccountConfig, error) {
+	// 导出格式：凭据在 credentials 里，外层的 concurrency / priority / extra 是导出方自己的
+	// 调度参数，不照搬 —— 那边常设 10 并发，Prism 对同一账号的并发很敏感，沿用本网关的默认值。
+	if creds, ok := m["credentials"].(map[string]any); ok {
+		if p := str(m, "platform"); p != "" && !strings.EqualFold(p, "openai") {
+			return config.AccountConfig{}, fmt.Errorf("不是 OpenAI 账号（platform=%s）", p)
+		}
+		flat := make(map[string]any, len(creds)+4)
+		for k, v := range creds {
+			flat[normKey(k)] = v
+		}
+		for _, k := range []string{"id", "name", "enabled", "tags", "proxy"} {
+			if v, ok := m[k]; ok {
+				flat[k] = v
+			}
+		}
+		if len(strs(flat, "tags")) == 0 && strings.EqualFold(str(m, "type"), "oauth") {
+			flat["tags"] = []any{"oauth"}
+		}
+		m = flat
+	}
+
+	ac := config.AccountConfig{
+		ID:             str(m, "id"),
+		Name:           str(m, "name"),
+		Cookies:        str(m, "cookies", "cookie"),
+		SessionToken:   str(m, "sessiontoken", "session"),
+		AccessToken:    str(m, "accesstoken", "token", "jwt", "bearertoken"),
+		RefreshToken:   str(m, "refreshtoken"),
+		AccountID:      str(m, "accountid", "chatgptaccountid", "deviceid"),
+		Email:          str(m, "email"),
+		Plan:           str(m, "plan", "plantype"),
+		Proxy:          str(m, "proxy"),
+		MaxConcurrency: integer(m, "maxconcurrency", "concurrency"),
+		RatePerSecond:  number(m, "ratepersecond", "rate"),
+		RateBurst:      integer(m, "rateburst", "burst"),
+		Weight:         integer(m, "weight"),
+		Tags:           strs(m, "tags"),
+	}
+	if v, ok := boolp(m, "enabled"); ok {
+		ac.Enabled = &v
+	}
+	if cm := strmap(m, "cookiemap"); cm != nil {
+		ac.CookieMap = cm
+	}
+	if hm := strmap(m, "headers"); hm != nil {
+		ac.Headers = hm
+	}
+	if ts := str(m, "expiresat"); ts != "" {
+		if t, err := time.Parse(time.RFC3339, ts); err == nil {
+			ac.ExpiresAt = &t
+		}
+	}
+	return ac, nil
+}
+
+// HasCredentials 判断账号配置里有没有任何能用来认证的东西。
+func HasCredentials(a config.AccountConfig) bool {
+	return a.AccessToken != "" || a.RefreshToken != "" || a.SessionToken != "" ||
+		a.Cookies != "" || len(a.CookieMap) > 0
+}
+
+// MergeAccountPatch 把管理端的部分更新（只含要改的字段，字段名同样宽容）合并到已有账号上。
+//
+// 必须逐字段合并：整体反序列化时没给的字段都是零值，存回去就把已有的标签、并发上限
+// 覆盖掉了（Dashboard 的编辑框只发 name / email / plan / max_concurrency）。
+func MergeAccountPatch(base config.AccountConfig, raw []byte) (config.AccountConfig, error) {
+	m, err := decodeLoose(raw)
+	if err != nil {
+		return base, err
+	}
+	has := func(keys ...string) bool {
+		for _, k := range keys {
+			if _, ok := m[k]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	out := base
+	if has("name") {
+		out.Name = str(m, "name")
+	}
+	if has("email") {
+		out.Email = str(m, "email")
+	}
+	if has("plan", "plantype") {
+		out.Plan = str(m, "plan", "plantype")
+	}
+	if has("maxconcurrency", "concurrency") {
+		out.MaxConcurrency = integer(m, "maxconcurrency", "concurrency")
+	}
+	if has("tags") {
+		out.Tags = strs(m, "tags")
+	}
+	// 凭据只在给了非空值时替换（SaveAccount 对空凭据本来就保留旧值）
+	for _, f := range []struct {
+		dst  *string
+		keys []string
+	}{
+		{&out.Cookies, []string{"cookies", "cookie"}},
+		{&out.AccessToken, []string{"accesstoken", "token", "jwt", "bearertoken"}},
+		{&out.RefreshToken, []string{"refreshtoken"}},
+	} {
+		if v := str(m, f.keys...); v != "" {
+			*f.dst = v
+		}
 	}
 	return out, nil
 }

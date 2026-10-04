@@ -366,30 +366,49 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 	})
 
 	// POST /admin/accounts: 创建/批量导入账号并持久化至 SQLite
+	//
+	// 请求体按凭据文件的宽容规则解析（account.ParseAccountList）：账号对象、数组、
+	// {"accounts":[…]}，以及其它网关（sub2api 等）的导出文件都认，字段名不分大小写与下划线。
+	// 早先直接反序列化进 config.AccountConfig —— 它没有 json tag，Dashboard 发的
+	// access_token / refresh_token 全被静默丢掉，导入出来的账号只剩名字。
 	mux.HandleFunc("POST /admin/accounts", func(w http.ResponseWriter, r *http.Request) {
-		var body json.RawMessage
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeAdminErr(w, http.StatusBadRequest, "解析请求 JSON 失败: "+err.Error())
+		body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+		if err != nil {
+			writeAdminErr(w, http.StatusBadRequest, "读取请求失败: "+err.Error())
 			return
 		}
-
-		var single config.AccountConfig
-		var batch []config.AccountConfig
-
-		if err := json.Unmarshal(body, &batch); err != nil {
-			if err2 := json.Unmarshal(body, &single); err2 != nil {
-				writeAdminErr(w, http.StatusBadRequest, "请求体需为账号对象或账号数组: "+err.Error())
+		batch, err := account.ParseAccountList(body)
+		if err != nil {
+			writeAdminErr(w, http.StatusBadRequest, "解析账号失败: "+err.Error())
+			return
+		}
+		if len(batch) == 0 {
+			writeAdminErr(w, http.StatusBadRequest, "请求里没有账号")
+			return
+		}
+		for i, a := range batch {
+			if !account.HasCredentials(a) {
+				writeAdminErr(w, http.StatusBadRequest, fmt.Sprintf("第 %d 个账号没有任何凭据（access_token / refresh_token / cookies）", i+1))
 				return
 			}
-			batch = []config.AccountConfig{single}
 		}
 
+		var ids []string
 		if s.sqlite != nil {
-			for _, a := range batch {
-				if err := s.sqlite.SaveAccount(a); err != nil {
+			existing, _ := s.sqlite.Load()
+			for i := range batch {
+				a := &batch[i]
+				if a.ID == "" {
+					a.ID = importedAccountID(existing, *a)
+				}
+				if a.Name == "" {
+					a.Name = a.Email
+				}
+				if err := s.sqlite.SaveAccount(*a); err != nil {
 					writeAdminErr(w, http.StatusInternalServerError, "保存至 SQLite 失败: "+err.Error())
 					return
 				}
+				ids = append(ids, a.ID)
 			}
 			_ = s.syncPoolFromSQLite()
 		}
@@ -399,6 +418,7 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status":  "ok",
 			"created": len(batch),
+			"ids":     ids,
 			"total":   s.pool.Size(),
 		})
 	})
@@ -432,14 +452,35 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 			return
 		}
 
-		var update config.AccountConfig
-		if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
-			writeAdminErr(w, http.StatusBadRequest, "解析修改数据失败: "+err.Error())
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			writeAdminErr(w, http.StatusBadRequest, "读取请求失败: "+err.Error())
 			return
 		}
-		update.ID = id
 
 		if s.sqlite != nil {
+			list, err := s.sqlite.Load()
+			if err != nil {
+				writeAdminErr(w, http.StatusInternalServerError, "读取 SQLite 失败: "+err.Error())
+				return
+			}
+			var cur *config.AccountConfig
+			for i := range list {
+				if list[i].ID == id {
+					cur = &list[i]
+				}
+			}
+			if cur == nil {
+				writeAdminErr(w, http.StatusNotFound, "账号不存在: "+id)
+				return
+			}
+			// 只改请求里给了的字段：Dashboard 编辑框不发 tags，整体覆盖会把标签清空
+			update, err := account.MergeAccountPatch(*cur, body)
+			if err != nil {
+				writeAdminErr(w, http.StatusBadRequest, "解析修改数据失败: "+err.Error())
+				return
+			}
+			update.ID = id
 			if err := s.sqlite.SaveAccount(update); err != nil {
 				writeAdminErr(w, http.StatusInternalServerError, "更新 SQLite 失败: "+err.Error())
 				return
@@ -1055,6 +1096,19 @@ func (s *Server) Close() error {
 }
 
 // syncPoolFromSQLite 从 SQLite 读取全量账号并重新热加载至账号池。
+// importedAccountID 给导入时没写 id 的账号定 id：凭据与已有账号相同（同一个号再导一次）
+// 就沿用它的 id 覆盖更新，否则新起一个。
+func importedAccountID(existing []config.AccountConfig, a config.AccountConfig) string {
+	for _, e := range existing {
+		if (a.RefreshToken != "" && e.RefreshToken == a.RefreshToken) ||
+			(a.AccessToken != "" && e.AccessToken == a.AccessToken) ||
+			(a.Cookies != "" && e.Cookies == a.Cookies) {
+			return e.ID
+		}
+	}
+	return "acc-" + oauthRandomHex(4)
+}
+
 func (s *Server) syncPoolFromSQLite() error {
 	if s.sqlite == nil {
 		return nil

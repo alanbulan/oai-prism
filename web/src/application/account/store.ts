@@ -123,40 +123,32 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     const text = input.rawText.trim();
     if (!text) throw new Error('导入内容不能为空');
 
-    const batch: any[] = [];
+    // JSON 原样交给后端解析：账号对象、数组、{"accounts":[…]}、其它网关（sub2api 等）的
+    // 导出文件都认，字段名不分大小写与下划线。前端自己挑字段时漏掉了嵌套的 credentials，
+    // 解析不出凭据的内容也会被后端拒绝，而不是建出空账号。
     if (text.startsWith('{') || text.startsWith('[')) {
+      let parsed: unknown;
       try {
-        const parsed = JSON.parse(text);
-        const list = Array.isArray(parsed) ? parsed : [parsed];
-        for (const item of list) {
-          batch.push({
-            id: item.id || `acc_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-            name: item.name || item.id || '新建账号',
-            plan: item.plan || 'pro',
-            email: item.email || '',
-            cookies: item.cookies || item.cookie || '',
-            access_token: item.accessToken || item.access_token || '',
-            refresh_token: item.refreshToken || item.refresh_token || '',
-            max_concurrency: item.maxConcurrency || item.max_concurrency || 2,
-          });
-        }
-      } catch {
-        // 尝试按行解析
+        parsed = JSON.parse(text);
+      } catch (e: any) {
+        throw new Error(`JSON 格式有误：${e.message}`);
       }
+      await get().createAccount(parsed as any);
+      return;
     }
 
-    if (batch.length === 0) {
-      const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
-      for (const line of lines) {
-        const id = `acc_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-        batch.push({
-          id,
-          name: input.name ? `${input.name} (${id.slice(-4)})` : `Cookie账号 #${id.slice(-4)}`,
-          plan: 'pro',
-          cookies: line,
-          max_concurrency: 2,
-        });
-      }
+    // 其余按行：每行一串 Cookie
+    const batch: any[] = [];
+    const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+    for (const line of lines) {
+      const id = `acc_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+      batch.push({
+        id,
+        name: input.name ? `${input.name} (${id.slice(-4)})` : `Cookie账号 #${id.slice(-4)}`,
+        plan: 'pro',
+        cookies: line,
+        max_concurrency: 2,
+      });
     }
 
     if (batch.length === 0) {

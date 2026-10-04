@@ -194,7 +194,7 @@ export const AccountImportModal: React.FC = () => {
       children: (
         <Space orientation="vertical" style={{ width: '100%' }}>
           <Text type="secondary">
-            支持单行/多行 Cookie 字符串，或直接粘贴 accounts.json 格式的 JSON 数组：
+            支持单行/多行 Cookie 字符串，或直接粘贴账号 JSON（accounts.json、其它网关如 sub2api 的导出文件均可）：
           </Text>
           <TextArea
             rows={8}
@@ -233,7 +233,7 @@ export const AccountImportModal: React.FC = () => {
             <InboxOutlined />
           </p>
           <p className="ant-upload-text">点击或拖拽 accounts.json 或 cookie.txt 文件到此区域</p>
-          <p className="ant-upload-hint">支持单个或批量账号 JSON 配置文件直接解析</p>
+          <p className="ant-upload-hint">支持单个或批量账号 JSON，包括其它网关（如 sub2api）导出的账号文件</p>
         </Dragger>
       ),
     },

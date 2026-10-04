@@ -66,10 +66,10 @@ export const AccountEditModal: React.FC = () => {
 
         <Form.Item
           name="max_concurrency"
-          label="最大并发槽位 (0 = 不限)"
+          label="最大并发槽位"
           extra="设置允许同时在上游执行推理的请求数，超出将在网关排队调度"
         >
-          <InputNumber min={0} max={64} style={{ width: '100%' }} />
+          <InputNumber min={1} max={64} style={{ width: '100%' }} />
         </Form.Item>
       </Form>
     </Modal>
