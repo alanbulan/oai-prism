@@ -572,3 +572,35 @@ func TestPool_MaxWaitCapsBlocking(t *testing.T) {
 		t.Errorf("错误信息应提示调大 max_wait: %v", err)
 	}
 }
+
+// 其它网关（sub2api）的导出文件：凭据嵌套在 credentials 里，client_id 即签发 refresh_token 的 OAuth client。
+func TestParseAccountList_ExportFile(t *testing.T) {
+	raw := []byte(`{"exported_at":"2026-10-04T12:44:07Z","proxies":[],"accounts":[{
+		"name":"gpt-x","platform":"openai","type":"oauth","concurrency":10,
+		"credentials":{"access_token":"at","refresh_token":"rt.1.x","email":"x@example.com",
+			"plan_type":"plus","client_id":"app_X","chatgpt_account_id":"acct-2"},
+		"extra":{"codex_5h_used_percent":45}}]}`)
+	list, err := ParseAccountList(raw)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("解析失败: %v %d", err, len(list))
+	}
+	a := list[0]
+	if a.ID != "" || a.Name != "gpt-x" || a.AccessToken != "at" || a.RefreshToken != "rt.1.x" ||
+		a.Email != "x@example.com" || a.Plan != "plus" || a.OAuthClientID != "app_X" || a.AccountID != "acct-2" {
+		t.Fatalf("字段不对: %+v", a)
+	}
+	if a.MaxConcurrency != 0 || len(a.Tags) != 1 || a.Tags[0] != "oauth" {
+		t.Fatalf("导出方的并发不应照搬、oauth 账号应打标签: %+v", a)
+	}
+	if !HasCredentials(a) {
+		t.Fatal("应识别出凭据")
+	}
+
+	// 单个账号对象也认；file 形式补默认 id
+	if list, _ := ParseAccounts([]byte(`{"name":"solo","cookies":"c=1"}`)); len(list) != 1 || list[0].ID != "file-1" {
+		t.Fatalf("单个对象: %+v", list)
+	}
+	if _, err := ParseAccountList([]byte(`{"accounts":[{"platform":"anthropic","credentials":{"access_token":"x"}}]}`)); err == nil {
+		t.Fatal("非 OpenAI 平台应报错")
+	}
+}
