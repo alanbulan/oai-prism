@@ -40,15 +40,14 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	model, effort := h.resolveModel(req.Model, "")
 	accountID, projectID := applyHeaderOverrides(r, &model, &effort)
 
-	// Anthropic 把 system 放在顶层字段；上游的 input 数组本身接受
-	// system 角色，所以直接搬到数组里、保持 system 不变 ——
-	// 不要折成 user 消息（那会把指令降级成用户发言）。
-	input := translateAnthropicMessages(req.Messages, "")
-	if sys := req.System.Text(); sys != "" {
-		input = append([]prism.InputItem{prism.NewSystemItem(sys)}, input...)
-	} else if h.cfg.Facade.DefaultSystemPrompt != "" {
-		input = append([]prism.InputItem{prism.NewSystemItem(h.cfg.Facade.DefaultSystemPrompt)}, input...)
+	// Anthropic 把 system 放在顶层字段：交给翻译层当 system，与折叠的历史
+	// 合成唯一一条（上游只读最后一条 system；单独前插一条的话，客户端自带的
+	// 多轮历史无处安放，整段丢失）。
+	sys := req.System.Text()
+	if sys == "" {
+		sys = h.cfg.Facade.DefaultSystemPrompt
 	}
+	input := translateAnthropicMessages(req.Messages, sys)
 
 	runReq := &RunRequest{
 		Model:     model,

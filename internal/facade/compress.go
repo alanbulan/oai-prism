@@ -91,11 +91,8 @@ func CompressChatMessages(msgs []ChatMessage, cfg CompressionConfig) ([]ChatMess
 			speaker = "Tool"
 		}
 
-		txt := item.msg.Content.Text()
-		// 截断单条过长历史，避免压缩后依然膨胀
-		if len(txt) > 200 {
-			txt = txt[:197] + "..."
-		}
+		// 截断单条过长历史，避免压缩后依然膨胀。按字符截：按字节切会把中文切成半个字符。
+		txt := truncateRunes(item.msg.Content.Text(), 197)
 		summaryBuilder.WriteString(fmt.Sprintf("%d. %s: %s\n", i+1, speaker, txt))
 	}
 

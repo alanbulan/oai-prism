@@ -222,7 +222,7 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 		h.applyLocalWorkspace(r, res.DeltaFiles)
 	}
 
-	fin := finishReason(res)
+	fin := finishReason(toolCalls)
 
 	// 如果有工具调用，推一帧带 tool_calls 的增量
 	if len(toolCalls) > 0 {
@@ -283,7 +283,7 @@ func (h *Handler) syncChat(w http.ResponseWriter, r *http.Request, runReq *RunRe
 		h.applyLocalWorkspace(r, res.DeltaFiles)
 	}
 
-	fin := finishReason(res)
+	fin := finishReason(toolCalls)
 	msg := ChatMessage{
 		Role:             "assistant",
 		Content:          stringContent(res.Text),
@@ -345,12 +345,13 @@ func stringContent(s string) StringOrArray {
 	return StringOrArray{raw: b}
 }
 
-// finishReason 决定 finish_reason。
-func finishReason(res *RunResult) string {
-	if res == nil {
-		return "stop"
-	}
-	if len(res.DeltaFiles) > 0 {
+// finishReason 决定 finish_reason：只看真正发出去的工具调用。
+//
+// 不能看 DeltaFiles —— 沙箱每轮都把 Prism 写进工作区的 AGENTS.md 报成新增文件，
+// 它被映射层滤掉后 tool_calls 为空，却会让 finish_reason 变成 "tool_calls"；
+// 按 OpenAI 语义，客户端会去执行一个不存在的工具调用（2026-10-04 实测命中）。
+func finishReason(toolCalls []ToolCall) string {
+	if len(toolCalls) > 0 {
 		return "tool_calls"
 	}
 	return "stop"

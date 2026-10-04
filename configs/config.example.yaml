@@ -191,6 +191,11 @@ facade:
   # 默认关闭（等于让调用方指定网关主机上的写入位置）；开启后也只接受本机请求。
   local_workspace_write: false
 
+  # 上游沙箱会给每个请求注入 Prism 自己的 AGENTS.md（LaTeX 编辑器规则），且没有
+  # 请求字段能去掉它。开启后，非 Codex 桥请求的 system 最前面会加一段声明点名作废它；
+  # Codex 桥请求自带同类条款，并改用本地 Codex CLI 发来的 AGENTS.md。
+  platform_notice: true
+
   # 对外模型名 -> 上游真名 + 推理强度。
   # label 是 /v1/models 里的展示名（可选，不填则不带 name 字段）。
   models:

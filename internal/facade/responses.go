@@ -92,15 +92,19 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	input := messagesFromResponsesInput(req.Input, "")
+	var input []prism.InputItem
 	if bridge {
 		// UA 推断的 OS 事实声明随桥指令一起进首条 system（见 osDirective）。
 		input = bridgeInputItems(req.Input, osDirective(r.UserAgent()))
-	} else if req.Instructions != "" {
-		// instructions 就是 Responses API 的 system，保持 system 角色。
-		input = append([]prism.InputItem{prism.NewSystemItem(req.Instructions)}, input...)
-	} else if h.cfg.Facade.DefaultSystemPrompt != "" {
-		input = append([]prism.InputItem{prism.NewSystemItem(h.cfg.Facade.DefaultSystemPrompt)}, input...)
+	} else {
+		// instructions 就是 Responses API 的 system：与 input 自带的 system、
+		// 折叠的历史合成唯一一条（上游只读最后一条 system，分开发会丢）。
+		fallback := h.cfg.Facade.DefaultSystemPrompt
+		if req.Instructions != "" {
+			fallback = ""
+		}
+		input = messagesFromResponsesInput(req.Input, fallback)
+		input = prependSystemText(input, req.Instructions)
 	}
 	if len(input) == 0 {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "input 不能为空")
@@ -131,6 +135,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		API:          "responses",
 		ExtraHeaders: extractSentinelToken(r),
 		IsAux:        turn.isAux,
+		Bridge:       bridge,
 	}
 	runReq.Extra = passthroughFields(rawFields, responsesKnownFields)
 
@@ -199,11 +204,14 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	// 上下文：每轮都发完整上下文。
 	//
 	// 2026-10-03 实测：只发"本轮增量 + previousResponseId"时第二轮必然失忆
-	// （上游不会替我们按句柄拼历史）。客户端自带历史的折叠进首条 system；
+	// （上游不会替我们按句柄拼历史）。客户端自带历史的折叠进唯一一条 system；
 	// 只发本轮消息的客户端，用本地会话链累积的历史注入。
 	switch {
-	case hasClientHistory:
+	case hasClientHistory && bridge:
 		runReq.Input = foldInputHistory(input)
+	case hasClientHistory:
+		// 非桥：translateChatMessages 已把历史折进 system，再折一次就重复了。
+		runReq.Input = input
 	default:
 		runReq.Input = input
 		if hist := sessionChainHistory(turn.chainKey); len(hist) > 0 {

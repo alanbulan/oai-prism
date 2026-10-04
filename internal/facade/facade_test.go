@@ -71,39 +71,32 @@ func TestTranslateChatMessages(t *testing.T) {
 
 	out := translateChatMessages(msgs, "")
 
-	// 上游的 input 数组**接受 system 角色**（真实前端源码就是这么发的），
-	// 所以 system / developer 必须保持 system，不能折成 user。
-	// 折成 user 等于把"指令"降级成"用户发言"，会改变模型服从度。
-	//
-	// 注意是 5 条而不是 4 条：system 与 developer 现在是两条独立的
-	// system 条目，而不是被合并成一条 —— 不要再自作主张改写调用方
-	// 的消息结构，保持原样最安全。
-	if len(out) != 5 {
-		t.Fatalf("条目数 = %d, want 5: %+v", len(out), out)
+	// system 与 developer 合并成最前面的唯一一条 system：上游只读最后一条
+	// system 当 Context（2026-10-04 双 system 暗号实测），分开发前一条会被丢掉。
+	// 也不能折成 user —— 上游会把它当成"User request"，顶替真正的提问。
+	if len(out) != 4 {
+		t.Fatalf("条目数 = %d, want 4: %+v", len(out), out)
 	}
-	if out[0].Role != "system" || !strings.Contains(out[0].Content[0].Text, "你是助手") {
-		t.Fatalf("system 必须保持 system 角色且内容完整: %+v", out[0])
+	sys := out[0].Content[0].Text
+	if out[0].Role != "system" || !strings.Contains(sys, "你是助手") || !strings.Contains(sys, "补充规则") {
+		t.Fatalf("system 与 developer 应合并成一条 system: %+v", out[0])
 	}
-	// developer 是 OpenAI 给 system 起的新名字，归一为 system。
-	if out[1].Role != "system" || !strings.Contains(out[1].Content[0].Text, "补充规则") {
-		t.Fatalf("developer 应归一为 system 角色: %+v", out[1])
+	if strings.Index(sys, "你是助手") > strings.Index(sys, "补充规则") {
+		t.Fatalf("合并后应保持原顺序: %q", sys)
 	}
-	if out[2].Role != "user" || out[3].Role != "assistant" || out[4].Role != "user" {
+	if out[1].Role != "user" || out[2].Role != "assistant" || out[3].Role != "user" {
 		t.Fatalf("角色顺序错误: %+v", out)
 	}
 	// 块类型必须正确：输入序列中无论助手还是用户文本块均为 input_text（对齐 PrismOpenAIProxy）。
-	if out[3].Content[0].Type != prism.BlockInputText {
-		t.Errorf("助手内容块类型应为 input_text，得到 %q", out[3].Content[0].Type)
-	}
 	if out[2].Content[0].Type != prism.BlockInputText {
-		t.Errorf("用户内容块类型应为 input_text，得到 %q", out[2].Content[0].Type)
+		t.Errorf("助手内容块类型应为 input_text，得到 %q", out[2].Content[0].Type)
+	}
+	if out[1].Content[0].Type != prism.BlockInputText {
+		t.Errorf("用户内容块类型应为 input_text，得到 %q", out[1].Content[0].Type)
 	}
 }
 
-// TestTranslateChatMessages_InjectsDefaultSystem 验证兜底系统提示。
-//
-// 真实前端每次请求都会带一条系统提示（bundle 里的 makeSystemPrompt）。
-// 调用方没给时我们要补上，否则模型缺少角色设定，回答风格会飘。
+// TestTranslateChatMessages_InjectsDefaultSystem 验证兜底系统提示：调用方没给 system 时补上。
 func TestTranslateChatMessages_InjectsDefaultSystem(t *testing.T) {
 	msgs := []ChatMessage{{Role: "user", Content: mustSA(t, `"问题"`)}}
 
@@ -648,10 +641,24 @@ func TestMapError(t *testing.T) {
 
 func TestFinishReason(t *testing.T) {
 	if finishReason(nil) != "stop" {
-		t.Fatal("nil 结果也应给出 stop")
+		t.Fatal("没有工具调用应给出 stop")
 	}
-	if finishReason(&RunResult{Text: "x"}) != "stop" {
-		t.Fatal("默认 stop")
+	if finishReason([]ToolCall{{ID: "call_1"}}) != "tool_calls" {
+		t.Fatal("有工具调用应给出 tool_calls")
+	}
+}
+
+// TestFinishReason_IgnoredDeltaFilesStayStop 复现 2026-10-04 实测：沙箱每轮都把
+// Prism 写进工作区的 AGENTS.md 报成新增文件，映射层滤掉它之后没有任何工具调用，
+// finish_reason 必须是 stop —— 否则客户端会去执行一个不存在的工具调用。
+func TestFinishReason_IgnoredDeltaFilesStayStop(t *testing.T) {
+	files := []prism.CodexDeltaFile{{FilePath: "AGENTS.md", Status: "added"}}
+	calls := MapDeltaFilesToToolCalls(files, nil)
+	if len(calls) != 0 {
+		t.Fatalf("AGENTS.md 不应映射成工具调用: %+v", calls)
+	}
+	if got := finishReason(calls); got != "stop" {
+		t.Fatalf("finish_reason = %q, want stop", got)
 	}
 }
 

@@ -249,6 +249,12 @@ type FacadeConfig struct {
 	// 第二轮必然失忆。这个开关只决定是否额外附带句柄（沙箱会话延续）。
 	UpstreamContinuation bool `yaml:"upstream_continuation"`
 
+	// PlatformNotice 在非 Codex 桥请求的 system 最前面加一段声明，点名作废上游
+	// 沙箱注入的 Prism AGENTS.md（LaTeX 编辑器规则）。上游没有去掉它的请求字段，
+	// 它与我们的内容同属 user 层，只能靠后到 + 点名压住。Codex 桥请求自带同类
+	// 条款，不受此开关影响。默认开启。
+	PlatformNotice bool `yaml:"platform_notice"`
+
 	// Models 把对外模型名映射到 Prism 内部的 model / reasoning effort。
 	// 例：gpt-5-codex-fast -> {model: gpt-5, effort: high}
 	Models map[string]ModelMapping `yaml:"models"`
@@ -294,12 +300,7 @@ type FacadeConfig struct {
 	// 就绪前 wait-for-sync 会直接断 TLS，所以这里靠重试熬过去。
 	SandboxReadyWait time.Duration `yaml:"sandbox_ready_wait"`
 
-	// DefaultSystemPrompt 在调用方没有提供 system 消息时注入。
-	//
-	// 真实前端每次请求都会带一条系统提示
-	// （bundle 里的 makeSystemPrompt("ChatGPT","Prism",语言)），
-	// 我们不注入的话模型缺少角色设定，回答风格会飘。
-	// 留空表示不注入。
+	// DefaultSystemPrompt 在调用方没有提供 system 消息时注入。留空表示不注入。
 	DefaultSystemPrompt string `yaml:"default_system_prompt"`
 
 	// 入站全局限流：每秒补充 RatePerSecond 个令牌，桶容量 RateBurst。
@@ -536,7 +537,8 @@ func Default() *Config {
 			UseSandbox:          true,
 			SandboxTTL:          30 * time.Minute,
 			SandboxReadyWait:    60 * time.Second,
-			DefaultSystemPrompt: DefaultPrismSystemPrompt,
+			DefaultSystemPrompt: DefaultFacadeSystemPrompt,
+			PlatformNotice:      true,
 		},
 		RawProxy: RawProxyConfig{
 			Enabled:         true,
@@ -658,13 +660,12 @@ const (
 	DefaultPollBackoffMax = 3 * time.Second
 )
 
-// DefaultPrismSystemPrompt 是兜底系统提示。
+// DefaultFacadeSystemPrompt 是兜底系统提示：中性角色，不带任何平台人设。
 //
-// 我们不照抄前端的 makeSystemPrompt 全文（那是它自己的产品文案，
-// 而且会随语言变），只给一个中性的角色设定。
-// 想要更强的一致性就把它设成和前端一样 —— 抓一次真实请求即可。
-const DefaultPrismSystemPrompt = "You are the AI assistant inside Prism, " +
-	"an online LaTeX editor. Answer the user's request directly and concisely."
+// 曾经写成 "the AI assistant inside Prism, an online LaTeX editor"，以为在对齐官方
+// 前端的 makeSystemPrompt —— 实测（2026-10-04）上游只读最后一条 system，前端那条
+// 人设根本到不了模型；我们自己反倒给每个请求加上了 LaTeX 编辑器人设。
+const DefaultFacadeSystemPrompt = "You are a helpful assistant. Answer the user's request directly."
 
 // DefaultPrismModel 是上游对话模型的默认值。
 //

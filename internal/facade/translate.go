@@ -17,22 +17,18 @@ import (
 //
 //  1. 用户内容用 input_text，助手历史用 output_text。传错不会报错，
 //     但模型会"看不见"这段内容 —— 属于静默失效，最难排查的一类。
-//  2. 上游没有独立的 system / instructions 字段，但**input 数组本身允许 system 角色**。
-//     真实前端源码就是这么发的（决定性证据）：
-//
-//       {type:"message", role:"system",
-//        content:[{type:"input_text", text: makeSystemPrompt("ChatGPT","Prism",lang)}]}
-//
-//     所以不要把系统提示"折成一条 user 消息"——那等于把指令降级成用户发言，
-//     会改变模型的服从度。这一条我方最初做错了，是比对第三方实现时发现的。
+//  2. 上游没有独立的 system / instructions 字段，input 数组里的 system 角色
+//     就是它的 Context：服务端把**最后一条 system** 与最后一条 user 拼成
+//     "Context:…User request:…"，其余条目全部丢弃（见 upstream_input.go）。
+//     所以全部 system 必须合并成一条，也不能折成 user（那会顶替掉真正的提问）。
 //  3. tools 不知道该放哪（真实前端请求体里没有它，工具是沙箱侧提供的），
 //     因此默认塞进 metadata，属于**待验证**的处理。
 
 // translateChatMessages 把 OpenAI messages 转成上游 input 条目。
 //
-// defaultSystem 在调用方没给 system 消息时作为兜底注入 ——
-// 真实前端每次都会带一条 system（makeSystemPrompt(...)），
-// 不注入的话模型缺少角色设定，回答风格会飘。
+// 全部 system / developer 合并成最前面的唯一一条，折叠的历史挂在它末尾；
+// 调用方没给 system 时用 defaultSystem 兜底，两者都没有而又有历史时，
+// 就单独为历史建一条 system —— 否则历史无处安放，整段丢失。
 func translateChatMessages(msgs []ChatMessage, defaultSystem string) []prism.InputItem {
 	// 上下文压缩：对超出轮数或字符阈值的长历史进行滑动窗口与结构化压缩
 	compressedMsgs, summaryText := CompressChatMessages(msgs, DefaultCompressionConfig)
@@ -89,30 +85,27 @@ func translateChatMessages(msgs []ChatMessage, defaultSystem string) []prism.Inp
 		historyText = "\n\n[Previous Conversation History]\n" + historyBuilder.String()
 	}
 
-	hasSystem := false
+	var sysParts []string
 	for _, m := range msgs {
-		role := strings.ToLower(strings.TrimSpace(m.Role))
-		if role == "system" || role == "developer" {
-			hasSystem = true
-			break
+		if isSystemRole(m.Role) {
+			if t := strings.TrimSpace(m.Content.Text()); t != "" {
+				sysParts = append(sysParts, t)
+			}
 		}
 	}
-	// role 保持 system：上游的 input 数组接受这个角色。
-	if !hasSystem && strings.TrimSpace(defaultSystem) != "" {
-		items = append(items, prism.NewSystemItem(defaultSystem+historyText))
+	sysText := strings.Join(sysParts, "\n\n")
+	if sysText == "" {
+		sysText = strings.TrimSpace(defaultSystem)
+	}
+	if sysText = strings.TrimSpace(sysText + historyText); sysText != "" {
+		items = append(items, prism.NewSystemItem(sysText))
 	}
 
-	systemInjected := !hasSystem
 	for _, m := range msgs {
 		role := strings.ToLower(strings.TrimSpace(m.Role))
 		switch role {
 		case "system", "developer":
-			sysText := m.Content.Text()
-			if !systemInjected && historyText != "" {
-				sysText += historyText
-				systemInjected = true
-			}
-			items = append(items, prism.NewSystemItem(sysText))
+			// 已合并进最前面那条 system。
 		case "assistant":
 			items = append(items, assistantItem(m))
 		case "tool", "function":

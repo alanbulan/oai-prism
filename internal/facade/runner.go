@@ -74,6 +74,10 @@ type RunRequest struct {
 	// 不占用、也不污染会话项目。
 	IsAux bool
 
+	// Bridge 标识 Codex 工具桥请求：桥指令自带作废上游平台提示词的条款，
+	// 不再叠加通用的 platformNotice。
+	Bridge bool
+
 	// BoundAccountID 是 ProjectID / ConversationID / PreviousResponseID / 沙箱快照
 	// 这组续接句柄所属的账号（来自会话链）。项目与会话是账号私有资源：
 	// 实际租到的账号与它不同（粘性过期、原账号冷却、换号重试）时，
@@ -384,8 +388,14 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		}
 	}
 
+	// 2.2) 规整成上游真正会读的形状：唯一一条 system + 最后一条 user（见 upstream_input.go）。
+	// 先于图片上传 —— 被上游丢弃的中间条目里的图片没必要上传；用量也只按这份计。
+	inputItems := canonicalUpstreamInput(req.Input)
+	if !req.Bridge && r.cfg.Facade.PlatformNotice {
+		inputItems = prependSystemText(inputItems, platformNotice)
+	}
+
 	// 2.3) 处理图片上传：必须在沙箱工作区同步之前上传至项目！
-	inputItems := req.Input
 	var hasNewUpload bool
 	if projectID != "" {
 		inputItems, hasNewUpload = preprocessInputImages(ctx, r.client, p, r.uploads, acct.ID, projectID, inputItems)

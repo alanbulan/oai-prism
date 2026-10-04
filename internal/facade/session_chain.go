@@ -4,8 +4,8 @@ package facade
 // 缓存对话历史，供单条消息客户端注入上下文。
 //
 // 实测结论（2026-10-02 完整实验矩阵 B/B2/K/V/W/Y/N，勿再按直觉改回去）：
-//   - 上游后端**只提取"首条 system + 最后一条 user"，中间的 input
-//     条目全部丢弃**（translate.go 头注释早已记载该缺陷）。把历史
+//   - 上游后端**只提取"最后一条 system + 最后一条 user"，中间的 input
+//     条目全部丢弃**（见 upstream_input.go）。把历史
 //     插成独立 input 条目（无论带不带 conversationId/previousResponseId、
 //     无论 system 是否加扰动标记、无论加不加零宽空格）全部失忆；
 //     历史折叠成 [Previous Conversation History] 文本拼进 system
@@ -247,7 +247,7 @@ func historyCarriesContextA(msgs []AnthropicMessage) bool {
 // （无 system 则前插一条）。
 //
 // 为什么折叠成文本而不是插入独立 input 条目（2026-10-02 血泪实测）：
-// 上游后端只提取"首条 system + 最后一条 user"，中间的 input 条目
+// 上游后端只提取"最后一条 system + 最后一条 user"，中间的 input 条目
 // 全部丢弃 —— translate.go 头注释早就写了这个缺陷。往轮把历史插成
 // 独立条目（V/W/Y/N 系列实验）全部失忆；折叠进 system（B/B2/K
 // 系列实验，同款 [Previous Conversation History] 格式）全部成功。

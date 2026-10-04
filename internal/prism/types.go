@@ -212,12 +212,10 @@ func NewUserItem(text string) InputItem {
 
 // NewSystemItem 构造一条系统消息块。
 //
-// 上游的 input 数组**接受 system 角色** —— 这不是推测：
-// 真实前端源码里第一条 input 就是 role:"system" 的系统提示
-// （makeSystemPrompt("ChatGPT","Prism",lang)）。
-//
-// 所以系统提示应当保持 system 角色，而不是折成 user 消息 ——
-// 折成 user 等于把"指令"降级成"用户发言"，会改变模型的服从度。
+// 上游的 input 数组**接受 system 角色**：服务端把最后一条 system 当作 Context、
+// 最后一条 user 当作 User request，拼成一段文本交给沙箱里的模型，其余条目丢弃
+// （2026-10-04 实测）。所以系统提示要保持 system 角色、且全部合并成一条 ——
+// 折成 user 会顶替掉真正的提问。
 func NewSystemItem(text string) InputItem {
 	return InputItem{
 		Type:    "message",
