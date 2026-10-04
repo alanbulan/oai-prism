@@ -43,6 +43,7 @@ const usage = `oaiprism - OpenAI Prism 高性能反向代理
   probe            校验凭据文件里的账号是否可用
   import           把 Cookie / Token 写入凭据文件并验证
   capture-summary  汇总抓包文件，输出各端点的协议字段清单
+  sentinel         自检纯 Go 的 Sentinel 签发（只连 sentinel.openai.com，不用账号）
   version          打印版本
 
 示例:
@@ -71,8 +72,8 @@ func main() {
 		err = cmdImport(args)
 	case "capture-summary", "summary":
 		err = cmdSummary(args)
-	case "tlsbridge", "tb":
-		err = cmdTLSBridge(args)
+	case "sentinel":
+		err = cmdSentinel(args)
 	case "version", "-v", "--version":
 		fmt.Printf("oaiprism %s\n", version)
 	case "help", "-h", "--help":

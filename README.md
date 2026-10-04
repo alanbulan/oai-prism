@@ -87,8 +87,8 @@ OAIprism 把这些全部收进网关，对外只暴露你已经在用的标准�
 
 ## 快速开始
 
-> 需要 Go 1.26+，以及运行 Sentinel oracle 所需的 Node.js 与 Chrome。以下命令以 Windows PowerShell 为例，
-> 其它平台的手动启动方式见[使用指南](docs/使用指南.md#安装与启动)。
+> 只需要 Go 1.26+（构建用）。运行时是单个进程、单个端口，不需要 Node.js 或浏览器。
+> 以下命令以 Windows PowerShell 为例，其它平台的启动方式见[使用指南](docs/使用指南.md#安装与启动)。
 
 ```powershell
 git clone https://github.com/alanbulan/oai-prism.git
@@ -100,8 +100,8 @@ go build -o oaiprism.exe ./cmd/oaiprism
 # 2. 导入账号：粘贴 prism.openai.com 的 Cookie、access token 或 refresh token
 .\oaiprism.exe import -stdin -id main
 
-# 3. 一键启动：Sentinel oracle → TLS 桥 → 网关
-.\tools\start_bridge.ps1
+# 3. 启动（只有网关一个进程，监听 8787）
+.\tools\start.ps1
 ```
 
 启动后打开 **http://127.0.0.1:8787/dashboard/**，在右上角「API 密钥」生成一个 Key，然后调用：
@@ -205,25 +205,30 @@ flowchart LR
         D["控制台 · 管理 API"]
     end
 
-    B["TLS 桥 · :8790<br/>浏览器指纹传输"]
-    O["Sentinel Oracle · :8791<br/>签发反自动化令牌"]
+    B["Chrome 指纹传输<br/>TLS/HTTP2 指纹 · 会话换发"]
+    O["Sentinel 签发<br/>goja 执行官方 sdk.js"]
     U[("prism.openai.com")]
+    S[("sentinel.openai.com")]
 
     C -->|标准 API| F
     F --- T
     F --> P
     D -.->|管理| P
     P -->|start + 轮询| B
-    B -->|取令牌| O
+    B -->|写请求要令牌| O
+    O -->|sentinel/req| S
     B --> U
 ```
 
-客户端请求在网关被翻译为上游的 start + 轮询协议，经 TLS 桥以浏览器指纹发出；
-轮询结果再被还原为 token 级增量 SSE 推回客户端。三个进程各自独立、崩溃面小、可单独重启。
+客户端请求在网关被翻译为上游的 start + 轮询协议，以 Chrome 的 TLS 指纹直连 Prism 发出；
+写请求需要的 Sentinel 反自动化令牌在进程内纯 Go 签发：嵌入式 JS 引擎原样执行官方 SDK，
+它看到的浏览器环境取自真实 Chrome 的快照。轮询结果再被还原为 token 级增量 SSE 推回客户端。
+全部在一个 Go 进程里，没有浏览器、没有附属服务。
 
 深入阅读：[多轮上下文](docs/架构与原理.md#多轮上下文) ·
 [Codex 工具桥](docs/架构与原理.md#codex-工具桥) ·
 [上游协议](docs/架构与原理.md#上游协议已实测校准) ·
+[Sentinel 纯 Go 签发](docs/架构与原理.md#sentinel-纯-go-签发) ·
 [沙箱](docs/架构与原理.md#沙箱) ·
 [安全设计](docs/架构与原理.md#安全设计) ·
 [性能设计](docs/架构与原理.md#性能设计)

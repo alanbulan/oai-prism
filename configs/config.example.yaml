@@ -38,21 +38,21 @@ server:
 # 上游（prism.openai.com）
 # ---------------------------------------------------------------------------
 upstream:
-  # 两种拓扑二选一：
-  #   桥模式（生产推荐、默认）：
-  #       base_url: http://127.0.0.1:8790
-  #       8787 网关 → 8790 tlsbridge（Go 传输 + 8791 oracle 现签 Sentinel）
-  #       → prism.openai.com。Cloudflare 对直连裸请求会拦，桥是必需前置。
-  #   直连模式（仅调试/离线契约测试）：
-  #       base_url: https://prism.openai.com
-  #       无 Sentinel token 时写操作会被上游拒绝（403 Request verification
-  #       failed），只适合只读探测。
-  base_url: http://127.0.0.1:8790
+  # 直连 Prism：网关自己就是"浏览器"——出站用内置的 Chrome TLS/HTTP2 指纹
+  # （Cloudflare 校验 JA3/JA4，标准库直连会被拦），写操作需要的 Sentinel token
+  # 在进程内纯 Go 签发（goja 里执行官方 sdk.js）。不需要 Node.js、Chrome 或其他进程。
+  base_url: https://prism.openai.com
+
+  # 签 Sentinel token 时扮演的浏览器指纹（可选）。留空用内置的通用 Windows Chrome；
+  # 想沿用自己电脑的指纹，把快照存成 JSON（形状同 internal/sentinel/profile_default.json）指过来。
+  # sentinel_profile: secrets/sentinel_profile.json
 
   # 单个请求整体超时。0 = 不设上限，由 context 精确控制。
   # 强烈建议保持 0：流式与长轮询都需要"多久都等"。
   timeout: 0s
 
+  # 以下连接层参数（超时、连接池、HTTP/2、压缩、TLS）只对非 prism.openai.com 的上游生效
+  # （如离线调试用的 tools/mock_upstream.py）；直连 Prism 时由内置 Chrome 指纹传输自管。
   dial_timeout: 10s
   keep_alive: 30s
   tls_handshake_timeout: 10s
@@ -79,7 +79,8 @@ upstream:
   # 出站代理（可选）。账号级代理见 creds.accounts[].proxy。
   # http_proxy: http://127.0.0.1:7890
 
-  # 伪装成浏览器：这几个头缺失很容易被上游风控识别为脚本。
+  # 浏览器头。发往 prism.openai.com 的请求，User-Agent / sec-ch-ua / Accept-Language
+  # 一律以 Sentinel 指纹为准（要和 token 里的指纹一致），这里的 user_agent 只用于其他域名。
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
   origin: "https://prism.openai.com"
   referer: "https://prism.openai.com/"

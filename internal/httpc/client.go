@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/oai-prism/oaiprism/internal/config"
+	"github.com/oai-prism/oaiprism/internal/upstream"
 )
 
 // Client 是对 *http.Client 的轻量包装，带上上游 BaseURL 与连接预热能力。
@@ -67,29 +68,47 @@ func New(cfg config.UpstreamConfig, opts Options) (*Client, error) {
 		insecure = *opts.InsecureSkipVerify
 	}
 
-	tr := &http.Transport{
-		Proxy:                 proxyFunc(pick(cfg.HTTPProxy, opts.Proxy)),
-		DialContext:           dialer.DialContext,
-		ForceAttemptHTTP2:     forceH2,
-		MaxIdleConns:          cfg.MaxIdleConns,
-		MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerHost,
-		MaxConnsPerHost:       cfg.MaxConnsPerHost,
-		IdleConnTimeout:       cfg.IdleConnTimeout,
-		TLSHandshakeTimeout:   cfg.TLSHandshakeTimeout,
-		ResponseHeaderTimeout: cfg.ResponseHeaderTimeout,
-		ExpectContinueTimeout: cfg.ExpectContinueTimeout,
-		DisableCompression:    cfg.DisableCompression,
-		ReadBufferSize:        cfg.ReadBufferSize,
-		WriteBufferSize:       cfg.WriteBufferSize,
-		TLSClientConfig: &tls.Config{
-			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: insecure,
-		},
+	var (
+		rt http.RoundTripper
+		tr *http.Transport
+	)
+	if upstream.IsPrism(base) {
+		// prism.openai.com 在 Cloudflare 后面校验 TLS 指纹，标准库直连会被 403：
+		// 改走 Chrome 指纹传输（同时负责会话换发与 Sentinel 签发）。
+		bt, err := upstream.Shared(upstream.Options{
+			Proxy:       pick(cfg.HTTPProxy, opts.Proxy),
+			ProfilePath: cfg.SentinelProfile,
+		})
+		if err != nil {
+			return nil, err
+		}
+		rt = bt
+	} else {
+		tr = &http.Transport{
+			Proxy:                 proxyFunc(pick(cfg.HTTPProxy, opts.Proxy)),
+			DialContext:           dialer.DialContext,
+			ForceAttemptHTTP2:     forceH2,
+			MaxIdleConns:          cfg.MaxIdleConns,
+			MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerHost,
+			MaxConnsPerHost:       cfg.MaxConnsPerHost,
+			IdleConnTimeout:       cfg.IdleConnTimeout,
+			TLSHandshakeTimeout:   cfg.TLSHandshakeTimeout,
+			ResponseHeaderTimeout: cfg.ResponseHeaderTimeout,
+			ExpectContinueTimeout: cfg.ExpectContinueTimeout,
+			DisableCompression:    cfg.DisableCompression,
+			ReadBufferSize:        cfg.ReadBufferSize,
+			WriteBufferSize:       cfg.WriteBufferSize,
+			TLSClientConfig: &tls.Config{
+				MinVersion:         tls.VersionTLS12,
+				InsecureSkipVerify: insecure,
+			},
+		}
+		rt = tr
 	}
 
 	return &Client{
 		HTTP: &http.Client{
-			Transport: tr,
+			Transport: rt,
 			// 不设 Timeout：流式与长轮询由 context 精确控制，
 			// 全局 Timeout 会把正常的长回答误杀。
 			Timeout: cfg.Timeout,
@@ -209,7 +228,8 @@ func trimRightSlash(s string) string {
 // 冷启动后的第一个请求要付出 DNS + TCP + TLS 三轮往返（跨洋链路能到 300ms+）。
 // 预热把这笔开销挪到启动阶段，对延迟敏感的调用收益很大。
 func (c *Client) Warmup(ctx context.Context, n int) int {
-	if n <= 0 {
+	if n <= 0 || c.transport == nil {
+		// Chrome 指纹传输不预热：用标准库 TLS 去握手反而会留下非浏览器指纹。
 		return 0
 	}
 	target := c.BaseURL.Host

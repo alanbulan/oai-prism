@@ -115,6 +115,11 @@ type UpstreamConfig struct {
 	// HTTPProxy 支持 per-upstream 出站代理（http/https/socks5）。
 	HTTPProxy string `yaml:"http_proxy"`
 
+	// SentinelProfile 指向自定义的浏览器指纹（JSON，形状同 internal/sentinel/profile_default.json）。
+	// 留空用内置指纹。base_url 指向 prism.openai.com 时，出站自动走内置的 Chrome 指纹传输
+	// 并用纯 Go 签发 Sentinel token（internal/upstream），User-Agent 等浏览器头也以指纹为准。
+	SentinelProfile string `yaml:"sentinel_profile"`
+
 	UserAgent string            `yaml:"user_agent"`
 	Origin    string            `yaml:"origin"`
 	Referer   string            `yaml:"referer"`

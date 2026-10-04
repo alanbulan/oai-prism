@@ -423,8 +423,8 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 	// 心跳：等待上游期间必须持续发事件保活。
 	//
 	// 为什么必需：start+poll 一轮可能要 1-5 分钟（上游沙箱重试、
-	// xhigh 长推理），期间若一个字节都不发，中间链路（node sidecar、
-	// 反代、Nginx 的 proxy_read_timeout）会按空闲把连接掐掉，
+	// xhigh 长推理），期间若一个字节都不发，中间链路（反代、
+	// Nginx 的 proxy_read_timeout）会按空闲把连接掐掉，
 	// 客户端表现为 "stream closed before response.completed"。
 	// 实测：Codex CLI 0.154/0.159 对长时间静默同样会判流断。
 	heartbeatStop := make(chan struct{})

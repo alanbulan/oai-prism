@@ -5,7 +5,8 @@ go 1.26.0
 require (
 	github.com/bogdanfinn/fhttp v0.6.9
 	github.com/bogdanfinn/tls-client v1.16.0
-	github.com/dlclark/regexp2/v2 v2.5.1
+	github.com/dlclark/regexp2/v2 v2.8.1
+	github.com/dop251/goja v0.0.0-20261002135814-104bc28c3abd
 	golang.org/x/time v0.16.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.59.0
@@ -20,6 +21,8 @@ require (
 	github.com/bogdanfinn/websocket v1.5.6-barnius // indirect
 	github.com/cloudflare/circl v1.6.2 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/go-sourcemap/sourcemap v2.1.3+incompatible // indirect
+	github.com/google/pprof v0.0.0-20260802141513-ef3492d7dac3 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.18.2 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
