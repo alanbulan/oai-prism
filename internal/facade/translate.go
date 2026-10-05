@@ -120,7 +120,7 @@ func chatHistory(msgs []ChatMessage, defaultSystem string) (sysText string, hist
 				txt += "\n[tool_call] " + tc.Function.Name + "(" + tc.Function.Arguments + ")"
 			}
 		}
-		history = append(history, historyEntry{speaker: speakerOf(m.Role), text: txt})
+		history = append(history, historyEntry{speaker: speakerOf(m.Role), text: txt, fp: m.fp})
 	}
 	return sysText, history, lastUserIdx
 }
@@ -289,24 +289,6 @@ func toolsMetadata(tools []ChatTool) []any {
 		out = append(out, map[string]any{"type": "function", "function": fn})
 	}
 	return out
-}
-
-// translateAnthropicMessages 把 Anthropic messages 转成上游 input 条目。
-func translateAnthropicMessages(msgs []AnthropicMessage, defaultSystem string, promptLimit int) []prism.InputItem {
-	return translateChatMessages(anthropicChatMessages(msgs), defaultSystem, promptLimit)
-}
-
-// anthropicChatMessages 把 Anthropic messages 换成 chat 消息（非 assistant 一律记作 user）。
-func anthropicChatMessages(msgs []AnthropicMessage) []ChatMessage {
-	chat := make([]ChatMessage, 0, len(msgs))
-	for _, m := range msgs {
-		role := strings.ToLower(strings.TrimSpace(m.Role))
-		if role != "assistant" {
-			role = "user"
-		}
-		chat = append(chat, ChatMessage{Role: role, Content: m.Content})
-	}
-	return chat
 }
 
 // messagesFromResponsesInput 解析 Responses API 的 input 字段。

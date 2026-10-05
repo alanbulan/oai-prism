@@ -62,7 +62,7 @@ func TestTranslateChatMessages_TrimsOldestToBudget(t *testing.T) {
 }
 
 func TestRenderHistory(t *testing.T) {
-	entries := []historyEntry{{"User", "一"}, {"Assistant", "二"}, {"User", "  "}}
+	entries := []historyEntry{{speaker: "User", text: "一"}, {speaker: "Assistant", text: "二"}, {speaker: "User", text: "  "}}
 	if got := renderHistory(entries, 0); got != historyHeader+"User: 一\nAssistant: 二" {
 		t.Fatalf("不限预算时应全量渲染（跳过空消息）: %q", got)
 	}
@@ -74,13 +74,13 @@ func TestRenderHistory(t *testing.T) {
 // TestRenderHistory_DropsBulkyBeforeUserMessages：超限时先丢大块的工具输出与助手回复，
 // 用户自己说的话（要求、暗号）最后才动；丢掉的位置原地注明，整段不超预算。
 func TestRenderHistory_DropsBulkyBeforeUserMessages(t *testing.T) {
-	entries := []historyEntry{{"User", "记住暗号：OLIVE-88"}}
+	entries := []historyEntry{{speaker: "User", text: "记住暗号：OLIVE-88"}}
 	for k := 1; k <= 6; k++ {
 		entries = append(entries,
-			historyEntry{"Assistant", fmt.Sprintf("CALL-%d", k)},
-			historyEntry{"User", fmt.Sprintf("[CLIENT RESULT] OUT-%d %s", k, strings.Repeat("长", 2000))})
+			historyEntry{speaker: "Assistant", text: fmt.Sprintf("CALL-%d", k)},
+			historyEntry{speaker: "User", text: fmt.Sprintf("[CLIENT RESULT] OUT-%d %s", k, strings.Repeat("长", 2000))})
 	}
-	entries = append(entries, historyEntry{"User", "接下来读 doc7"})
+	entries = append(entries, historyEntry{speaker: "User", text: "接下来读 doc7"})
 
 	const budget = 20000
 	got := renderHistory(entries, budget)
@@ -99,7 +99,7 @@ func TestRenderHistory_DropsBulkyBeforeUserMessages(t *testing.T) {
 	// 全是用户长消息时退回按时间从最旧的丢。
 	var users []historyEntry
 	for k := 1; k <= 10; k++ {
-		users = append(users, historyEntry{"User", fmt.Sprintf("U%02d %s", k, strings.Repeat("x", 3000))})
+		users = append(users, historyEntry{speaker: "User", text: fmt.Sprintf("U%02d %s", k, strings.Repeat("x", 3000))})
 	}
 	got = renderHistory(users, 12000)
 	if len(got) > 12000 || strings.Contains(got, "U01 ") || !strings.Contains(got, "U10 ") {

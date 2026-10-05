@@ -44,14 +44,34 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	model, effort := h.resolveModel(mapped, "")
 	accountID, projectID := applyHeaderOverrides(r, &model, &effort)
 
-	// Anthropic 把 system 放在顶层字段：交给翻译层当 system，与折叠的历史
-	// 合成唯一一条（上游只读最后一条 system；单独前插一条的话，客户端自带的
-	// 多轮历史无处安放，整段丢失）。
+	// 工具桥：声明了工具的客户端（Claude Code）由上游决策、本地执行（见 anthropic_bridge.go）。
+	var bt *anthropicBridgeTurn
+	if tools := anthropicBridgeTools(req); len(tools) > 0 {
+		bt = &anthropicBridgeTurn{tools: tools}
+	}
+
+	// Anthropic 把 system 放在顶层字段：作为最前面的一条 system，与对话中间的 system 消息、
+	// 折叠的历史合成唯一一条（上游只读最后一条 system；分开发的话，客户端自带的多轮历史
+	// 无处安放，整段丢失）。
 	sys := req.System.Text()
-	if sys == "" {
+	if sys == "" && bt == nil {
 		sys = h.cfg.Facade.DefaultSystemPrompt
 	}
-	input := translateAnthropicMessages(req.Messages, sys, h.cfg.Facade.PromptByteLimit())
+	if bt != nil {
+		sys = strings.TrimSpace(anthropicBridgePrompt(bt.tools, parseAnthropicToolChoice(req.ToolChoice)) + "\n\n" + sys)
+	}
+	if directive := anthropicOutputSchema(rawFields); directive != "" {
+		sys = strings.TrimSpace(sys + "\n\n" + directive)
+	}
+	chat := append([]ChatMessage{{Role: "system", Content: stringContent(sys)}}, anthropicChatMessages(req.Messages)...)
+	input := translateChatMessages(chat, "", h.cfg.Facade.PromptByteLimit())
+	conv := chatConversation(chat, "")
+	if bt != nil {
+		addClientToolReminder(input, conv)
+		if conv != nil {
+			bt.cwd = clientWorkingDir(conv.system)
+		}
+	}
 
 	runReq := &RunRequest{
 		Model:     model,
@@ -63,11 +83,16 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		AccountID: accountID,
 		ProjectID: projectID,
 		API:       "messages",
+		Bridge:    bt != nil,
+		IsAux:     isClaudeCodeAux(r, req),
 	}
 	runReq.Extra = passthroughFields(rawFields, anthropicKnownFields)
 	// 原生续接：会话历史由上游保管，续接轮次只发增量（见 native.go）。
-	if conv := chatConversation(anthropicChatMessages(req.Messages), sys); conv != nil {
+	if conv != nil && !runReq.IsAux {
 		h.attachNative(runReq, &nativeTurn{key: runReq.StickyKey, strong: isStrongSessionKey(runReq.StickyKey), conv: conv})
+	}
+	if bt != nil {
+		h.log.Debug("Claude Code 工具桥", "tools", len(bt.tools), "key", runReq.StickyKey, "cwd", bt.cwd)
 	}
 
 	// 超过上游单条上限：在 message_start 之前以 400 "prompt is too long" 回绝 ——
@@ -80,10 +105,54 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	id := newID("msg_")
 
 	if req.Stream {
-		h.streamAnthropic(w, r, runReq, id, req.Model, req.wantsThinking())
+		h.streamAnthropic(w, r, runReq, id, req.Model, req.wantsThinking(), bt)
 		return
 	}
-	h.syncAnthropic(w, r, runReq, id, req.Model, req.wantsThinking())
+	h.syncAnthropic(w, r, runReq, id, req.Model, req.wantsThinking(), bt)
+}
+
+// anthropicBridgeTurn 是一次工具桥请求的上下文。
+type anthropicBridgeTurn struct {
+	tools []AnthropicTool
+	cwd   string // 客户端工作目录（沙箱文件兜底转成本地路径用）
+}
+
+// anthropicBridgeOutcome 把桥模式的上游回复拆成给客户端的正文与工具调用。
+//
+// 上游没按桥的格式调用工具、却在沙箱里写了文件时，把文件变更转成客户端的
+// Write / Edit 调用（转不了就附在正文后面），不让成品留在用户拿不到的沙箱里。
+func (h *Handler) anthropicBridgeOutcome(r *http.Request, runReq *RunRequest, bt *anthropicBridgeTurn, res *RunResult) (string, []localToolCall) {
+	if res == nil {
+		return "", nil
+	}
+	prose, calls := parseLocalToolCalls(res.Text, bt.tools)
+	if len(calls) == 0 && len(res.DeltaFiles) > 0 {
+		key := runReq.StickyKey
+		if key == "" {
+			key = scopeKey(r, "cid:"+res.ConversationID)
+		}
+		if files := sessionChainFilterNewDeltaFiles("ccfiles:"+key, res.DeltaFiles); len(files) > 0 {
+			fileCalls, note := deltaFilesToClientTools(files, bt.cwd, bt.tools)
+			if len(fileCalls) > 0 {
+				calls = fileCalls
+				h.log.Info("Claude Code 工具桥：上游沙箱里的文件变更已转成本地工具调用", "files", len(files), "calls", len(fileCalls))
+			} else {
+				note = strings.TrimSpace(note + renderFileAttachments(files))
+			}
+			if note != "" {
+				prose = strings.TrimSpace(prose + "\n\n" + note)
+			}
+		}
+	}
+	if len(calls) > 0 {
+		bridgeToolUseIDs(calls, res.Text)
+		names := make([]string, len(calls))
+		for i, c := range calls {
+			names[i] = c.Name
+		}
+		h.log.Info("Claude Code 工具桥：交给客户端执行", "calls", strings.Join(names, ","))
+	}
+	return prose, calls
 }
 
 // anthropicModel 把模型表里没有的名字换成默认模型。
@@ -147,6 +216,11 @@ func anthropicConversationKey(r *http.Request, body map[string]json.RawMessage, 
 	if cid := conversationIDFrom(r, body); cid != "" {
 		return scopeKey(r, "cid:"+cid)
 	}
+	// Claude Code 的会话 ID 加首条消息指纹：同一会话里的主对话、子代理、旁路请求各是一段对话
+	// （见 firstUserFingerprint）。
+	if sid := claudeCodeSessionID(r, body); sid != "" {
+		return scopeKey(r, "sid:"+sid+"/"+firstUserFingerprint(msgs))
+	}
 	// Anthropic 没有 user 字段，用 metadata.user_id 兜底。
 	if uid := anthropicUserID(body); uid != "" {
 		return scopeKey(r, "u:"+uid)
@@ -158,7 +232,7 @@ func anthropicConversationKey(r *http.Request, body map[string]json.RawMessage, 
 	return scopeKey(r, conversationKeyBase(r, nil, conv))
 }
 
-func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id, publicModel string, thinking bool) {
+func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id, publicModel string, thinking bool, bt *anthropicBridgeTurn) {
 	// 流式头必须早于首帧，只能给出续接中的上游会话（见 streamConversationID）。
 	setConversationHeader(w, streamConversationID(runReq))
 
@@ -187,6 +261,10 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 		if err := blocks.thinking(d.Reasoning); err != nil {
 			return err
 		}
+		if bt != nil {
+			// 桥模式：正文要等整段回复到齐才分得清是不是工具调用（上游本来也只在终态给正文）。
+			return nil
+		}
 		return blocks.text(d.Text)
 	}
 
@@ -208,6 +286,21 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 		return
 	}
 
+	stop := "end_turn"
+	if bt != nil {
+		prose, calls := h.anthropicBridgeOutcome(r, runReq, bt, res)
+		if blocks.text(prose) != nil {
+			return
+		}
+		for _, c := range calls {
+			if blocks.toolUse(c) != nil {
+				return
+			}
+		}
+		if len(calls) > 0 {
+			stop = "tool_use"
+		}
+	}
 	if blocks.finish() != nil {
 		return
 	}
@@ -217,7 +310,7 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 		usage = res.Usage
 	}
 	buf = AppendAnthropicEvent(buf[:0], AnthropicEvent{
-		Type: "message_delta", StopReason: "end_turn", Usage: usage,
+		Type: "message_delta", StopReason: stop, Usage: usage,
 	})
 	_ = sw.WriteRaw(buf)
 
@@ -225,7 +318,7 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 	_ = sw.WriteRaw(buf)
 }
 
-func (h *Handler) syncAnthropic(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id, publicModel string, thinking bool) {
+func (h *Handler) syncAnthropic(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id, publicModel string, thinking bool, bt *anthropicBridgeTurn) {
 	res, err := h.runner.Run(r.Context(), runReq, nil)
 	bindLogResult(r, res)
 	if err != nil {
@@ -251,6 +344,20 @@ func (h *Handler) syncAnthropic(w http.ResponseWriter, r *http.Request, runReq *
 		Model:      publicModel,
 		Content:    []AnthropicContent{{Type: "text", Text: text}},
 		StopReason: "end_turn",
+	}
+	if bt != nil {
+		prose, calls := h.anthropicBridgeOutcome(r, runReq, bt, res)
+		text = prose
+		resp.Content = resp.Content[:0]
+		if prose != "" || len(calls) == 0 {
+			resp.Content = append(resp.Content, AnthropicContent{Type: "text", Text: prose})
+		}
+		for _, c := range calls {
+			resp.Content = append(resp.Content, AnthropicContent{Type: "tool_use", ID: c.ID, Name: c.Name, Input: c.Input})
+		}
+		if len(calls) > 0 {
+			resp.StopReason = "tool_use"
+		}
 	}
 	if thinking && res != nil && res.Reasoning != "" {
 		resp.Content = append([]AnthropicContent{{Type: "thinking", Thinking: res.Reasoning, Signature: anthropicThinkingSignature}}, resp.Content...)
@@ -328,6 +435,7 @@ type anthropicBlocks struct {
 	index      int    // 当前打开（或下一个要开）的块
 	open       string // "", "thinking", "text"
 	hasText    bool
+	hasTool    bool
 	late       strings.Builder
 }
 
@@ -390,7 +498,24 @@ func (b *anthropicBlocks) text(text string) error {
 	return b.write(AnthropicEvent{Type: "content_block_delta", Text: text})
 }
 
-// finish 关闭仍打开的块、补发迟到的思考；一个正文块都没有时补一个空的（空回答也要有正文块）。
+// toolUse 写一个完整的 tool_use 块（Claude Code 工具桥）：开块、参数 JSON、关块。
+func (b *anthropicBlocks) toolUse(c localToolCall) error {
+	if err := b.stop(); err != nil {
+		return err
+	}
+	b.hasTool = true
+	if err := b.write(AnthropicEvent{Type: "content_block_start", Block: "tool_use", ToolID: c.ID, ToolName: c.Name}); err != nil {
+		return err
+	}
+	if err := b.write(AnthropicEvent{Type: "content_block_delta", Block: "tool_use", Text: string(c.Input)}); err != nil {
+		return err
+	}
+	err := b.write(AnthropicEvent{Type: "content_block_stop"})
+	b.index++
+	return err
+}
+
+// finish 关闭仍打开的块、补发迟到的思考；正文块、工具调用都没有时补一个空正文块（空回答也要有正文块）。
 func (b *anthropicBlocks) finish() error {
 	if err := b.stop(); err != nil {
 		return err
@@ -404,7 +529,7 @@ func (b *anthropicBlocks) finish() error {
 			return err
 		}
 	}
-	if !b.hasText {
+	if !b.hasText && !b.hasTool {
 		if err := b.start("text"); err != nil {
 			return err
 		}

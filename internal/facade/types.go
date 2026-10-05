@@ -111,6 +111,10 @@ type ChatMessage struct {
 
 	// 有些客户端用 reasoning_content 回传上一轮的思维链。
 	ReasoningContent string `json:"reasoning_content,omitempty"`
+
+	// fp 非 0 时是这条（助手）消息在原生续接比对里的指纹：客户端回传的形态拼不回上游原文时
+	// 由翻译层给出（见 anthropic_bridge.go bridgeToolUseIDs）。
+	fp uint64
 }
 
 // ToolCall 是一次函数调用。
@@ -228,6 +232,8 @@ type AnthropicMessage struct {
 
 // AnthropicTool 是工具定义（Anthropic 用的字段名与 OpenAI 不同）。
 type AnthropicTool struct {
+	// Type 为空或 custom 是客户端执行的工具；web_search_20250305 这类是 Anthropic 服务端工具。
+	Type        string          `json:"type,omitempty"`
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	InputSchema json.RawMessage `json:"input_schema,omitempty"`
@@ -251,6 +257,11 @@ type AnthropicContent struct {
 	Text      string `json:"text,omitempty"`
 	Thinking  string `json:"thinking,omitempty"`
 	Signature string `json:"signature,omitempty"`
+
+	// tool_use 块（Claude Code 工具桥，见 anthropic_bridge.go）
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
 }
 
 // AnthropicUsage 是用量。

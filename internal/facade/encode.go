@@ -126,9 +126,13 @@ type AnthropicEvent struct {
 	Index      int
 	// ErrorType 是 error 事件的 error.type（默认 api_error）。
 	ErrorType string
-	// Block 是内容块类型："thinking" 或正文（空）；Signature 非空时是思考块的签名增量。
+	// Block 是内容块类型："thinking"、"tool_use" 或正文（空）；Signature 非空时是思考块的签名增量。
 	Block     string
 	Signature string
+	// ToolID / ToolName 是 tool_use 块的调用 ID 与工具名（content_block_start 用）；
+	// tool_use 块的 delta 里 Text 是参数 JSON（input_json_delta）。
+	ToolID   string
+	ToolName string
 }
 
 // AppendAnthropicEvent 编码一个 Anthropic SSE 事件（含 event: 行）。
@@ -157,9 +161,16 @@ func AppendAnthropicEvent(dst []byte, e AnthropicEvent) []byte {
 	case "content_block_start":
 		dst = append(dst, `{"type":"content_block_start","index":`...)
 		dst = sse.AppendInt(dst, int64(e.Index))
-		if e.Block == "thinking" {
+		switch e.Block {
+		case "thinking":
 			dst = append(dst, `,"content_block":{"type":"thinking","thinking":"","signature":""}}`...)
-		} else {
+		case "tool_use":
+			dst = append(dst, `,"content_block":{"type":"tool_use","id":`...)
+			dst = sse.AppendJSONString(dst, e.ToolID)
+			dst = append(dst, `,"name":`...)
+			dst = sse.AppendJSONString(dst, e.ToolName)
+			dst = append(dst, `,"input":{}}}`...)
+		default:
 			dst = append(dst, `,"content_block":{"type":"text","text":""}}`...)
 		}
 
@@ -172,6 +183,9 @@ func AppendAnthropicEvent(dst []byte, e AnthropicEvent) []byte {
 			dst = sse.AppendJSONString(dst, e.Signature)
 		case e.Block == "thinking":
 			dst = append(dst, `,"delta":{"type":"thinking_delta","thinking":`...)
+			dst = sse.AppendJSONString(dst, e.Text)
+		case e.Block == "tool_use":
+			dst = append(dst, `,"delta":{"type":"input_json_delta","partial_json":`...)
 			dst = sse.AppendJSONString(dst, e.Text)
 		default:
 			dst = append(dst, `,"delta":{"type":"text_delta","text":`...)

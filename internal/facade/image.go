@@ -384,10 +384,14 @@ func imageMIME(ext string) string {
 }
 
 // attachmentHint 告诉模型附件在沙箱工作区里的实际位置。
+//
+// 还要说明"打开附图不算用工具"：用户常说"不要用任何工具 / 直接回答"（本意是别动文件），
+// 模型照字面连 view_image 也不调，回一句"看不到图片"（2026-10-05 Claude Code 实测）。
 func attachmentHint(projectPath string) string {
 	rel := strings.TrimPrefix(projectPath, "/")
 	return "(Attached image: view it with your view_image tool at the workspace-relative path `" + rel +
-		"` — relative to your current working directory, not `/" + rel + "` at the filesystem root.)"
+		"` — relative to your current working directory, not `/" + rel + "` at the filesystem root. " +
+		"Viewing an attached image is how you read the user's message: always do it, even if the user asks you not to use tools or to answer directly.)"
 }
 
 // localImagePathRe 匹配 Codex 给图片加的标签里的本机路径：<image name=[Image #1] path="F:\...">。

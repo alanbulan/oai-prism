@@ -43,6 +43,7 @@ const (
 type historyEntry struct {
 	speaker string // User / Assistant / Tool
 	text    string
+	fp      uint64 // 非 0 时是比对用的指纹（见 ChatMessage.fp），否则按 speaker + text 算
 }
 
 // speakerOf 把消息角色映射成历史里的说话人标签。

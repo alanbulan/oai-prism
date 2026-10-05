@@ -32,7 +32,7 @@ func TestNativeDelta_StrongKeySkipsAssistant(t *testing.T) {
 	b := committed(t1, "```codex-exec\ncat a.txt\n```")
 
 	t2 := &nativeTurn{strong: true, conv: nativeConv("SYS", "[CLIENT RESULT] hello",
-		historyEntry{"User", "读 a.txt"}, historyEntry{"Assistant", "[tool_call] exec(cat a.txt)"})}
+		historyEntry{speaker: "User", text: "读 a.txt"}, historyEntry{speaker: "Assistant", text: "[tool_call] exec(cat a.txt)"})}
 	rest, ok := t2.delta(b, t2.conv.entries())
 	if !ok || len(rest) != 1 || rest[0].text != "[CLIENT RESULT] hello" {
 		t.Fatalf("增量应只有本轮工具结果: ok=%v %+v", ok, rest)
@@ -40,14 +40,14 @@ func TestNativeDelta_StrongKeySkipsAssistant(t *testing.T) {
 
 	// 并行工具调用：两条结果都是新的，最后一条是本轮消息。
 	t3 := &nativeTurn{strong: true, conv: nativeConv("SYS", "[CLIENT RESULT] two",
-		historyEntry{"User", "读 a.txt"}, historyEntry{"Assistant", "call"}, historyEntry{"User", "[CLIENT RESULT] one"})}
+		historyEntry{speaker: "User", text: "读 a.txt"}, historyEntry{speaker: "Assistant", text: "call"}, historyEntry{speaker: "User", text: "[CLIENT RESULT] one"})}
 	rest, ok = t3.delta(b, t3.conv.entries())
 	if !ok || len(rest) != 2 {
 		t.Fatalf("应带上两条新结果: ok=%v %+v", ok, rest)
 	}
 
 	// 历史被改写（首条不同）：对不上，须新建会话。
-	t4 := &nativeTurn{strong: true, conv: nativeConv("SYS", "继续", historyEntry{"User", "读 b.txt"}, historyEntry{"Assistant", "x"})}
+	t4 := &nativeTurn{strong: true, conv: nativeConv("SYS", "继续", historyEntry{speaker: "User", text: "读 b.txt"}, historyEntry{speaker: "Assistant", text: "x"})}
 	if _, ok := t4.delta(b, t4.conv.entries()); ok {
 		t.Fatal("改写过的历史不能接到旧会话上")
 	}
@@ -58,11 +58,11 @@ func TestNativeDelta_WeakKeyMatchesAssistantText(t *testing.T) {
 	t1 := &nativeTurn{conv: nativeConv("", "你好")}
 	b := committed(t1, "你好！我是 A")
 
-	same := &nativeTurn{conv: nativeConv("", "第二问", historyEntry{"User", "你好"}, historyEntry{"Assistant", "你好！我是 A"})}
+	same := &nativeTurn{conv: nativeConv("", "第二问", historyEntry{speaker: "User", text: "你好"}, historyEntry{speaker: "Assistant", text: "你好！我是 A"})}
 	if rest, ok := same.delta(b, same.conv.entries()); !ok || len(rest) != 1 || rest[0].text != "第二问" {
 		t.Fatalf("同一段对话应只发本轮: ok=%v %+v", ok, rest)
 	}
-	other := &nativeTurn{conv: nativeConv("", "第二问", historyEntry{"User", "你好"}, historyEntry{"Assistant", "你好！我是 B"})}
+	other := &nativeTurn{conv: nativeConv("", "第二问", historyEntry{speaker: "User", text: "你好"}, historyEntry{speaker: "Assistant", text: "你好！我是 B"})}
 	if _, ok := other.delta(b, other.conv.entries()); ok {
 		t.Fatal("助手原文不同说明是另一段对话，不能续接")
 	}
@@ -91,21 +91,21 @@ func TestNativeDelta_SingleMessageClient(t *testing.T) {
 func TestNativeDelta_RebaseOnCompactionSummary(t *testing.T) {
 	summary := "Progress summary: created a.txt and b.txt; next step is to run the tests. " + strings.Repeat("detail ", 20)
 	comp := &nativeTurn{strong: true, compaction: true, conv: nativeConv("SYS", "You are performing a CONTEXT CHECKPOINT COMPACTION.",
-		historyEntry{"User", "建两个文件"}, historyEntry{"Assistant", "call"}, historyEntry{"User", "[CLIENT RESULT] ok"})}
+		historyEntry{speaker: "User", text: "建两个文件"}, historyEntry{speaker: "Assistant", text: "call"}, historyEntry{speaker: "User", text: "[CLIENT RESULT] ok"})}
 	b := committed(comp, summary)
 	if b.summary == "" {
 		t.Fatal("压缩轮应记下摘要")
 	}
 
 	after := &nativeTurn{strong: true, conv: nativeConv("SYS", "现在跑测试",
-		historyEntry{"User", "建两个文件"},
-		historyEntry{"User", "Another language model started to solve this problem and produced a summary of its thinking process.\n" + summary})}
+		historyEntry{speaker: "User", text: "建两个文件"},
+		historyEntry{speaker: "User", text: "Another language model started to solve this problem and produced a summary of its thinking process.\n" + summary})}
 	rest, ok := after.delta(b, after.conv.entries())
 	if !ok || len(rest) != 1 || rest[0].text != "现在跑测试" {
 		t.Fatalf("应从摘要之后接上: ok=%v %+v", ok, rest)
 	}
 	// 压缩发生在一轮中间：摘要就是最后一条，原样发给上游让它接着干。
-	mid := &nativeTurn{strong: true, conv: nativeConv("SYS", "Another language model started… "+summary, historyEntry{"User", "建两个文件"})}
+	mid := &nativeTurn{strong: true, conv: nativeConv("SYS", "Another language model started… "+summary, historyEntry{speaker: "User", text: "建两个文件"})}
 	if rest, ok := mid.delta(b, mid.conv.entries()); !ok || len(rest) != 1 {
 		t.Fatalf("摘要是本轮消息时应续接: ok=%v %+v", ok, rest)
 	}
@@ -148,7 +148,7 @@ func TestNativeDeltaItems_SystemRefresh(t *testing.T) {
 func TestNativeDeltaItems_PriorEntries(t *testing.T) {
 	nt := &nativeTurn{strong: true, conv: nativeConv("S", "[CLIENT RESULT] last")}
 	b := &nativeBinding{sysHash: textFingerprint("S")}
-	rest := []historyEntry{{"User", "[CLIENT RESULT] first"}, {"User", "[CLIENT RESULT] last"}}
+	rest := []historyEntry{{speaker: "User", text: "[CLIENT RESULT] first"}, {speaker: "User", text: "[CLIENT RESULT] last"}}
 	items, _, _ := nt.deltaItems(b, rest, 0, "")
 	user := itemText(items[1])
 	if !strings.HasPrefix(user, nativeSinceHeader+"User: [CLIENT RESULT] first\n\n") || !strings.HasSuffix(user, "[CLIENT RESULT] last") {
@@ -157,9 +157,9 @@ func TestNativeDeltaItems_PriorEntries(t *testing.T) {
 
 	var big []historyEntry
 	for i := 0; i < 20; i++ {
-		big = append(big, historyEntry{"User", "[CLIENT RESULT] " + strings.Repeat("o", 2000)})
+		big = append(big, historyEntry{speaker: "User", text: "[CLIENT RESULT] " + strings.Repeat("o", 2000)})
 	}
-	big = append(big, historyEntry{"User", "[CLIENT RESULT] last"})
+	big = append(big, historyEntry{speaker: "User", text: "[CLIENT RESULT] last"})
 	items, _, _ = nt.deltaItems(b, big, 12000, "")
 	if n := promptBytes(items); n > 12000 || !strings.Contains(itemText(items[1]), historyOmittedMark) {
 		t.Fatalf("超限应裁剪并注明（%d 字节）", n)
@@ -247,7 +247,7 @@ func TestChatConversation(t *testing.T) {
 func TestNativeSeedTurns(t *testing.T) {
 	var hist []historyEntry
 	for i := 0; i < 40; i++ {
-		hist = append(hist, historyEntry{"User", fmt.Sprintf("Q%02d %s", i, strings.Repeat("长", 1000))})
+		hist = append(hist, historyEntry{speaker: "User", text: fmt.Sprintf("Q%02d %s", i, strings.Repeat("长", 1000))})
 	}
 	nt := &nativeTurn{strong: true, conv: nativeConv("SYS", "当前问题", hist...)}
 	const limit = 24000
@@ -278,7 +278,7 @@ func TestNativeSeedTurns(t *testing.T) {
 	// 超过补种总量：只补最近的，注明省略。
 	big := make([]historyEntry, 0, 400)
 	for i := 0; i < 400; i++ {
-		big = append(big, historyEntry{"User", fmt.Sprintf("B%03d %s", i, strings.Repeat("x", 4000))})
+		big = append(big, historyEntry{speaker: "User", text: fmt.Sprintf("B%03d %s", i, strings.Repeat("x", 4000))})
 	}
 	nt.conv.history = big
 	seeds = nt.seedTurns(96 << 10)
@@ -300,7 +300,7 @@ func TestNativeDelta_WeakBindingFoundByHandle(t *testing.T) {
 		t.Fatalf("凭句柄找回、只发本轮的客户端应直接追加: ok=%v %+v", ok, rest)
 	}
 	full := &nativeTurn{strong: true, weak: b.weak, conv: nativeConv("", "第二问",
-		historyEntry{"User", "你好"}, historyEntry{"Assistant", "你好！我是 A"})}
+		historyEntry{speaker: "User", text: "你好"}, historyEntry{speaker: "Assistant", text: "你好！我是 A"})}
 	if rest, ok := full.delta(b, full.conv.entries()); !ok || len(rest) != 1 || rest[0].text != "第二问" {
 		t.Fatalf("带历史时应按弱键比对并只发本轮: ok=%v %+v", ok, rest)
 	}
@@ -385,13 +385,13 @@ func TestNativeStore_SurvivesRestart(t *testing.T) {
 	r.UseNativeStore(st)
 	got := nativeBindingPeek(key)
 	if got == nil || got.cid != "cdx1_persist" || got.account != "acct" || got.project != "proj" || got.sinceSys != 42 ||
-		len(got.delivered) != 1 || got.delivered[0] != entryFingerprint(historyEntry{"User", "记住 PERSIST-9"}) {
+		len(got.delivered) != 1 || got.delivered[0] != entryFingerprint(historyEntry{speaker: "User", text: "记住 PERSIST-9"}) {
 		t.Fatalf("重启后应恢复绑定: %+v", got)
 	}
 	if nativeBindingPeek("k:0badc0de0badc0de|cid:cdx1_persist") != got || nativeBindingPeek("k:0badc0de0badc0de|r:resp_p") != got {
 		t.Fatal("别名应指向恢复出的同一个绑定")
 	}
-	next := &nativeTurn{key: key, strong: true, conv: nativeConv("SYS", "暗号是什么？", historyEntry{"User", "记住 PERSIST-9"}, historyEntry{"Assistant", "好"})}
+	next := &nativeTurn{key: key, strong: true, conv: nativeConv("SYS", "暗号是什么？", historyEntry{speaker: "User", text: "记住 PERSIST-9"}, historyEntry{speaker: "Assistant", text: "好"})}
 	if rest, ok := next.delta(got, next.conv.entries()); !ok || len(rest) != 1 || rest[0].text != "暗号是什么？" {
 		t.Fatalf("恢复后应只发增量: ok=%v %+v", ok, rest)
 	}

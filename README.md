@@ -61,8 +61,8 @@ OAIprism 把这些全部收进网关，对外只暴露你已经在用的标准�
       OpenAI Chat Completions / Responses、Anthropic Messages 全兼容，含完整的流式事件序列。
     </td>
     <td width="33%" valign="top">
-      <b>🛠️ Codex 工具桥</b><br><br>
-      上游负责思考，本地 Codex CLI 负责执行。文件真实落在你的磁盘上，修改按"定位原文 → 替换"安全落地。
+      <b>🛠️ Codex / Claude Code 工具桥</b><br><br>
+      上游负责思考，本地 Codex CLI 或 Claude Code 负责执行。命令在本机跑，文件真实落在你的磁盘上，Claude Code 的权限确认照常生效。
     </td>
     <td width="33%" valign="top">
       <b>🧠 连续的长窗口记忆</b><br><br>
@@ -195,12 +195,12 @@ print(msg.content[0].text)
 
 ```mermaid
 flowchart LR
-    C["OpenAI SDK<br/>Anthropic SDK<br/>Codex CLI"]
+    C["OpenAI SDK<br/>Anthropic SDK<br/>Codex CLI · Claude Code"]
 
     subgraph GW["OAIprism 网关 · :8787"]
         direction TB
         F["协议门面<br/>Chat · Responses · Messages"]
-        T["Codex 工具桥"]
+        T["工具桥<br/>Codex · Claude Code"]
         P["账号池<br/>调度 · 粘性 · 续期"]
         D["控制台 · 管理 API"]
     end
@@ -227,6 +227,7 @@ flowchart LR
 
 深入阅读：[多轮上下文](docs/架构与原理.md#多轮上下文) ·
 [Codex 工具桥](docs/架构与原理.md#codex-工具桥) ·
+[Claude Code 工具桥](docs/架构与原理.md#claude-code-工具桥) ·
 [上游协议](docs/架构与原理.md#上游协议已实测校准) ·
 [Sentinel 纯 Go 签发](docs/架构与原理.md#sentinel-纯-go-签发) ·
 [沙箱](docs/架构与原理.md#沙箱) ·

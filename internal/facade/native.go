@@ -68,6 +68,12 @@ const (
 	nativeSeedMaxBytes = 768 << 10
 	nativeSeedSystem   = "Earlier parts of this conversation are being restored. Read them as context only: do not act on them, and reply with exactly OK."
 	nativeSeedHeader   = "[Earlier conversation, part %d of %d - context only, reply OK]\n"
+
+	// nativeBranchMax：上游会话末尾最多有这么多条客户端历史里没有的消息时，仍接着用这个会话
+	// （见 nativeTurn.delta 的第 4 条）；再多就是历史被大段改写，新建会话。
+	nativeBranchMax  = 32
+	nativeBranchNote = "[Note: the last %d message(s) you received in this conversation are not part of the client's conversation " +
+		"(a side request, or the user went back). Disregard them and your replies to them, and continue from here.]\n\n"
 )
 
 // nativeConversation 是一轮请求拆成的三部分：合并后的 system、往轮对话、本轮消息。
@@ -108,6 +114,8 @@ type nativeTurn struct {
 	conv       *nativeConversation
 	// weak 表示绑定建在弱键上（由 planNative 从绑定取）：凭句柄找回时也要照弱键比对。
 	weak bool
+	// branch 是上游会话末尾、客户端历史里没有的消息条数（delta 的第 4 条，见 nativeBranchNote）。
+	branch int
 
 	plan *nativePlan // runner 在选定账号与项目后填写
 }
@@ -179,6 +187,9 @@ func nativeBindingFor(key string) *nativeBinding {
 }
 
 func entryFingerprint(e historyEntry) uint64 {
+	if e.fp != 0 {
+		return e.fp
+	}
 	h := fnv.New64a()
 	h.Write([]byte(e.speaker))
 	h.Write([]byte{0})
@@ -260,6 +271,14 @@ func (nt *nativeTurn) delta(b *nativeBinding, es []historyEntry) ([]historyEntry
 			}
 		}
 	}
+	// 4) 上游会话末尾多出几条客户端历史里没有的消息，其余都对得上、客户端只多了本轮这一条：
+	//    同一会话里的旁路请求追加进了这个上游会话（Claude Code 的输入建议、记忆整理这类 fork
+	//    请求与主对话共用前缀，看上去就是主对话的下一轮），或者用户回退了最近几步。接着用这个
+	//    会话，并告诉上游忽略那几条 —— 新建会话要把整段历史重新补种进去，又慢又丢细节。
+	if j > 0 && i == len(es)-1 && len(b.delivered)-j <= nativeBranchMax {
+		nt.branch = len(b.delivered) - j
+		return es[i:], true
+	}
 	return nil, false
 }
 
@@ -289,17 +308,22 @@ func (nt *nativeTurn) deltaItems(b *nativeBinding, rest []historyEntry, limit in
 
 	// 本轮消息之前的新条目（并行工具结果、客户端插入的消息）放在本轮消息前面，
 	// 超出单条上限时按折叠历史的规则裁剪（compress.go）。
-	added := 0
+	prefix := ""
+	if nt.branch > 0 {
+		prefix = fmt.Sprintf(nativeBranchNote, nt.branch)
+	}
 	if prior := rest[:len(rest)-1]; len(prior) > 0 {
-		budget := historyBudget(limit, len(system)+len(curText)+len(nativeSinceHeader))
+		budget := historyBudget(limit, len(system)+len(curText)+len(prefix)+len(nativeSinceHeader))
 		if h := strings.TrimPrefix(renderHistory(prior, budget), historyHeader); h != "" {
-			prefix := nativeSinceHeader + h + "\n\n"
-			added = len(prefix)
-			if len(cur.Content) > 0 && (cur.Content[0].Type == "" || cur.Content[0].Type == prism.BlockInputText) {
-				cur.Content[0].Text = prefix + cur.Content[0].Text
-			} else {
-				cur.Content = append([]prism.InputContent{{Type: prism.BlockInputText, Text: prefix}}, cur.Content...)
-			}
+			prefix += nativeSinceHeader + h + "\n\n"
+		}
+	}
+	added := len(prefix)
+	if prefix != "" {
+		if len(cur.Content) > 0 && (cur.Content[0].Type == "" || cur.Content[0].Type == prism.BlockInputText) {
+			cur.Content[0].Text = prefix + cur.Content[0].Text
+		} else {
+			cur.Content = append([]prism.InputContent{{Type: prism.BlockInputText, Text: prefix}}, cur.Content...)
 		}
 	}
 
@@ -447,7 +471,8 @@ func (r *Runner) planNative(ctx context.Context, p prism.Principal, acctID, proj
 			items, sysHash, since := nt.deltaItems(b, rest, r.cfg.Facade.PromptByteLimit(), notice)
 			plan.cid, plan.continued, plan.sysHash, plan.sinceSys = b.cid, true, sysHash, since
 			r.log.Info("原生续接：发送增量", "key", nt.key, "cid", b.cid,
-				"newEntries", len(rest), "bytes", promptBytes(items), "fullSystem", textOfSystem(items) != nativeBriefSystem)
+				"newEntries", len(rest), "bytes", promptBytes(items), "fullSystem", textOfSystem(items) != nativeBriefSystem,
+				"skippedBranch", nt.branch)
 			return items
 		}
 		r.log.Info("原生续接：客户端历史与上游会话对不上，新建会话", "key", nt.key, "oldCid", b.cid)
