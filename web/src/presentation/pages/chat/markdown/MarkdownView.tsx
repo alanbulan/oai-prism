@@ -11,7 +11,7 @@ import 'katex/dist/katex.min.css';
 import './markdown.css';
 import { CodeBlock } from './CodeBlock';
 import { HtmlPreview } from './HtmlPreview';
-import { codeOf, normalizeMath, previewKind, sanitizeSchema } from './utils';
+import { codeOf, fenceRawDocuments, normalizeMath, previewKind, sanitizeSchema } from './utils';
 
 type PluggableList = NonNullable<Options['rehypePlugins']>;
 
@@ -61,9 +61,9 @@ interface MarkdownViewProps {
   className?: string;
 }
 
-/** 助手消息渲染：GFM、公式、代码高亮、HTML/SVG 沙箱预览，裸 HTML 经白名单清洗 */
+/** 助手消息渲染：GFM、公式、代码高亮、HTML/SVG 沙箱预览（不带围栏的整份文档也算），裸 HTML 经白名单清洗 */
 export const MarkdownView: React.FC<MarkdownViewProps> = React.memo(({ content, streaming = false, className }) => {
-  const md = useMemo(() => normalizeMath(content), [content]);
+  const md = useMemo(() => normalizeMath(fenceRawDocuments(content)), [content]);
   return (
     <div className={className ? `md-body ${className}` : 'md-body'}>
       <ReactMarkdown

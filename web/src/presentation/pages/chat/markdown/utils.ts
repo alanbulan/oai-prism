@@ -44,6 +44,69 @@ export function normalizeMath(md: string): string {
     .join('');
 }
 
+// ---------------------------------------------------------------- 裸文档补围栏
+//
+// 用户说"直接输出 HTML"时，模型会把整份 <!DOCTYPE html> 文档（或一段 <svg>）当作回复本身，
+// 不加 ``` 围栏。按 Markdown 解析它会被拆碎：<style>/<script> 被清洗掉，缩进四格的行变成
+// 一个个 text 代码块，剩下的标题、段落散落在回复里（2026-10-05 摸糖果可视化）。
+// 这里给围栏外、从行首开始的完整文档补上 ```html / ```svg 围栏，走正常的预览流程；
+// 还没收到结束标签（生成中或输出被截断）时包到结尾。
+const RAW_DOC_HINT = /<!doctype\s+html|<html[\s>]|<svg[\s>]/i;
+const HTML_DOC_START = /^ {0,3}(?:<!doctype\s+html|<html[\s>])/i;
+const SVG_START = /^ {0,3}(?:<\?xml[^>]*>\s*)?<svg[\s>]/i;
+const FENCE_LINE = /^\s*(`{3,}|~{3,})(.*)$/;
+
+/** 文档结束位置（结束标签之后）；没有结束标签时到全文末尾 */
+function rawDocEnd(md: string, from: number, kind: PreviewKind): number {
+  if (kind === 'html') {
+    const m = /<\/html\s*>/i.exec(md.slice(from));
+    return m ? from + m.index + m[0].length : md.length;
+  }
+  // SVG 可以嵌套：按开闭标签计数，找到与开头配对的 </svg>
+  const tags = /<svg[\s>]|<\/svg\s*>/gi;
+  tags.lastIndex = from;
+  let depth = 0;
+  for (let m = tags.exec(md); m; m = tags.exec(md)) {
+    depth += m[0][1] === '/' ? -1 : 1;
+    if (depth === 0) return m.index + m[0].length;
+  }
+  return md.length;
+}
+
+export function fenceRawDocuments(md: string): string {
+  if (!RAW_DOC_HINT.test(md)) return md;
+  let out = '';
+  let pos = 0;
+  let fence = ''; // 所在围栏的开头标记；空 = 不在围栏里
+  while (pos < md.length) {
+    const nl = md.indexOf('\n', pos);
+    const lineEnd = nl < 0 ? md.length : nl + 1;
+    const line = md.slice(pos, nl < 0 ? md.length : nl).replace(/\r$/, '');
+    const f = FENCE_LINE.exec(line);
+    if (fence) {
+      if (f && f[1][0] === fence[0] && f[1].length >= fence.length && !f[2].trim()) fence = '';
+    } else if (f && !(f[1][0] === '`' && f[2].includes('`'))) {
+      fence = f[1];
+    } else {
+      const kind: PreviewKind | null = HTML_DOC_START.test(line) ? 'html' : SVG_START.test(line) ? 'svg' : null;
+      if (kind) {
+        const end = rawDocEnd(md, pos, kind);
+        const doc = md.slice(pos, end).replace(/\s+$/, '');
+        // 围栏比文档里最长的一串反引号还长一截（JS 模板字符串、内嵌的 Markdown 示例）
+        const longest = Math.max(0, ...(doc.match(/`+/g) || []).map((s) => s.length));
+        const ticks = '`'.repeat(Math.max(3, longest + 1));
+        out += `${ticks}${kind}\n${doc}\n${ticks}\n`;
+        // 结束标签后同一行还有文字时，从那里另起一行继续
+        pos = md[end] === '\n' ? end + 1 : end;
+        continue;
+      }
+    }
+    out += md.slice(pos, lineEnd);
+    pos = lineEnd;
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- hast 文本
 interface HastLike {
   type?: string;
