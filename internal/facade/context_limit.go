@@ -77,8 +77,8 @@ func isUpstreamTooLarge(msg string) bool {
 // 非桥请求再前置平台声明。预检与 runOnce 共用，保证量的是同一份内容。
 func (r *Runner) upstreamPromptItems(req *RunRequest) []prism.InputItem {
 	items := canonicalUpstreamInput(req.Input)
-	if !req.Bridge && r.cfg.Facade.PlatformNotice {
-		items = prependSystemText(items, platformNotice)
+	if notice := r.noticeFor(req); notice != "" {
+		items = prependSystemText(items, notice)
 	}
 	return items
 }

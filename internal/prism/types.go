@@ -332,6 +332,8 @@ type StatusResponse struct {
 	Delta     string
 	Reset     bool
 	Reasoning string
+	// ReasoningParts 是 Reasoning 的逐条拆分（每条 summary 一段），用于与进行中的转录摘要去重。
+	ReasoningParts []string
 
 	// OutputItems 是上游返回的确定性 Response 条目列表（支持 message, function_call, reasoning 等）。
 	OutputItems []CodexOutputItem
@@ -349,6 +351,9 @@ type StatusResponse struct {
 	Done  bool
 	Fail  bool
 	Usage *Usage
+
+	// Progress 是生成进行中的增量进度（codex_live_progress），没有时为 nil。
+	Progress *LiveProgress
 
 	Raw json.RawMessage
 }
@@ -377,6 +382,39 @@ func (f CodexDeltaFile) DiffString() string {
 	out := string(f.Diff)
 	out = strings.TrimSpace(out)
 	return out
+}
+
+// LiveProgress 是上游在 pending 轮询里下发的进度（codex_live_progress）。
+//
+// 上游模型以 Codex 智能体的方式在沙箱里干活：思考、调工具（search / list / apply_patch …）、
+// 写文件，最后才给出回答。正文与终态思考摘要只在终态一次性给出，但每次轮询都会带上
+// 自上次 turn_state.transcript_cursor 之后新增的转录行 —— 只含增量，不是全量。
+//
+// 实测形状（2026-10-05）：
+//
+//	{"transcriptCursor":31,"lineCount":9,
+//	 "reasoningSummaries":[{"line_index":23,"text":"**Designing …** …","source":"reasoning"}],
+//	 "toolCalls":[{"line_index":26,"call_id":"tool:26:0","name":"apply_patch","call_type":"function_call",…}],
+//	 "eventPreviews":[]}
+type LiveProgress struct {
+	// TranscriptCursor 是转录游标：前进了就说明上游还在干活（哪怕这一轮没有可展示的条目）。
+	TranscriptCursor   int             `json:"transcriptCursor"`
+	LineCount          int             `json:"lineCount"`
+	ReasoningSummaries []LiveReasoning `json:"reasoningSummaries"`
+	ToolCalls          []LiveToolCall  `json:"toolCalls"`
+}
+
+// LiveReasoning 是一条进行中的思考摘要。
+type LiveReasoning struct {
+	LineIndex int    `json:"line_index"`
+	Text      string `json:"text"`
+}
+
+// LiveToolCall 是一次进行中的上游工具调用（只有名字，参数不下发）。
+type LiveToolCall struct {
+	LineIndex int    `json:"line_index"`
+	CallID    string `json:"call_id"`
+	Name      string `json:"name"`
 }
 
 // CodexOutputItem 是上游返回的单个 Output 条目（Response 协议一等公民）。
@@ -417,7 +455,9 @@ type PrismEnvelope struct {
 	// transcript_cursor 等）。下一轮 start 必须原样回传 —— 多轮续接的
 	// 另一半钥匙（另一半是 previousResponseId）。真实 Web 每轮都带。
 	ListenSnapshot json.RawMessage `json:"codex_listen_snapshot,omitempty"`
-	Response       *struct {
+	// LiveProgress 单独解码（见 parseEnvelope）：进度字段形状一变，不能连累整个包络退回宽松解析。
+	LiveProgress json.RawMessage `json:"codex_live_progress,omitempty"`
+	Response     *struct {
 		Status  string        `json:"status"` // "success", "error"
 		Payload *CodexPayload `json:"payload"`
 	} `json:"response,omitempty"`

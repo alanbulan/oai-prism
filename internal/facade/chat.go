@@ -52,6 +52,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		ProjectID:    projectID,
 		API:          "chat",
 		ExtraHeaders: extractSentinelToken(r),
+		FileTools:    len(req.Tools) > 0,
 	}
 	runReq.Extra = passthroughFields(rawFields, chatKnownFields)
 	// 原生续接：会话历史由上游保管，续接轮次只发增量（见 native.go）。
@@ -209,7 +210,14 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 
 	var toolCalls []ToolCall
 	if res != nil && len(res.DeltaFiles) > 0 {
-		toolCalls = MapDeltaFilesToToolCalls(res.DeltaFiles, declaredTools)
+		if len(declaredTools) > 0 {
+			toolCalls = MapDeltaFilesToToolCalls(res.DeltaFiles, declaredTools)
+		} else if att := chatFileAttachments(r, res); att != "" {
+			// 客户端没声明工具：成品文件附在回答后面（见 chat_files.go）
+			if err := emit(Delta{Text: att}); err != nil {
+				return
+			}
+		}
 		h.applyLocalWorkspace(r, res.DeltaFiles)
 	}
 
@@ -266,15 +274,20 @@ func (h *Handler) syncChat(w http.ResponseWriter, r *http.Request, runReq *RunRe
 	}
 
 	var toolCalls []ToolCall
-	if res != nil && len(res.DeltaFiles) > 0 {
-		toolCalls = MapDeltaFilesToToolCalls(res.DeltaFiles, declaredTools)
+	text := res.Text
+	if len(res.DeltaFiles) > 0 {
+		if len(declaredTools) > 0 {
+			toolCalls = MapDeltaFilesToToolCalls(res.DeltaFiles, declaredTools)
+		} else {
+			text += chatFileAttachments(r, res) // 客户端没声明工具：成品文件附在回答后面
+		}
 		h.applyLocalWorkspace(r, res.DeltaFiles)
 	}
 
 	fin := finishReason(toolCalls)
 	msg := ChatMessage{
 		Role:             "assistant",
-		Content:          stringContent(res.Text),
+		Content:          stringContent(text),
 		ReasoningContent: res.Reasoning,
 		ToolCalls:        toolCalls,
 	}

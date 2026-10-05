@@ -393,7 +393,11 @@ facade:
   # 机会性长轮询参数：当前上游不认它，发出去也无副作用。
   use_status_wait: false
   poll_wait_ms: 10000
+  # 上游毫无进展时最多等多久。上游模型以智能体方式在沙箱里干活（思考、调工具、写文件），
+  # 正文要到最后才一次性给出；进行中的转录（思考摘要、工具调用）每推进一步都会把这个时限顺延。
   max_poll_timeout: 15m
+  # 一轮生成的总时长上限（不论有没有进展）。复杂任务（大张 SVG / 多文件改动）跑半小时以上很正常。
+  max_run_timeout: 2h
   sync_timeout: 10m
 
   # 说明：上游没有独立的 system / instructions 字段，

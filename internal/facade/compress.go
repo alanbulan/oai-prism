@@ -36,7 +36,7 @@ const (
 	// 太小的不先丢：一行省略说明本身就要近百字节，丢了反而更长。
 	bulkyEntryBytes = 512
 	// promptOverheadReserve 是算历史预算时为平台声明与上游包装预留的字节。
-	promptOverheadReserve = len(platformNotice) + 64
+	promptOverheadReserve = len(inlineNotice) + 64
 )
 
 // historyEntry 是折叠进 system 的一条往轮消息。

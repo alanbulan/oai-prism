@@ -64,6 +64,12 @@ type fakeUpstream struct {
 	reasoningInPending bool
 	// pollDelay：每次轮询先等这么久再回（模拟上游迟迟不出结果）。
 	pollDelay time.Duration
+	// liveProgress：第 n 次 pending 轮询带的 codex_live_progress（nil = 不带）。
+	liveProgress func(n int) map[string]any
+	// finalReasoning：终态帧 reasoning 条目的逐条 summary（空 = 默认的"先想一下"）。
+	finalReasoning []string
+	// deltaFiles：终态 payload 的 codexDeltaFiles（上游沙箱里的文件变更）。
+	deltaFiles []any
 
 	// conversationID 让测试可以要求上游回一个非空会话 ID。
 	// 默认空（真实上游新建会话时它就是 null）。
@@ -174,12 +180,14 @@ func (f *fakeUpstream) payloadOutput(text string, withReasoning bool) map[string
 func (f *fakeUpstream) payloadWith(text, reasoning string) map[string]any {
 	output := []any{}
 	if reasoning != "" {
-		output = append(output, map[string]any{
-			"type": "reasoning",
-			"summary": []any{
-				map[string]any{"type": "summary_text", "text": reasoning},
-			},
-		})
+		summary := []any{map[string]any{"type": "summary_text", "text": reasoning}}
+		if reasoning == "先想一下" && len(f.finalReasoning) > 0 {
+			summary = summary[:0]
+			for _, s := range f.finalReasoning {
+				summary = append(summary, map[string]any{"type": "summary_text", "text": s})
+			}
+		}
+		output = append(output, map[string]any{"type": "reasoning", "summary": summary})
 	}
 	output = append(output, map[string]any{
 		"type": "message",
@@ -437,6 +445,11 @@ func (f *fakeUpstream) handler() http.Handler {
 			}
 			// 非 finalOnly 模式下 pending 帧带累计正文 ——
 			// 这样前缀差分才有东西可差，也是"真流式"的前提。
+			if f.liveProgress != nil {
+				if lp := f.liveProgress(n); lp != nil {
+					resp["codex_live_progress"] = lp
+				}
+			}
 			if !f.finalOnlyPayload {
 				payload := f.payloadOutput(text, false)
 				if f.reasoningInPending {
@@ -454,13 +467,17 @@ func (f *fakeUpstream) handler() http.Handler {
 			return
 		}
 
+		final := f.payloadOutput(text, true)
+		if f.deltaFiles != nil {
+			final["codexDeltaFiles"] = f.deltaFiles
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status":     "completed",
 			"request_id": rid,
 			"turn_state": map[string]any{"seq": n + 1},
 			"response": map[string]any{
 				"status":  "success",
-				"payload": f.payloadOutput(text, true),
+				"payload": final,
 			},
 		})
 	})

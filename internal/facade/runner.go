@@ -77,6 +77,10 @@ type RunRequest struct {
 	// 不再叠加通用的 platformNotice。
 	Bridge bool
 
+	// FileTools：客户端声明了工具，上游沙箱里写的文件会转成它的写文件工具调用（chat.go）。
+	// 为假时客户端只看得到回答正文，提示上游把成品直接写在回答里（见 noticeFor）。
+	FileTools bool
+
 	// Native 非空时走原生续接（见 native.go）：上游保管会话历史，续接时只发增量。
 	// Input 仍是全量折叠后的条目 —— 新建上游会话的首轮与各种回退都发它。
 	Native *nativeTurn
@@ -640,6 +644,8 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		sentReasoning = full
 		return d
 	}
+	// 进行中的转录（思考摘要、工具调用）与终态思考合成的全文，见 livetrace.go
+	var trace liveTrace
 
 	// 3) start 有可能直接就是终态（回答很短，或者立刻失败了）。
 	if st := startResp.Initial; st != nil {
@@ -654,7 +660,9 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			prev = st.Text
 			result.Text = st.Text
 		}
-		if rd := nextReasoning(st.Reasoning); (st.Delta != "" || rd != "") && emit != nil {
+		trace.observe(st.Progress)
+		reasoning := trace.full(st.Reasoning, st.ReasoningParts)
+		if rd := nextReasoning(reasoning); (st.Delta != "" || rd != "") && emit != nil {
 			if eerr := emit(Delta{Text: st.Delta, Reasoning: rd, Reset: st.Reset}); eerr != nil {
 				return result, eerr
 			}
@@ -664,8 +672,8 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		if st.Usage != nil {
 			result.Usage = st.Usage
 		}
-		if st.Reasoning != "" {
-			result.Reasoning = st.Reasoning
+		if reasoning != "" {
+			result.Reasoning = reasoning
 		}
 		if st.ResponseID != "" {
 			result.ResponseID = st.ResponseID
@@ -704,12 +712,25 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	}
 
 	// 4) 轮询直到终态。
+	//
+	// 两道时限：max_poll_timeout 是"上游毫无进展"的最长等待，转录游标前进、来了思考或正文
+	// 都会把它顺延；max_run_timeout 是一轮生成的总时长上限（同步请求再受 req.Deadline 约束）。
+	// 上游模型以智能体方式在沙箱里写文件时，一轮跑二三十分钟是常态（2026-10-05：一张
+	// 多约束 SVG 插画在 20 分钟固定时限处被切断，上游其实一直在推进 —— 转录里有思考摘要和
+	// 一次次 apply_patch，只是正文要到终态才给）。
 	f := &r.cfg.Facade
-	limit := f.MaxPollTimeout
-	if req.Deadline > 0 && req.Deadline < limit {
-		limit = req.Deadline
+	idle, hard := f.MaxPollTimeout, f.MaxRunTimeout
+	if hard < idle {
+		hard = idle
 	}
-	deadline := time.Now().Add(limit)
+	if req.Deadline > 0 && req.Deadline < hard {
+		hard = req.Deadline
+	}
+	if idle > hard {
+		idle = hard
+	}
+	pollStart := time.Now()
+	lastProgress := pollStart
 	interval := f.PollInterval
 	failures := 0
 
@@ -719,11 +740,15 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			r.stopUpstream(p, requestID, convID, turnState)
 			return result, cerr
 		}
-		if time.Now().After(deadline) {
+		if now := time.Now(); now.Sub(lastProgress) > idle || now.Sub(pollStart) > hard {
 			r.app.PollRounds.Inc("timeout")
 			r.stopUpstream(p, requestID, convID, turnState)
-			return result, fmt.Errorf("%w（已轮询 %d 次，已收 %d 字节）",
-				ErrPollTimeout, result.Polls, len(result.Text))
+			why := fmt.Sprintf("上游 %s 没有任何进展", idle)
+			if now.Sub(pollStart) > hard {
+				why = fmt.Sprintf("超过单轮生成上限 %s", hard)
+			}
+			return result, fmt.Errorf("%w：%s（已轮询 %d 次，已收正文 %d 字节）",
+				ErrPollTimeout, why, result.Polls, len(result.Text))
 		}
 
 		t0 := time.Now()
@@ -770,6 +795,8 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 				"polls", result.Polls,
 				"elapsed", time.Since(started).Round(time.Second).String(),
 				"model", req.Model,
+				"transcript", trace.cursor,
+				"idle", time.Since(lastProgress).Round(time.Second).String(),
 			)
 		}
 
@@ -793,8 +820,10 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		if st.Usage != nil {
 			result.Usage = st.Usage
 		}
-		if st.Reasoning != "" {
-			result.Reasoning = st.Reasoning
+		advanced := trace.observe(st.Progress)
+		reasoning := trace.full(st.Reasoning, st.ReasoningParts)
+		if reasoning != "" {
+			result.Reasoning = reasoning
 		}
 		if len(st.DeltaFiles) > 0 {
 			result.DeltaFiles = st.DeltaFiles
@@ -806,7 +835,11 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			result.ListenSnapshot = st.ListenSnapshot
 		}
 
-		if rd := nextReasoning(st.Reasoning); (st.Delta != "" || rd != "") && emit != nil {
+		rd := nextReasoning(reasoning)
+		if advanced || st.Delta != "" || rd != "" {
+			lastProgress = time.Now()
+		}
+		if (st.Delta != "" || rd != "") && emit != nil {
 			if eerr := emit(Delta{Text: st.Delta, Reasoning: rd, Reset: st.Reset}); eerr != nil {
 				r.stopUpstream(p, requestID, convID, turnState)
 				return result, eerr

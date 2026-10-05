@@ -769,6 +769,30 @@ func (c *Client) parseStatus(raw []byte, fallbackID, prevText string) (*StatusRe
 	return c.parseGeneric(v, raw, fallbackID, prevText)
 }
 
+// summaryParts 把 reasoning 条目的 summary 拆成逐条文本：
+// 标准形状是 [{"type":"summary_text","text":…}, …]，其他形状整体展平成一条。
+func summaryParts(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var items []struct {
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &items) == nil {
+		var out []string
+		for _, it := range items {
+			if it.Text != "" {
+				out = append(out, it.Text)
+			}
+		}
+		return out
+	}
+	if s := FlattenContent(raw); s != "" {
+		return []string{s}
+	}
+	return nil
+}
+
 // parseEnvelope 解析 Prism/Codex 的已知包络。
 //
 // 形状（实测）：
@@ -800,6 +824,12 @@ func (c *Client) parseEnvelope(v any, raw []byte, fallbackID, prevText string) (
 			ListenSnapshot: env.ListenSnapshot,
 			Status:         strings.ToLower(strings.TrimSpace(env.Status)),
 			Usage:          env.Usage,
+		}
+		if len(env.LiveProgress) > 0 {
+			var lp LiveProgress
+			if json.Unmarshal(env.LiveProgress, &lp) == nil {
+				out.Progress = &lp
+			}
 		}
 		if env.Message != "" && out.Status == "error" {
 			out.Fail = true
@@ -838,16 +868,22 @@ func (c *Client) parseEnvelope(v any, raw []byte, fallbackID, prevText string) (
 				out.DeltaFiles = payload.DeltaFiles
 				out.OutputItems = payload.Output
 
-				// 确定性提取 reasoning 与 assistant 文本
+				// 确定性提取 reasoning 与 assistant 文本。
+				// 智能体式的一轮会有多个 reasoning 条目（每步工具调用前各一个），全部按序收下。
+				var reasoning []string
 				for _, item := range payload.Output {
-					if item.Type == "reasoning" {
-						if len(item.Summary) > 0 {
-							out.Reasoning = FlattenContent(item.Summary)
-						} else if item.Text != "" {
-							out.Reasoning = item.Text
-						}
+					if item.Type != "reasoning" {
+						continue
+					}
+					if parts := summaryParts(item.Summary); len(parts) > 0 {
+						reasoning = append(reasoning, strings.Join(parts, ""))
+						out.ReasoningParts = append(out.ReasoningParts, parts...)
+					} else if item.Text != "" {
+						reasoning = append(reasoning, item.Text)
+						out.ReasoningParts = append(out.ReasoningParts, item.Text)
 					}
 				}
+				out.Reasoning = strings.Join(reasoning, "\n\n")
 				for i := len(payload.Output) - 1; i >= 0; i-- {
 					item := payload.Output[i]
 					if item.Type == "message" && (item.Role == "assistant" || item.Role == "") {

@@ -302,10 +302,13 @@ type FacadeConfig struct {
 
 	// 轮询参数。render-status 支持 waitMs 长轮询，
 	// response_with_tools_status 是否支持由 enable_wait_ms 控制。
-	PollInterval   time.Duration `yaml:"poll_interval"`
-	PollWaitMs     int           `yaml:"poll_wait_ms"`
-	UseStatusWait  bool          `yaml:"use_status_wait"`
+	PollInterval  time.Duration `yaml:"poll_interval"`
+	PollWaitMs    int           `yaml:"poll_wait_ms"`
+	UseStatusWait bool          `yaml:"use_status_wait"`
+	// MaxPollTimeout 是上游毫无进展时最多等多久：转录游标前进、来了思考摘要或正文都会顺延。
 	MaxPollTimeout time.Duration `yaml:"max_poll_timeout"`
+	// MaxRunTimeout 是一轮生成的总时长上限（不论有没有进展）。
+	MaxRunTimeout  time.Duration `yaml:"max_run_timeout"`
 	PollBackoffMax time.Duration `yaml:"poll_backoff_max"`
 
 	// 同步模式下最多等多久；超时后返回已完成部分。
@@ -572,6 +575,7 @@ func Default() *Config {
 			PollWaitMs:          10000,
 			UseStatusWait:       true,
 			MaxPollTimeout:      15 * time.Minute,
+			MaxRunTimeout:       DefaultMaxRunTimeout,
 			PollBackoffMax:      DefaultPollBackoffMax,
 			SyncTimeout:         10 * time.Minute,
 			UseSandbox:          true,
@@ -699,6 +703,7 @@ func defaultSchema() SchemaConfig {
 const (
 	DefaultPollInterval   = 1 * time.Second
 	DefaultPollBackoffMax = 3 * time.Second
+	DefaultMaxRunTimeout  = 2 * time.Hour
 )
 
 // DefaultFacadeSystemPrompt 是兜底系统提示：中性角色，不带任何平台人设。
@@ -877,6 +882,9 @@ func (c *Config) normalize() error {
 	}
 	if f.MaxPollTimeout <= 0 {
 		f.MaxPollTimeout = 15 * time.Minute
+	}
+	if f.MaxRunTimeout <= 0 {
+		f.MaxRunTimeout = DefaultMaxRunTimeout
 	}
 	if f.SyncTimeout <= 0 {
 		f.SyncTimeout = 10 * time.Minute

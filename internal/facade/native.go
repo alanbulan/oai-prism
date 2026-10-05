@@ -443,10 +443,7 @@ func (r *Runner) planNative(ctx context.Context, p prism.Principal, acctID, proj
 	if b.cid != "" && b.account == acctID && b.project == projectID {
 		plan.delivered = nt.fingerprints(es)
 		if rest, ok := nt.delta(b, es); ok {
-			notice := ""
-			if !req.Bridge && r.cfg.Facade.PlatformNotice {
-				notice = platformNotice
-			}
+			notice := r.noticeFor(req)
 			items, sysHash, since := nt.deltaItems(b, rest, r.cfg.Facade.PromptByteLimit(), notice)
 			plan.cid, plan.continued, plan.sysHash, plan.sinceSys = b.cid, true, sysHash, since
 			r.log.Info("原生续接：发送增量", "key", nt.key, "cid", b.cid,
@@ -472,10 +469,7 @@ func (r *Runner) planNative(ctx context.Context, p prism.Principal, acctID, proj
 	// 换号、网关重启、旧会话作废之后，上游照样拿到客户端手里的完整历史。
 	if historyTrimmed(full) {
 		if seeds := nt.seedTurns(r.cfg.Facade.PromptByteLimit()); len(seeds) > 0 {
-			notice := ""
-			if !req.Bridge && r.cfg.Facade.PlatformNotice {
-				notice = platformNotice
-			}
+			notice := r.noticeFor(req)
 			plan.seeds, plan.fallback = seeds, full
 			items := nt.currentWithSystem(notice)
 			r.log.Info("原生续接：新建上游会话，历史分段补种后发送本轮", "key", nt.key, "cid", cid,
