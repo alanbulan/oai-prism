@@ -126,6 +126,7 @@ export function parseClient(ua: string | null | undefined): ClientInfo {
     return { name: `${sdk[1]} ${lang}`, version: sdk[3], kind: 'sdk' };
   }
   const tools: [RegExp, string, ClientInfo['kind']][] = [
+    [/^claude-cli\/([\w.-]+)/i, 'Claude Code', 'cli'],
     [/^curl\/([\w.-]+)/i, 'curl', 'cli'],
     [/^Python-urllib\/([\w.-]+)/i, 'Python urllib', 'sdk'],
     [/^python-requests\/([\w.-]+)/i, 'Python requests', 'sdk'],

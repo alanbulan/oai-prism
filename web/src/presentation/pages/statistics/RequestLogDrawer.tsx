@@ -1,11 +1,11 @@
 import React from 'react';
 import { Drawer, Descriptions, Tag, Typography, Alert, Tooltip, theme } from 'antd';
-import { ClockCircleOutlined, FieldTimeOutlined, RobotOutlined, UserOutlined } from '@ant-design/icons';
+import { ClockCircleOutlined, DashboardOutlined, FieldTimeOutlined, RobotOutlined, UserOutlined } from '@ant-design/icons';
 import type { RequestLog } from '../../../domain/statistics/entity';
 import { useAccountStore } from '../../../application/account/store';
 import { MONO_FAMILY } from '../../theme/tokens';
 import { formatDateTime, formatDuration, formatRelative, normalizeIp, parseClient } from '../../utils/format';
-import { isFailed, isStreamBroken, latencyTone, statusTagColor, statusText } from './logMeta';
+import { formatSpeed, isFailed, isStreamBroken, latencyTone, outputSpeed, statusTagColor, statusText } from './logMeta';
 
 const { Text } = Typography;
 
@@ -65,6 +65,7 @@ const LogDetail: React.FC<{ log: RequestLog }> = ({ log }) => {
   const { ip, local } = normalizeIp(log.clientIp);
   const accountName = log.accountId ? accountNameMap.get(log.accountId) : undefined;
   const tokens = log.promptTokens + log.completionTokens;
+  const speed = outputSpeed(log);
   // 0 用量只有两种来源：失败请求不计，或用量统计上线前的历史记录
   const noUsageHint = ok ? '未记录（统计上线前的请求）' : '失败请求不计用量';
   const accountSub = !log.accountId
@@ -104,7 +105,7 @@ const LogDetail: React.FC<{ log: RequestLog }> = ({ log }) => {
         style={{
           marginTop: 18,
           display: 'grid',
-          gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+          gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
           border: `1px solid ${token.colorBorderSecondary}`,
           borderRadius: 12,
           overflow: 'hidden',
@@ -118,6 +119,12 @@ const LogDetail: React.FC<{ log: RequestLog }> = ({ log }) => {
               <span style={{ color: toneColor[latencyTone(log.durationMs)] }}>{formatDuration(log.durationMs)}</span>
             ),
             sub: `${log.durationMs.toLocaleString()} ms`,
+          },
+          {
+            icon: <DashboardOutlined />,
+            label: '输出速度',
+            value: speed === null ? '—' : formatSpeed(speed),
+            sub: speed === null ? '没有输出' : `输出 ${log.completionTokens.toLocaleString()} tokens ÷ 总耗时`,
           },
           {
             icon: <RobotOutlined />,
@@ -137,7 +144,8 @@ const LogDetail: React.FC<{ log: RequestLog }> = ({ log }) => {
             style={{
               padding: '12px 14px',
               minWidth: 0,
-              borderLeft: i ? `1px solid ${token.colorBorderSecondary}` : 'none',
+              borderLeft: i % 2 ? `1px solid ${token.colorBorderSecondary}` : 'none',
+              borderTop: i >= 2 ? `1px solid ${token.colorBorderSecondary}` : 'none',
               background: token.colorFillQuaternary,
             }}
           >

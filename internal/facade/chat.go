@@ -152,6 +152,7 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 	if err := sw.WriteData(buf); err != nil {
 		return
 	}
+	defer keepAlive(sw, streamKeepAliveInterval, sseCommentFrame)()
 
 	emit := func(d Delta) error {
 		// 思维链与正文分成两个 chunk：混在一起会让客户端
@@ -194,6 +195,8 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 				buf = append(buf, `,"type":"upstream_error"}}`...)
 			}
 			_ = sw.WriteData(buf)
+		} else {
+			middleware.RecordLogAbort(r)
 		}
 		_ = sw.Done()
 		return

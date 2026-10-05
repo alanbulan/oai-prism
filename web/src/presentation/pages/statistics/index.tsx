@@ -42,7 +42,7 @@ import {
   normalizeIp,
   parseClient,
 } from '../../utils/format';
-import { isFailed, isStreamBroken, latencyTone, statusTagColor, statusText } from './logMeta';
+import { formatSpeed, isFailed, isStreamBroken, outputSpeed, statusTagColor, statusText } from './logMeta';
 import { RequestLogDrawer } from './RequestLogDrawer';
 
 const { Text } = Typography;
@@ -197,13 +197,6 @@ export const StatisticsPage: React.FC = () => {
     legend: false,
   };
 
-  const toneColor = {
-    fast: token.colorSuccess,
-    normal: token.colorText,
-    slow: token.colorWarning,
-    'very-slow': token.colorError,
-  } as const;
-
   const tabular: React.CSSProperties = { fontVariantNumeric: 'tabular-nums' };
 
   const requestLogColumns: ColumnsType<RequestLog> = [
@@ -243,7 +236,7 @@ export const StatisticsPage: React.FC = () => {
       title: '接口',
       dataIndex: 'path',
       key: 'path',
-      width: 200,
+      width: 168,
       ellipsis: true,
       render: (p: string, r) => (
         <Tooltip title={`${r.method} ${p}`}>
@@ -269,7 +262,7 @@ export const StatisticsPage: React.FC = () => {
       title: '账号',
       dataIndex: 'accountId',
       key: 'accountId',
-      width: 144,
+      width: 128,
       ellipsis: true,
       render: (acc: string) => {
         if (!acc) return <Text type="secondary">未分配</Text>;
@@ -282,9 +275,25 @@ export const StatisticsPage: React.FC = () => {
       },
     },
     {
+      title: 'IP',
+      dataIndex: 'clientIp',
+      key: 'clientIp',
+      width: 128,
+      ellipsis: true,
+      render: (raw: string) => {
+        const { ip, local } = normalizeIp(raw);
+        return (
+          <Tooltip title={local ? `${ip}（本机）` : ip}>
+            <span style={{ fontFamily: MONO_FAMILY, fontSize: 12 }}>{ip}</span>
+            {local && <Text type="secondary" style={{ fontSize: 12 }}> 本机</Text>}
+          </Tooltip>
+        );
+      },
+    },
+    {
       title: 'Token',
       key: 'tokens',
-      width: 104,
+      width: 88,
       align: 'right',
       render: (_, r) => {
         const total = r.promptTokens + r.completionTokens;
@@ -305,20 +314,32 @@ export const StatisticsPage: React.FC = () => {
       },
     },
     {
-      title: '耗时',
-      dataIndex: 'durationMs',
-      key: 'durationMs',
-      width: 96,
+      title: '速度',
+      key: 'speed',
+      width: 104,
       align: 'right',
-      render: (ms: number) => (
-        <Tooltip title={`${ms.toLocaleString()} ms`}>
-          <span style={{ ...tabular, fontWeight: 500, color: toneColor[latencyTone(ms)] }}>{formatDuration(ms)}</span>
-        </Tooltip>
-      ),
+      render: (_, r) => {
+        const v = outputSpeed(r);
+        if (v === null) {
+          return (
+            <Tooltip title={`没有输出 · 总耗时 ${formatDuration(r.durationMs)}`}>
+              <Text type="secondary">—</Text>
+            </Tooltip>
+          );
+        }
+        return (
+          <Tooltip
+            title={`输出 ${r.completionTokens.toLocaleString()} tokens ÷ 总耗时 ${formatDuration(r.durationMs)}（端到端，含排队与思考）`}
+          >
+            <span style={{ ...tabular, fontWeight: 500 }}>{formatSpeed(v)}</span>
+          </Tooltip>
+        );
+      },
     },
     {
       title: '客户端',
       key: 'client',
+      width: 168,
       ellipsis: true,
       render: (_, r) => {
         const c = parseClient(r.userAgent);
@@ -574,8 +595,8 @@ export const StatisticsPage: React.FC = () => {
               columns={requestLogColumns}
               dataSource={requestLogs}
               loading={logsLoading && requestLogs.length === 0}
-              // x = 客户端列最小 112 + 其余列宽之和；容器更宽时余量归客户端列
-              scroll={{ x: 1036 }}
+              // x = 各列宽之和；容器更宽时余量按列宽比例分给各列，操作列紧跟在数据后面
+              scroll={{ x: 1164 }}
               onRow={(r) => ({ onClick: () => openDetail(r) })}
               locale={{
                 emptyText: (

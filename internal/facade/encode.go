@@ -126,6 +126,9 @@ type AnthropicEvent struct {
 	Index      int
 	// ErrorType 是 error 事件的 error.type（默认 api_error）。
 	ErrorType string
+	// Block 是内容块类型："thinking" 或正文（空）；Signature 非空时是思考块的签名增量。
+	Block     string
+	Signature string
 }
 
 // AppendAnthropicEvent 编码一个 Anthropic SSE 事件（含 event: 行）。
@@ -152,15 +155,34 @@ func AppendAnthropicEvent(dst []byte, e AnthropicEvent) []byte {
 		dst = append(dst, `,"output_tokens":0}}}`...)
 
 	case "content_block_start":
-		dst = append(dst, `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`...)
+		dst = append(dst, `{"type":"content_block_start","index":`...)
+		dst = sse.AppendInt(dst, int64(e.Index))
+		if e.Block == "thinking" {
+			dst = append(dst, `,"content_block":{"type":"thinking","thinking":"","signature":""}}`...)
+		} else {
+			dst = append(dst, `,"content_block":{"type":"text","text":""}}`...)
+		}
 
 	case "content_block_delta":
-		dst = append(dst, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":`...)
-		dst = sse.AppendJSONString(dst, e.Text)
+		dst = append(dst, `{"type":"content_block_delta","index":`...)
+		dst = sse.AppendInt(dst, int64(e.Index))
+		switch {
+		case e.Signature != "":
+			dst = append(dst, `,"delta":{"type":"signature_delta","signature":`...)
+			dst = sse.AppendJSONString(dst, e.Signature)
+		case e.Block == "thinking":
+			dst = append(dst, `,"delta":{"type":"thinking_delta","thinking":`...)
+			dst = sse.AppendJSONString(dst, e.Text)
+		default:
+			dst = append(dst, `,"delta":{"type":"text_delta","text":`...)
+			dst = sse.AppendJSONString(dst, e.Text)
+		}
 		dst = append(dst, `}}`...)
 
 	case "content_block_stop":
-		dst = append(dst, `{"type":"content_block_stop","index":0}`...)
+		dst = append(dst, `{"type":"content_block_stop","index":`...)
+		dst = sse.AppendInt(dst, int64(e.Index))
+		dst = append(dst, '}')
 
 	case "message_delta":
 		dst = append(dst, `{"type":"message_delta","delta":{"stop_reason":`...)
@@ -217,6 +239,17 @@ type ResponsesEvent struct {
 	// item 形状各写一个硬编码分支。
 	ItemJSON   string
 	OutputJSON string
+
+	// OutputIndex 是条目在 response.output 里的位置（reasoning 条目在前时正文是 1）。
+	OutputIndex int
+}
+
+// appendItemRef 写条目内事件共用的 "item_id":…,"output_index":N。
+func appendItemRef(dst []byte, e ResponsesEvent) []byte {
+	dst = append(dst, `,"item_id":`...)
+	dst = sse.AppendJSONString(dst, e.ItemID)
+	dst = append(dst, `,"output_index":`...)
+	return sse.AppendInt(dst, int64(e.OutputIndex))
 }
 
 // AppendResponsesEvent 编码一个 Responses API SSE 事件。
@@ -237,59 +270,84 @@ func AppendResponsesEvent(dst []byte, e ResponsesEvent) []byte {
 		dst = sse.AppendJSONString(dst, e.Model)
 		dst = append(dst, `,"output":[]}}`...)
 
-	case "response.output_item.added":
-		if e.ItemJSON != "" {
-			dst = append(dst, `{"type":"response.output_item.added","output_index":0,"item":`...)
+	case "response.output_item.added", "response.output_item.done":
+		dst = append(dst, `{"type":`...)
+		dst = sse.AppendJSONString(dst, e.Type)
+		dst = append(dst, `,"output_index":`...)
+		dst = sse.AppendInt(dst, int64(e.OutputIndex))
+		dst = append(dst, `,"item":`...)
+		switch {
+		case e.ItemJSON != "":
 			dst = append(dst, e.ItemJSON...)
-			dst = append(dst, '}')
-			break
+		case e.Type == "response.output_item.added":
+			dst = append(dst, `{"id":`...)
+			dst = sse.AppendJSONString(dst, e.ItemID)
+			dst = append(dst, `,"type":"message","status":"in_progress","role":"assistant","content":[]}`...)
+		default:
+			dst = append(dst, `{"id":`...)
+			dst = sse.AppendJSONString(dst, e.ItemID)
+			dst = append(dst, `,"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":`...)
+			dst = sse.AppendJSONString(dst, e.Text)
+			dst = append(dst, `,"annotations":[]}]}`...)
 		}
-		dst = append(dst, `{"type":"response.output_item.added","output_index":0,"item":{"id":`...)
-		dst = sse.AppendJSONString(dst, e.ItemID)
-		dst = append(dst, `,"type":"message","status":"in_progress","role":"assistant","content":[]}}`...)
+		dst = append(dst, '}')
 
 	case "response.content_part.added":
-		dst = append(dst, `{"type":"response.content_part.added","item_id":`...)
-		dst = sse.AppendJSONString(dst, e.ItemID)
-		dst = append(dst, `,"output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}`...)
+		dst = append(dst, `{"type":"response.content_part.added"`...)
+		dst = appendItemRef(dst, e)
+		dst = append(dst, `,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}`...)
 
 	case "response.output_text.delta":
-		dst = append(dst, `{"type":"response.output_text.delta","item_id":`...)
-		dst = sse.AppendJSONString(dst, e.ItemID)
-		dst = append(dst, `,"output_index":0,"content_index":0,"delta":`...)
+		dst = append(dst, `{"type":"response.output_text.delta"`...)
+		dst = appendItemRef(dst, e)
+		dst = append(dst, `,"content_index":0,"delta":`...)
 		dst = sse.AppendJSONString(dst, e.Text)
 		dst = append(dst, '}')
 
 	case "response.output_text.done":
-		dst = append(dst, `{"type":"response.output_text.done","item_id":`...)
-		dst = sse.AppendJSONString(dst, e.ItemID)
-		dst = append(dst, `,"output_index":0,"content_index":0,"text":`...)
+		dst = append(dst, `{"type":"response.output_text.done"`...)
+		dst = appendItemRef(dst, e)
+		dst = append(dst, `,"content_index":0,"text":`...)
 		dst = sse.AppendJSONString(dst, e.Text)
 		dst = append(dst, '}')
 
 	case "response.content_part.done":
-		dst = append(dst, `{"type":"response.content_part.done","item_id":`...)
-		dst = sse.AppendJSONString(dst, e.ItemID)
-		dst = append(dst, `,"output_index":0,"content_index":0,"part":{"type":"output_text","text":`...)
+		dst = append(dst, `{"type":"response.content_part.done"`...)
+		dst = appendItemRef(dst, e)
+		dst = append(dst, `,"content_index":0,"part":{"type":"output_text","text":`...)
 		dst = sse.AppendJSONString(dst, e.Text)
 		dst = append(dst, `,"annotations":[]}}`...)
 
-	case "response.output_item.done":
-		if e.ItemJSON != "" {
-			dst = append(dst, `{"type":"response.output_item.done","output_index":0,"item":`...)
-			dst = append(dst, e.ItemJSON...)
-			dst = append(dst, '}')
-			break
-		}
-		dst = append(dst, `{"type":"response.output_item.done","output_index":0,"item":{"id":`...)
-		dst = sse.AppendJSONString(dst, e.ItemID)
-		dst = append(dst, `,"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":`...)
+	// 思考摘要（reasoning 条目）：Codex 据此显示模型的思考过程。
+	case "response.reasoning_summary_part.added":
+		dst = append(dst, `{"type":"response.reasoning_summary_part.added"`...)
+		dst = appendItemRef(dst, e)
+		dst = append(dst, `,"summary_index":0,"part":{"type":"summary_text","text":""}}`...)
+
+	case "response.reasoning_summary_text.delta":
+		dst = append(dst, `{"type":"response.reasoning_summary_text.delta"`...)
+		dst = appendItemRef(dst, e)
+		dst = append(dst, `,"summary_index":0,"delta":`...)
 		dst = sse.AppendJSONString(dst, e.Text)
-		dst = append(dst, `,"annotations":[]}]}}`...)
+		dst = append(dst, '}')
+
+	case "response.reasoning_summary_text.done":
+		dst = append(dst, `{"type":"response.reasoning_summary_text.done"`...)
+		dst = appendItemRef(dst, e)
+		dst = append(dst, `,"summary_index":0,"text":`...)
+		dst = sse.AppendJSONString(dst, e.Text)
+		dst = append(dst, '}')
+
+	case "response.reasoning_summary_part.done":
+		dst = append(dst, `{"type":"response.reasoning_summary_part.done"`...)
+		dst = appendItemRef(dst, e)
+		dst = append(dst, `,"summary_index":0,"part":{"type":"summary_text","text":`...)
+		dst = sse.AppendJSONString(dst, e.Text)
+		dst = append(dst, `}}`...)
 
 	case "response.custom_tool_call_input.done":
-		dst = append(dst, `{"type":"response.custom_tool_call_input.done","item_id":`...)
-		dst = sse.AppendJSONString(dst, e.ItemID)
+		dst = append(dst, `{"type":"response.custom_tool_call_input.done"`...)
+		dst = appendItemRef(dst, e)
 		dst = append(dst, `,"input":`...)
 		dst = sse.AppendJSONString(dst, e.Text)
 		dst = append(dst, '}')

@@ -64,6 +64,51 @@ type LogErrorBox struct {
 	account string
 	// 本次请求的 token 用量（facade 按实际收发内容精确计数后写入）
 	promptTokens, completionTokens int
+	aborted                        bool
+	model                          string
+}
+
+// RecordLogModel 记录本次请求实际使用的模型（网关换过模型名时）。
+//
+// 流水默认记客户端请求的模型名；Claude Code 发的是 claude-sonnet-4-5 这类名字，网关
+// 换成默认的 GPT 模型发给上游，流水里却显示 Claude 模型（2026-10-05 用户反馈）。
+func RecordLogModel(r *http.Request, model string) {
+	if box, ok := r.Context().Value(CtxKeyLogError{}).(*LogErrorBox); ok && model != "" {
+		box.mu.Lock()
+		box.model = model
+		box.mu.Unlock()
+	}
+}
+
+// LogModel 取出 RecordLogModel 记录的模型。
+func LogModel(ctx context.Context) string {
+	if box, ok := ctx.Value(CtxKeyLogError{}).(*LogErrorBox); ok {
+		box.mu.Lock()
+		defer box.mu.Unlock()
+		return box.model
+	}
+	return ""
+}
+
+// RecordLogAbort 记录"客户端在回答结束前断开了连接"。流式响应头早已是 200，
+// 不记的话这类请求在流水里是一条没有错误的成功记录（2026-10-05：Claude Code
+// 等满 5 分钟没收到数据后断开，流水显示 200）。落库时按 499 记。
+func RecordLogAbort(r *http.Request) {
+	if box, ok := r.Context().Value(CtxKeyLogError{}).(*LogErrorBox); ok {
+		box.mu.Lock()
+		box.aborted = true
+		box.mu.Unlock()
+	}
+}
+
+// LogAborted 判断本请求是否被客户端中途断开。
+func LogAborted(ctx context.Context) bool {
+	if box, ok := ctx.Value(CtxKeyLogError{}).(*LogErrorBox); ok {
+		box.mu.Lock()
+		defer box.mu.Unlock()
+		return box.aborted
+	}
+	return false
 }
 
 // RecordLogUsage 记录本次请求的 token 用量。

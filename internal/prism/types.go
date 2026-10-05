@@ -328,11 +328,10 @@ type StatusResponse struct {
 	// ListenSnapshot 是沙箱 codex 会话状态指针（同上，续接另一半）。
 	ListenSnapshot json.RawMessage
 
-	Text           string
-	Delta          string
-	Reset          bool
-	Reasoning      string
-	ReasoningDelta string
+	Text      string
+	Delta     string
+	Reset     bool
+	Reasoning string
 
 	// OutputItems 是上游返回的确定性 Response 条目列表（支持 message, function_call, reasoning 等）。
 	OutputItems []CodexOutputItem

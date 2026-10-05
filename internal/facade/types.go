@@ -199,6 +199,25 @@ type AnthropicRequest struct {
 	TopK        *int           `json:"top_k,omitempty"`
 	StopSeqs    []string       `json:"stop_sequences,omitempty"`
 	Metadata    map[string]any `json:"metadata,omitempty"`
+
+	// Thinking 是扩展思考开关：开了（enabled / adaptive）才回思考块，与 Anthropic 一致 ——
+	// 很多脚本直接取 content[0].text，没开却多出一个思考块会把它们弄坏。
+	Thinking *AnthropicThinking `json:"thinking,omitempty"`
+}
+
+// AnthropicThinking 是请求里的 thinking 配置。
+type AnthropicThinking struct {
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
+	// Display 是思考内容要不要给客户端："omitted" 表示不要（Claude Code 的 -p 文本输出），
+	// 交互 / 流式输出时是 "updates"。
+	Display string `json:"display,omitempty"`
+}
+
+// wantsThinking 判断客户端是否开启了扩展思考、且要看思考内容。
+func (r *AnthropicRequest) wantsThinking() bool {
+	return r.Thinking != nil && (r.Thinking.Type == "enabled" || r.Thinking.Type == "adaptive") &&
+		r.Thinking.Display != "omitted"
 }
 
 // AnthropicMessage 是一条消息。
@@ -228,8 +247,10 @@ type AnthropicResponse struct {
 
 // AnthropicContent 是内容块。
 type AnthropicContent struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
+	Type      string `json:"type"`
+	Text      string `json:"text,omitempty"`
+	Thinking  string `json:"thinking,omitempty"`
+	Signature string `json:"signature,omitempty"`
 }
 
 // AnthropicUsage 是用量。
@@ -290,6 +311,13 @@ type ResponsesItem struct {
 	Role    string             `json:"role,omitempty"`
 	Status  string             `json:"status,omitempty"`
 	Content []ResponsesContent `json:"content,omitempty"`
+	Summary []ResponsesSummary `json:"summary,omitempty"` // reasoning 条目的思考摘要
+}
+
+// ResponsesSummary 是 reasoning 条目的摘要块（type 为 summary_text）。
+type ResponsesSummary struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 // ResponsesContent 是输出内容块。

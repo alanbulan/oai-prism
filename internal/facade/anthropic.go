@@ -37,7 +37,11 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	model, effort := h.resolveModel(req.Model, "")
+	mapped := h.anthropicModel(req.Model)
+	if mapped != req.Model && r.Header.Get(HeaderModel) == "" {
+		middleware.RecordLogModel(r, mapped) // 流水记实际用的模型，不是客户端发来的 claude-*
+	}
+	model, effort := h.resolveModel(mapped, "")
 	accountID, projectID := applyHeaderOverrides(r, &model, &effort)
 
 	// Anthropic 把 system 放在顶层字段：交给翻译层当 system，与折叠的历史
@@ -76,16 +80,39 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	id := newID("msg_")
 
 	if req.Stream {
-		h.streamAnthropic(w, r, runReq, id, req.Model)
+		h.streamAnthropic(w, r, runReq, id, req.Model, req.wantsThinking())
 		return
 	}
-	h.syncAnthropic(w, r, runReq, id, req.Model)
+	h.syncAnthropic(w, r, runReq, id, req.Model, req.wantsThinking())
+}
+
+// anthropicModel 把模型表里没有的名字换成默认模型。
+//
+// Claude Code 发的是 claude-sonnet-4-5 这类名字，原样交给上游会整轮回
+// "Error while processing conversation (400)"，又被当成沙箱未就绪重试 10 次 —— 客户端
+// 卡上五六分钟后失败（2026-10-05 实测）。回给客户端的仍是它请求的名字。
+func (h *Handler) anthropicModel(requested string) string {
+	f := &h.cfg.Facade
+	if _, ok := f.Models[requested]; ok || requested == "" || requested == f.DefaultModel {
+		return requested
+	}
+	for _, m := range f.Models {
+		if m.Model == requested {
+			return requested
+		}
+	}
+	return f.DefaultModel
 }
 
 var anthropicKnownFields = map[string]struct{}{
 	"model": {}, "messages": {}, "max_tokens": {}, "system": {}, "stream": {},
 	"tools": {}, "tool_choice": {}, "temperature": {}, "top_p": {}, "top_k": {},
 	"stop_sequences": {}, "metadata": {},
+	// Anthropic 协议自己的开关不透传：上游不认识顶层的陌生字段，整轮回
+	// "Error while processing conversation (400)"（Claude Code 每个请求都带 thinking 与
+	// context_management，2026-10-05 实测因此完全用不了）。
+	"thinking": {}, "context_management": {}, "container": {}, "mcp_servers": {}, "service_tier": {},
+	"output_config": {}, "output_format": {}, "betas": {},
 	// 会话 ID 是会话键（见 anthropicConversationKey）；previous_response_id 不适用于本协议。
 	// 两者都不作为未知字段透传给上游。
 	"conversation_id": {}, "conversationId": {},
@@ -131,7 +158,7 @@ func anthropicConversationKey(r *http.Request, body map[string]json.RawMessage, 
 	return scopeKey(r, conversationKeyBase(r, nil, conv))
 }
 
-func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id, publicModel string) {
+func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id, publicModel string, thinking bool) {
 	// 流式头必须早于首帧，只能给出续接中的上游会话（见 streamConversationID）。
 	setConversationHeader(w, streamConversationID(runReq))
 
@@ -153,23 +180,24 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 	if err := sw.WriteRaw(buf); err != nil {
 		return
 	}
-	buf = AppendAnthropicEvent(buf[:0], AnthropicEvent{Type: "content_block_start"})
-	if err := sw.WriteRaw(buf); err != nil {
-		return
-	}
-
+	defer keepAlive(sw, streamKeepAliveInterval, anthropicPingFrame)()
+	// 内容块等内容到了再开：思考块要排在正文块前面。
+	blocks := &anthropicBlocks{sw: sw, thinkingOn: thinking}
 	emit := func(d Delta) error {
-		if d.Text == "" {
-			return nil
+		if err := blocks.thinking(d.Reasoning); err != nil {
+			return err
 		}
-		buf = AppendAnthropicEvent(buf[:0], AnthropicEvent{Type: "content_block_delta", Text: d.Text})
-		return sw.WriteRaw(buf)
+		return blocks.text(d.Text)
 	}
 
 	res, runErr := h.runner.Run(r.Context(), runReq, emit)
 	bindLogResult(r, res)
 
-	if runErr != nil && !errors.Is(runErr, context.Canceled) {
+	if errors.Is(runErr, context.Canceled) {
+		middleware.RecordLogAbort(r) // 客户端已断开：不再往断掉的连接上写收尾事件
+		return
+	}
+	if runErr != nil {
 		middleware.RecordLogError(r, "anthropic 流式失败: %v", runErr)
 		ev := AnthropicEvent{Type: "error", Text: runErr.Error()}
 		if errors.Is(runErr, ErrContextTooLarge) {
@@ -180,8 +208,9 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 		return
 	}
 
-	buf = AppendAnthropicEvent(buf[:0], AnthropicEvent{Type: "content_block_stop"})
-	_ = sw.WriteRaw(buf)
+	if blocks.finish() != nil {
+		return
+	}
 
 	var usage *prism.Usage
 	if res != nil {
@@ -196,7 +225,7 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 	_ = sw.WriteRaw(buf)
 }
 
-func (h *Handler) syncAnthropic(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id, publicModel string) {
+func (h *Handler) syncAnthropic(w http.ResponseWriter, r *http.Request, runReq *RunRequest, id, publicModel string, thinking bool) {
 	res, err := h.runner.Run(r.Context(), runReq, nil)
 	bindLogResult(r, res)
 	if err != nil {
@@ -222,6 +251,9 @@ func (h *Handler) syncAnthropic(w http.ResponseWriter, r *http.Request, runReq *
 		Model:      publicModel,
 		Content:    []AnthropicContent{{Type: "text", Text: text}},
 		StopReason: "end_turn",
+	}
+	if thinking && res != nil && res.Reasoning != "" {
+		resp.Content = append([]AnthropicContent{{Type: "thinking", Thinking: res.Reasoning, Signature: anthropicThinkingSignature}}, resp.Content...)
 	}
 	if res != nil && res.Usage != nil {
 		resp.Usage = AnthropicUsage{
@@ -281,4 +313,101 @@ func (h *Handler) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	r.Body = io.NopCloser(bytes.NewReader(chatBody))
 	r.ContentLength = int64(len(chatBody))
 	h.handleChatCompletions(w, r)
+}
+
+// anthropicThinkingSignature 是思考块的签名。真 Anthropic 的签名用来校验回传的思考没被改过；
+// 这里的思考是上游给的摘要，客户端回传时网关直接忽略（只取 text），签名只是占位。
+const anthropicThinkingSignature = "oaiprism-upstream-reasoning-summary"
+
+// anthropicBlocks 按序写内容块：思考块（客户端开了 thinking 才有）在前、正文块在后，
+// index 依次递增。正文已经开始后才到的思考，等正文块关闭后补成下一个块。
+type anthropicBlocks struct {
+	sw         *sse.Writer
+	buf        []byte
+	thinkingOn bool
+	index      int    // 当前打开（或下一个要开）的块
+	open       string // "", "thinking", "text"
+	hasText    bool
+	late       strings.Builder
+}
+
+func (b *anthropicBlocks) write(e AnthropicEvent) error {
+	e.Index = b.index
+	b.buf = AppendAnthropicEvent(b.buf[:0], e)
+	return b.sw.WriteRaw(b.buf)
+}
+
+func (b *anthropicBlocks) start(kind string) error {
+	if b.open == kind {
+		return nil
+	}
+	if err := b.stop(); err != nil {
+		return err
+	}
+	b.open = kind
+	if kind == "text" {
+		b.hasText = true
+	}
+	return b.write(AnthropicEvent{Type: "content_block_start", Block: kind})
+}
+
+func (b *anthropicBlocks) stop() error {
+	if b.open == "" {
+		return nil
+	}
+	if b.open == "thinking" {
+		if err := b.write(AnthropicEvent{Type: "content_block_delta", Block: "thinking", Signature: anthropicThinkingSignature}); err != nil {
+			return err
+		}
+	}
+	err := b.write(AnthropicEvent{Type: "content_block_stop"})
+	b.open = ""
+	b.index++
+	return err
+}
+
+func (b *anthropicBlocks) thinking(text string) error {
+	if text == "" || !b.thinkingOn {
+		return nil
+	}
+	if b.open == "text" {
+		b.late.WriteString(text)
+		return nil
+	}
+	if err := b.start("thinking"); err != nil {
+		return err
+	}
+	return b.write(AnthropicEvent{Type: "content_block_delta", Block: "thinking", Text: text})
+}
+
+func (b *anthropicBlocks) text(text string) error {
+	if text == "" {
+		return nil
+	}
+	if err := b.start("text"); err != nil {
+		return err
+	}
+	return b.write(AnthropicEvent{Type: "content_block_delta", Text: text})
+}
+
+// finish 关闭仍打开的块、补发迟到的思考；一个正文块都没有时补一个空的（空回答也要有正文块）。
+func (b *anthropicBlocks) finish() error {
+	if err := b.stop(); err != nil {
+		return err
+	}
+	if late := b.late.String(); late != "" {
+		b.late.Reset()
+		if err := b.thinking(late); err != nil {
+			return err
+		}
+		if err := b.stop(); err != nil {
+			return err
+		}
+	}
+	if !b.hasText {
+		if err := b.start("text"); err != nil {
+			return err
+		}
+	}
+	return b.stop()
 }

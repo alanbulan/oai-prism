@@ -873,7 +873,6 @@ func (c *Client) parseEnvelope(v any, raw []byte, fallbackID, prevText string) (
 						}
 					}
 				}
-				out.ReasoningDelta = out.Reasoning
 			}
 		}
 
@@ -976,7 +975,6 @@ func (c *Client) parseEnvelope(v any, raw []byte, fallbackID, prevText string) (
 			}
 			if payload != nil {
 				out.Text, out.Reasoning = extractCodexOutput(payload)
-				out.ReasoningDelta = out.Reasoning
 				// payload.id 是上游真正的 response 句柄（resp_* 形态），
 				// 多轮延续（previousResponseId）全靠它。宽松分支同样必须提取，
 				// 否则强类型分支因形态漂移失败时会话链就断了（2026-10-02 实测）。

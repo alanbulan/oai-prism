@@ -60,6 +60,11 @@ type fakeUpstream struct {
 	gens map[string]*genState
 	seq  int
 
+	// reasoningInPending：生成中的帧也带（到目前为止的）思考摘要，终态帧是完整的。
+	reasoningInPending bool
+	// pollDelay：每次轮询先等这么久再回（模拟上游迟迟不出结果）。
+	pollDelay time.Duration
+
 	// conversationID 让测试可以要求上游回一个非空会话 ID。
 	// 默认空（真实上游新建会话时它就是 null）。
 	conversationID string
@@ -158,12 +163,21 @@ func (f *fakeUpstream) parts() []string {
 
 // payloadOutput 构造 response.payload.output。
 func (f *fakeUpstream) payloadOutput(text string, withReasoning bool) map[string]any {
-	output := []any{}
+	reasoning := ""
 	if withReasoning {
+		reasoning = "先想一下"
+	}
+	return f.payloadWith(text, reasoning)
+}
+
+// payloadWith 同 payloadOutput，思考摘要由调用方给（空则不带 reasoning 条目）。
+func (f *fakeUpstream) payloadWith(text, reasoning string) map[string]any {
+	output := []any{}
+	if reasoning != "" {
 		output = append(output, map[string]any{
 			"type": "reasoning",
 			"summary": []any{
-				map[string]any{"type": "summary_text", "text": "先想一下"},
+				map[string]any{"type": "summary_text", "text": reasoning},
 			},
 		})
 	}
@@ -359,6 +373,13 @@ func (f *fakeUpstream) handler() http.Handler {
 	mux.HandleFunc("/api/llm/response_with_tools_status", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		if f.pollDelay > 0 {
+			select { // 模拟上游迟迟不出结果（客户端可能先断开）
+			case <-time.After(f.pollDelay):
+			case <-r.Context().Done():
+				return
+			}
+		}
 
 		f.mu.Lock()
 		f.statusBodies = append(f.statusBodies, body)
@@ -417,9 +438,13 @@ func (f *fakeUpstream) handler() http.Handler {
 			// 非 finalOnly 模式下 pending 帧带累计正文 ——
 			// 这样前缀差分才有东西可差，也是"真流式"的前提。
 			if !f.finalOnlyPayload {
+				payload := f.payloadOutput(text, false)
+				if f.reasoningInPending {
+					payload = f.payloadWith(text, "先想") // 生成中的帧带到目前为止的思考摘要
+				}
 				resp["response"] = map[string]any{
 					"status":  "success",
-					"payload": f.payloadOutput(text, false),
+					"payload": payload,
 				}
 			}
 			f.mu.Lock()
@@ -1300,6 +1325,10 @@ func TestE2E_ResponsesAPI(t *testing.T) {
 			Content []struct {
 				Text string `json:"text"`
 			} `json:"content"`
+			Summary []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"summary"`
 		} `json:"output"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -1308,11 +1337,14 @@ func TestE2E_ResponsesAPI(t *testing.T) {
 	if out.Object != "response" || out.Status != "completed" {
 		t.Fatalf("Responses 结构错误: %+v", out)
 	}
-	if len(out.Output) != 1 || len(out.Output[0].Content) != 1 {
+	// 上游的思考摘要在前（reasoning 条目），正文消息在后
+	if len(out.Output) != 2 || out.Output[0].Type != "reasoning" || len(out.Output[0].Summary) != 1 ||
+		out.Output[0].Summary[0].Type != "summary_text" || out.Output[0].Summary[0].Text != "先想一下" ||
+		out.Output[1].Type != "message" || len(out.Output[1].Content) != 1 {
 		t.Fatalf("output 结构错误: %+v", out.Output)
 	}
-	if out.Output[0].Content[0].Text != "你好，这是一段流式回答。（完）" {
-		t.Fatalf("内容错误: %q", out.Output[0].Content[0].Text)
+	if out.Output[1].Content[0].Text != "你好，这是一段流式回答。（完）" {
+		t.Fatalf("内容错误: %q", out.Output[1].Content[0].Text)
 	}
 
 	// instructions 也要折进 input。

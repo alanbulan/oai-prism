@@ -947,6 +947,9 @@ func (s *Server) requestAuditMiddleware(next http.Handler) http.Handler {
 		duration := time.Since(start).Milliseconds()
 		// 实际路由到的账号由 facade 记进审计上下文；不读请求头 —— 那是客户端可控输入。
 		accountID := middleware.LogAccount(r.Context())
+		if m := middleware.LogModel(r.Context()); m != "" {
+			model = m // 网关换过模型名：记实际用的模型（如 claude-* → 默认 GPT 模型）
+		}
 		if hModel := r.Header.Get("X-Oaiprism-Model"); hModel != "" {
 			model = hModel
 		}
@@ -968,6 +971,13 @@ func (s *Server) requestAuditMiddleware(next http.Handler) http.Handler {
 		// HTTP 状态码帮不上忙，错误只存在事件流里。
 		if errs := middleware.LogErrors(r.Context()); len(errs) > 0 {
 			item.ErrorMessage = strings.Join(errs, " | ")
+		}
+		// 流式响应被客户端中途断开：状态码已是 200，按 499 记（与同步请求一致）
+		if middleware.LogAborted(r.Context()) && item.StatusCode < 400 {
+			item.StatusCode = 499
+			if item.ErrorMessage == "" {
+				item.ErrorMessage = "客户端在回答结束前断开了连接"
+			}
 		}
 
 		go func() {

@@ -48,6 +48,20 @@ export function isFailed(log: LogOutcome): boolean {
   return log.statusCode >= 400 || !!log.errorMessage;
 }
 
+/**
+ * 输出速度（tokens/s）= 输出 token ÷ 总耗时。上游的回答是生成完一次性给出的，没有"首字之后"
+ * 的流式窗口可量，只能按端到端算（含排队、思考）。没有输出或耗时为 0 时返回 null。
+ */
+export function outputSpeed(log: { completionTokens: number; durationMs: number }): number | null {
+  if (log.completionTokens <= 0 || log.durationMs <= 0) return null;
+  return log.completionTokens / (log.durationMs / 1000);
+}
+
+export function formatSpeed(v: number): string {
+  if (v < 0.1) return '<0.1 tok/s';
+  return `${v < 10 ? v.toFixed(1) : Math.round(v).toLocaleString()} tok/s`;
+}
+
 export type LatencyTone = 'fast' | 'normal' | 'slow' | 'very-slow';
 
 /** 耗时分级：流式长回复动辄几十秒，阈值按对话场景设定而非普通 API */

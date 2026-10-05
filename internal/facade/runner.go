@@ -626,6 +626,21 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		r.app.FacadeFirstByte.Observe(result.FirstDelta.Seconds(), req.API)
 	}
 
+	// 上游每次给的是到目前为止的完整思考摘要：只发新增的部分，且不跟正文增量绑在一起
+	// （曾经只随正文增量发、每次发全文：只调工具没有正文的一轮丢了思考，正文分多次到时思考重复）。
+	var sentReasoning string
+	nextReasoning := func(full string) string {
+		if full == "" || full == sentReasoning {
+			return ""
+		}
+		d := full
+		if strings.HasPrefix(full, sentReasoning) {
+			d = full[len(sentReasoning):]
+		}
+		sentReasoning = full
+		return d
+	}
+
 	// 3) start 有可能直接就是终态（回答很短，或者立刻失败了）。
 	if st := startResp.Initial; st != nil {
 		if st.Fail {
@@ -638,13 +653,13 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		if st.Text != "" {
 			prev = st.Text
 			result.Text = st.Text
-			if st.Delta != "" && emit != nil {
-				if eerr := emit(Delta{Text: st.Delta, Reasoning: st.ReasoningDelta, Reset: st.Reset}); eerr != nil {
-					return result, eerr
-				}
-				bumpFirstByte()
-				r.app.SSEDeltas.Inc(req.API)
+		}
+		if rd := nextReasoning(st.Reasoning); (st.Delta != "" || rd != "") && emit != nil {
+			if eerr := emit(Delta{Text: st.Delta, Reasoning: rd, Reset: st.Reset}); eerr != nil {
+				return result, eerr
 			}
+			bumpFirstByte()
+			r.app.SSEDeltas.Inc(req.API)
 		}
 		if st.Usage != nil {
 			result.Usage = st.Usage
@@ -791,15 +806,15 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			result.ListenSnapshot = st.ListenSnapshot
 		}
 
-		if st.Delta != "" {
-			if emit != nil {
-				if eerr := emit(Delta{Text: st.Delta, Reasoning: st.ReasoningDelta, Reset: st.Reset}); eerr != nil {
-					r.stopUpstream(p, requestID, convID, turnState)
-					return result, eerr
-				}
-				bumpFirstByte()
-				r.app.SSEDeltas.Inc(req.API)
+		if rd := nextReasoning(st.Reasoning); (st.Delta != "" || rd != "") && emit != nil {
+			if eerr := emit(Delta{Text: st.Delta, Reasoning: rd, Reset: st.Reset}); eerr != nil {
+				r.stopUpstream(p, requestID, convID, turnState)
+				return result, eerr
 			}
+			bumpFirstByte()
+			r.app.SSEDeltas.Inc(req.API)
+		}
+		if st.Delta != "" {
 			result.Text = st.Text
 			if result.Text == "" {
 				result.Text = prev + st.Delta

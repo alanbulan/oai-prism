@@ -309,7 +309,10 @@ func (h *Handler) writeLocalTitle(w http.ResponseWriter, req *ResponsesRequest, 
 		buf := make([]byte, 0, 1024)
 		buf = AppendResponsesEvent(buf[:0], ResponsesEvent{Type: "response.created", ResponseID: turn.id, Model: req.Model, CreatedAt: turn.created})
 		_ = sw.WriteRaw(buf)
-		_ = emitTextResponseEvents(sw, &buf, turn.id, req.Model, turn.created, newID("msg_"), titleJSON, nil)
+		st := newResponsesStream(sw, newID("msg_"))
+		if st.finishMessage(titleJSON) == nil {
+			_ = st.completed(turn.id, req.Model, turn.created, nil)
+		}
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -471,18 +474,25 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		_ = sw.WriteRaw(buf)
 	}
 
+	st := newResponsesStream(sw, itemID)
+
 	if turn.bridge {
-		// 桥模式不能边收边发：必须先拿到完整回复才能判断它是
-		// 工具调用（```codex-exec 块）还是纯文本，缓冲后统一输出。
+		// 桥模式不能边收边发正文：必须先拿到完整回复才能判断它是
+		// 工具调用（```codex-exec 块）还是纯文本，缓冲后统一输出。思考摘要不受影响，随到随发。
 		var sb strings.Builder
 		emit := func(d Delta) error {
 			sb.WriteString(d.Text)
-			return nil
+			if turn.compaction {
+				return nil // 压缩请求只要那条摘要消息
+			}
+			return st.reasoningDelta(d.Reasoning)
 		}
 		res, runErr := h.runResponses(r, runReq, emit)
 		if runErr != nil {
 			if !errors.Is(runErr, context.Canceled) {
 				fail(runErr)
+			} else {
+				middleware.RecordLogAbort(r)
 			}
 			return
 		}
@@ -504,62 +514,35 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 			finalRespID = res.ResponseID
 		}
 		if js != "" {
-			var items []string
 			for _, call := range bridgeToolCalls(turn, js, isWindowsClient(r)) {
-				ev := []ResponsesEvent{{Type: "response.output_item.added", ItemJSON: call.item}}
-				if call.input != "" {
-					// custom_tool_call 专用事件；function_call 没有这一段。
-					ev = append(ev, ResponsesEvent{Type: "response.custom_tool_call_input.done", ItemID: call.id, Text: call.input})
+				if err := st.toolCall(call); err != nil {
+					return
 				}
-				ev = append(ev, ResponsesEvent{Type: "response.output_item.done", ItemJSON: call.item})
-				for _, e := range ev {
-					if err := sw.WriteRaw(AppendResponsesEvent(buf[:0], e)); err != nil {
-						return
-					}
-				}
-				items = append(items, call.item)
 			}
-			done := AppendResponsesEvent(buf[:0], ResponsesEvent{
-				Type:       "response.completed",
-				ResponseID: finalRespID, Model: publicModel, CreatedAt: created,
-				OutputJSON: "[" + strings.Join(items, ",") + "]",
-				Usage:      usage,
-			})
-			_ = sw.WriteRaw(done)
+			_ = st.completed(finalRespID, publicModel, created, usage)
 			return
 		}
 
 		// 纯文本：桥模式下一次性给出（模型已完整生成，无需伪增量）。
-		_ = emitTextResponseEvents(sw, &buf, finalRespID, publicModel, created, itemID, stripExecFence(text), usage)
-		return
-	}
-
-	buf = AppendResponsesEvent(buf[:0], ResponsesEvent{
-		Type: "response.output_item.added", ItemID: itemID,
-	})
-	if err := sw.WriteRaw(buf); err != nil {
-		return
-	}
-	buf = AppendResponsesEvent(buf[:0], ResponsesEvent{
-		Type: "response.content_part.added", ItemID: itemID,
-	})
-	if err := sw.WriteRaw(buf); err != nil {
-		return
-	}
-
-	emit := func(d Delta) error {
-		if d.Text == "" {
-			return nil
+		if st.finishMessage(stripExecFence(text)) == nil {
+			_ = st.completed(finalRespID, publicModel, created, usage)
 		}
-		buf = AppendResponsesEvent(buf[:0], ResponsesEvent{
-			Type: "response.output_text.delta", ItemID: itemID, Text: d.Text,
-		})
-		return sw.WriteRaw(buf)
+		return
+	}
+
+	// 正文条目等第一段内容到了再开：思考摘要（reasoning 条目）要排在它前面。
+	emit := func(d Delta) error {
+		if err := st.reasoningDelta(d.Reasoning); err != nil {
+			return err
+		}
+		return st.textDelta(d.Text)
 	}
 	res, runErr := h.runResponses(r, runReq, emit)
 	if runErr != nil {
 		if !errors.Is(runErr, context.Canceled) {
 			fail(runErr)
+		} else {
+			middleware.RecordLogAbort(r)
 		}
 		return
 	}
@@ -576,7 +559,9 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 	if res != nil && res.ResponseID != "" {
 		finalRespID = res.ResponseID
 	}
-	_ = emitTextResponseEvents(sw, &buf, finalRespID, publicModel, created, itemID, text, usage)
+	if st.finishMessage(text) == nil {
+		_ = st.completed(finalRespID, publicModel, created, usage)
+	}
 }
 
 // bridgeExecJS 从桥模式回复里取出要交给客户端执行的 JS。
@@ -637,26 +622,6 @@ func bridgeToolCalls(turn *responsesTurn, js string, isWindows bool) []bridgeToo
 	return out
 }
 
-// emitTextResponseEvents 发文本型回复的收尾事件序列：
-// output_text.done -> content_part.done -> output_item.done -> completed。
-// 返回第一个写错误（如有）。
-func emitTextResponseEvents(sw *sse.Writer, buf *[]byte, id, publicModel string, created int64, itemID, text string, usage *prism.Usage) error {
-	events := []ResponsesEvent{
-		{Type: "response.output_text.done", ItemID: itemID, Text: text},
-		{Type: "response.content_part.done", ItemID: itemID, Text: text},
-		{Type: "response.output_item.done", ItemID: itemID, Text: text},
-		{Type: "response.completed", ResponseID: id, Model: publicModel,
-			CreatedAt: created, ItemID: itemID, Text: text, Usage: usage},
-	}
-	for _, ev := range events {
-		*buf = AppendResponsesEvent((*buf)[:0], ev)
-		if err := sw.WriteRaw(*buf); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *RunRequest, turn *responsesTurn) {
 	res, err := h.runResponses(r, runReq, nil)
 	if err != nil {
@@ -696,6 +661,9 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 		if js != "" {
 			setConversationHeader(w, conversationID)
 			var out []any
+			if res != nil && res.Reasoning != "" {
+				out = append(out, json.RawMessage(reasoningItemJSON(newID("rs_"), res.Reasoning)))
+			}
 			for _, call := range bridgeToolCalls(turn, js, isWindowsClient(r)) {
 				out = append(out, json.RawMessage(call.item))
 			}
@@ -712,22 +680,28 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 		}
 		text = stripExecFence(text)
 	}
+	var output []ResponsesItem
+	if res != nil && res.Reasoning != "" && !turn.compaction {
+		output = append(output, ResponsesItem{Type: "reasoning", ID: newID("rs_"),
+			Summary: []ResponsesSummary{{Type: "summary_text", Text: res.Reasoning}}})
+	}
+	output = append(output, ResponsesItem{
+		Type:   "message",
+		ID:     newID("msg_"),
+		Role:   "assistant",
+		Status: "completed",
+		Content: []ResponsesContent{{
+			Type: "output_text",
+			Text: text,
+		}},
+	})
 	resp := ResponsesResponse{
 		ID:        finalRespID,
 		Object:    "response",
 		CreatedAt: turn.created,
 		Status:    "completed",
 		Model:     turn.publicModel,
-		Output: []ResponsesItem{{
-			Type:   "message",
-			ID:     newID("msg_"),
-			Role:   "assistant",
-			Status: "completed",
-			Content: []ResponsesContent{{
-				Type: "output_text",
-				Text: text,
-			}},
-		}},
+		Output:    output,
 	}
 	if usage != nil {
 		resp.Usage = usage
