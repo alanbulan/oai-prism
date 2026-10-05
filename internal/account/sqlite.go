@@ -53,6 +53,8 @@ func NewSQLiteStore(dbPath string, log *slog.Logger) (*SQLiteStore, error) {
 	db.SetMaxOpenConns(1)
 	_, _ = db.Exec("PRAGMA journal_mode=DELETE;")
 	_, _ = db.Exec("PRAGMA synchronous=NORMAL;")
+	// 命令行 import、探针等别的进程也会写这个库：遇锁等一会儿，而不是立刻 SQLITE_BUSY。
+	_, _ = db.Exec("PRAGMA busy_timeout=5000;")
 
 	s := &SQLiteStore{
 		db:   db,

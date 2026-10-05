@@ -151,22 +151,34 @@ export const AccountImportModal: React.FC = () => {
   const [rawText, setRawText] = useState('');
   const [loading, setLoading] = useState(false);
 
+  const submit = async (text: string, source?: string) => {
+    setLoading(true);
+    try {
+      await importAccounts({ rawText: text });
+      message.success(source ? `已导入 ${source}` : '账号导入成功！');
+      setRawText('');
+      setImportModalOpen(false);
+    } catch (err: any) {
+      const reason = err.message || '导入失败，请检查数据格式';
+      if (source) {
+        // 文件导入失败：内容放进文本页，方便看清哪里不对、改完再导
+        setRawText(text);
+        setActiveTab('text');
+        message.error(`${source} 导入失败：${reason}（内容已放到文本页）`);
+      } else {
+        message.error(reason);
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleOk = async () => {
     if (!rawText.trim()) {
       message.warning('请先输入或上传账号凭据内容');
       return;
     }
-    setLoading(true);
-    try {
-      await importAccounts({ rawText });
-      message.success('账号导入成功！');
-      setRawText('');
-      setImportModalOpen(false);
-    } catch (err: any) {
-      message.error(err.message || '导入失败，请检查数据格式');
-    } finally {
-      setLoading(false);
-    }
+    await submit(rawText);
   };
 
   const handleOAuthDone = () => {
@@ -216,23 +228,26 @@ export const AccountImportModal: React.FC = () => {
         <Dragger
           accept=".json,.txt"
           showUploadList={false}
+          disabled={loading}
           beforeUpload={(file) => {
-            const reader = new FileReader();
-            reader.onload = (e) => {
-              const content = e.target?.result as string;
-              if (content) {
-                setRawText(content);
-                message.info(`已读取文件: ${file.name}，可切换到文本选项卡预览并点击确定`);
-              }
-            };
-            reader.readAsText(file);
+            // 拖进来就直接导入；失败时才把内容放进文本页
+            file
+              .text()
+              .then((content) => {
+                if (!content.trim()) {
+                  message.warning(`${file.name} 是空文件`);
+                  return;
+                }
+                return submit(content, file.name);
+              })
+              .catch((err) => message.error(`读取 ${file.name} 失败：${err?.message || err}`));
             return false;
           }}
         >
           <p className="ant-upload-drag-icon">
             <InboxOutlined />
           </p>
-          <p className="ant-upload-text">点击或拖拽 accounts.json 或 cookie.txt 文件到此区域</p>
+          <p className="ant-upload-text">点击或拖拽 accounts.json 或 cookie.txt 文件到此区域，放下即导入</p>
           <p className="ant-upload-hint">支持单个或批量账号 JSON，包括其它网关（如 sub2api）导出的账号文件</p>
         </Dragger>
       ),

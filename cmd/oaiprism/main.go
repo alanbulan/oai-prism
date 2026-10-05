@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -306,12 +307,6 @@ func cmdImport(args []string) error {
 	log := logx.Setup("warn", "text")
 	store := account.NewStore(credsPath, log)
 
-	existing, err := store.Load()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "警告: 现有凭据文件解析失败，将被覆盖: %v\n", err)
-		existing = nil
-	}
-
 	ac := config.AccountConfig{
 		ID:             *id,
 		Name:           *name,
@@ -380,6 +375,20 @@ func cmdImport(args []string) error {
 		}
 	}
 
+	// 网关已在用 SQLite（凭据文件旁的 accounts.db）时写进数据库：账号池以它为准，
+	// 凭据文件只在数据库为空时导入一次。显式 -out 时仍写文件。
+	if dbPath := filepath.Join(filepath.Dir(credsPath), "accounts.db"); *out == "" {
+		if _, statErr := os.Stat(dbPath); statErr == nil {
+			return importToSQLite(dbPath, ac, *name != "", c, log)
+		}
+	}
+
+	existing, err := store.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "警告: 现有凭据文件解析失败，将被覆盖: %v\n", err)
+		existing = nil
+	}
+
 	// upsert 到凭据文件。
 	merged := make([]config.AccountConfig, 0, len(existing)+1)
 	replaced := false
@@ -402,7 +411,42 @@ func cmdImport(args []string) error {
 	fmt.Printf("\n已写入 %s（共 %d 个账号，本次为%s）\n", credsPath, len(merged),
 		map[bool]string{true: "更新", false: "新增"}[replaced])
 	fmt.Printf("自愈能力: %s\n", canRefreshDesc(c))
-	fmt.Println("\n服务运行中时会自动热加载；未运行时下次启动即生效。")
+	fmt.Println("\n未启用 SQLite 时服务运行中会自动热加载；未运行时下次启动即生效。")
+	return nil
+}
+
+// importToSQLite 把账号 upsert 进网关的 SQLite。已有同 ID 账号时保留控制台里设置的
+// 名称、标签与并发上限（除非命令行显式给了 -name），只换凭据与校验得到的元信息。
+func importToSQLite(dbPath string, ac config.AccountConfig, nameGiven bool, c *creds.Credential, log *slog.Logger) error {
+	sq, err := account.NewSQLiteStore(dbPath, log)
+	if err != nil {
+		return fmt.Errorf("打开 %s: %w", dbPath, err)
+	}
+	defer sq.Close()
+	list, err := sq.Load()
+	if err != nil {
+		return fmt.Errorf("读取 %s: %w", dbPath, err)
+	}
+	replaced := false
+	for _, e := range list {
+		if e.ID != ac.ID {
+			continue
+		}
+		replaced = true
+		if !nameGiven {
+			ac.Name = e.Name
+		}
+		ac.Tags, ac.MaxConcurrency = e.Tags, e.MaxConcurrency
+		if ac.OAuthClientID == "" {
+			ac.OAuthClientID = e.OAuthClientID
+		}
+	}
+	if err := sq.SaveAccount(ac); err != nil {
+		return fmt.Errorf("写入 %s: %w", dbPath, err)
+	}
+	fmt.Printf("\n已写入 %s（本次为%s）\n", dbPath, map[bool]string{true: "更新", false: "新增"}[replaced])
+	fmt.Printf("自愈能力: %s\n", canRefreshDesc(c))
+	fmt.Println("\n服务运行中时在控制台点「重载并刷新」即生效；未运行时下次启动即生效。")
 	return nil
 }
 

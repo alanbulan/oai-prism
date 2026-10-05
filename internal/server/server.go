@@ -75,20 +75,22 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		log.Error("初始化 SQLite 账号存储失败，退化为仅文件模式",
 			"path", dbPath, "err", sqliteErr)
 	} else {
-		// 自动迁移已有账号至 SQLite，实现开箱即用无缝接管
-		mergedInit := mergeAccounts(cfg.Creds.Accounts, fileAccounts)
-		_ = sqliteStore.MigrateIfEmpty(mergedInit)
-		if dbAccounts, err := sqliteStore.Load(); err == nil && len(dbAccounts) > 0 {
-			fileAccounts = dbAccounts
-		}
+		// 账号以 SQLite 为准：凭据文件与配置内账号只在数据库为空时导入一次。
+		_ = sqliteStore.MigrateIfEmpty(mergeAccounts(cfg.Creds.Accounts, fileAccounts))
 		// 刷新后的凭据写回 SQLite：refresh_token 每次刷新都会轮换，不落盘的话
 		// 重启（或 Dashboard 编辑触发的整池重建）后读回的是已作废的旧值。
 		// 只 UPDATE token 列，不碰 Dashboard 编辑的 name / tags / max_concurrency。
 		pool.SetOnRefreshed(account.NewRefreshPersister(sqliteStore, cfg.Creds.PersistRefreshMin, log).Persist)
 	}
 
-	if len(fileAccounts) > 0 {
-		if err := pool.Build(mergeAccounts(cfg.Creds.Accounts, fileAccounts)); err != nil {
+	initial := mergeAccounts(cfg.Creds.Accounts, fileAccounts)
+	if sqliteErr == nil {
+		if dbAccounts, err := sqliteStore.Load(); err == nil && len(dbAccounts) > 0 {
+			initial = dbAccounts
+		}
+	}
+	if len(initial) > 0 {
+		if err := pool.Build(initial); err != nil {
 			return nil, fmt.Errorf("构建账号池: %w", err)
 		}
 	}
@@ -524,16 +526,16 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 	})
 
 	mux.HandleFunc("POST /admin/reload", func(w http.ResponseWriter, r *http.Request) {
-		list, err := s.store.Load()
+		list, err := s.loadPoolAccounts()
 		if err != nil {
-			writeAdminErr(w, http.StatusBadRequest, "读取凭据文件失败: "+err.Error())
+			writeAdminErr(w, http.StatusBadRequest, "读取账号失败: "+err.Error())
 			return
 		}
-		if err := s.pool.Build(mergeAccounts(s.cfg.Creds.Accounts, list)); err != nil {
+		if err := s.pool.Build(list); err != nil {
 			writeAdminErr(w, http.StatusInternalServerError, "重建账号池失败: "+err.Error())
 			return
 		}
-		s.log.Info("凭据已手动重载", "count", s.pool.Size())
+		s.log.Info("账号池已手动重载", "count", s.pool.Size())
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"accounts": s.pool.Size()})
 	})
@@ -994,7 +996,9 @@ func (s *Server) Run(ctx context.Context) error {
 	defer bgCancel()
 
 	s.pool.StartBackground(bgCtx)
-	if s.cfg.Creds.Mode == "file" || s.cfg.Creds.Mode == "hybrid" {
+	// 凭据文件热重载只在没有 SQLite 时启用：有 SQLite 时文件里的令牌早已过时
+	// （续期轮换只写回数据库），按文件重建会丢掉控制台导入的账号、换回作废的令牌。
+	if (s.cfg.Creds.Mode == "file" || s.cfg.Creds.Mode == "hybrid") && s.sqlite == nil {
 		go s.store.Watch(bgCtx, s.cfg.Creds.ReloadInterval, func(list []config.AccountConfig) {
 			if err := s.pool.Build(mergeAccounts(s.cfg.Creds.Accounts, list)); err != nil {
 				s.log.Error("热重载账号池失败，保留原池", "err", err)
@@ -1113,11 +1117,27 @@ func importedAccountID(existing []config.AccountConfig, a config.AccountConfig) 
 	return "acc-" + oauthRandomHex(4)
 }
 
+// loadPoolAccounts 是账号池的唯一来源，启动、手动重载、控制台增删改之后的重建都从这里取。
+//
+// 有 SQLite 时以数据库为准：控制台导入与编辑、续期轮换后的令牌都只写在数据库里，
+// 凭据文件与配置内账号只在数据库为空时导入一次（见 New）。曾经手动重载读的是凭据文件，
+// 一点「重载并刷新」控制台导入的账号就从池里消失，留下的还是文件里早已作废的令牌。
+func (s *Server) loadPoolAccounts() ([]config.AccountConfig, error) {
+	if s.sqlite != nil {
+		return s.sqlite.Load()
+	}
+	list, err := s.store.Load()
+	if err != nil {
+		return nil, err
+	}
+	return mergeAccounts(s.cfg.Creds.Accounts, list), nil
+}
+
 func (s *Server) syncPoolFromSQLite() error {
 	if s.sqlite == nil {
 		return nil
 	}
-	dbAccounts, err := s.sqlite.Load()
+	dbAccounts, err := s.loadPoolAccounts()
 	if err != nil {
 		s.log.Error("从 SQLite 读取账号失败", "err", err)
 		return err

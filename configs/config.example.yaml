@@ -102,7 +102,8 @@ upstream:
 # ---------------------------------------------------------------------------
 creds:
   # static      - 凭据写在下面的 accounts 里
-  # file        - 凭据放在独立 JSON 文件，改动后自动热加载（推荐）
+  # file        - 凭据放在独立 JSON 文件（推荐）。启用 SQLite（creds.file 旁的 accounts.db）后
+  #               账号以数据库为准，文件只在数据库为空时导入一次；没有 SQLite 时改动文件自动热加载
   # passthrough - 由调用方每个请求自带
   # hybrid      - 静态 + 文件同时用
   mode: file

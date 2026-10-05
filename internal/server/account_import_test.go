@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"testing"
 	"time"
 )
@@ -126,5 +127,41 @@ func TestAdmin_ImportAccountFormats(t *testing.T) {
 	}
 	if code, _ := doLocal(t, http.MethodPut, ts.URL+"/admin/accounts/nope", `{"name":"x"}`, jsonHdr); code != http.StatusNotFound {
 		t.Fatalf("不存在的账号应 404，得到 %d", code)
+	}
+}
+
+// 「重载并刷新」曾按凭据文件重建账号池：控制台导入的账号（只在 SQLite 里）随之消失，
+// 留下的是文件里的旧账号与早已作废的令牌。账号池只认 SQLite。
+func TestAdmin_ReloadKeepsSQLiteAccounts(t *testing.T) {
+	ts, _, srv := newTestServerWithSrv(t, &fakeUpstream{t: t}, goodAccount(), nil)
+	jsonHdr := map[string]string{"Content-Type": "application/json"}
+
+	at := fakeJWT(map[string]any{"exp": time.Now().Add(240 * time.Hour).Unix()})
+	if code, out := doLocal(t, http.MethodPost, ts.URL+"/admin/accounts",
+		fmt.Sprintf(`{"id":"dash-1","access_token":%q,"refresh_token":"rt.1.dash"}`, at), jsonHdr); code != http.StatusCreated {
+		t.Fatalf("导入 %d: %s", code, out)
+	}
+	// 凭据文件里是另一个旧账号，且 main 的令牌已过时
+	stale := `{"accounts":[{"id":"file-only","access_token":"old"},{"id":"main","access_token":"stale-token"}]}`
+	if err := os.WriteFile(srv.cfg.Creds.File, []byte(stale), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ {
+		if code, out := doLocal(t, http.MethodPost, ts.URL+"/admin/reload", "", nil); code != http.StatusOK {
+			t.Fatalf("reload %d: %s", code, out)
+		}
+	}
+	if srv.pool.Get("dash-1") == nil || srv.pool.Get("main") == nil {
+		t.Fatalf("重载后账号池丢了 SQLite 里的账号：%d 个", srv.pool.Size())
+	}
+	if srv.pool.Get("file-only") != nil || srv.pool.Size() != 2 {
+		t.Fatalf("重载不应读凭据文件：%d 个", srv.pool.Size())
+	}
+	if tok := srv.pool.Get("main").Credential().AccessToken; tok != "good-token" {
+		t.Fatalf("重载换回了文件里的旧令牌：%q", tok)
+	}
+	if _, ok := adminAccounts(t, ts.URL)["dash-1"]; !ok {
+		t.Fatal("列表里应仍有导入的账号")
 	}
 }
