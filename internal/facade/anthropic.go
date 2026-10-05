@@ -68,9 +68,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	conv := chatConversation(chat, "")
 	if bt != nil {
 		addClientToolReminder(input, conv)
-		if conv != nil {
-			bt.cwd = clientWorkingDir(conv.system)
-		}
+		bt.cwd = clientWorkingDir(conv)
 	}
 
 	runReq := &RunRequest{

@@ -2,7 +2,10 @@ package facade
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -225,8 +228,68 @@ func TestDeltaFilesToClientTools(t *testing.T) {
 	if got := joinClientPath("/home/me/p", "a/b.txt"); got != "/home/me/p/a/b.txt" {
 		t.Fatalf("POSIX 路径: %q", got)
 	}
-	if got := clientWorkingDir("# Environment\n - Primary working directory: C:\\work\\demo\n - Platform: win32"); got != `C:\work\demo` {
+	if got := clientWorkingDir(nativeConv("# Environment\n - Primary working directory: C:\\work\\demo\n - Platform: win32", "hi")); got != `C:\work\demo` {
 		t.Fatalf("应从 system 取出工作目录: %q", got)
+	}
+	// Claude Code 2.1.289 也会把环境段落作为 <system-reminder> 放进第一条 user 消息
+	env := "<system-reminder>\n# Environment\n - Primary working directory: D:\\proj\\中文目录\n - Shell: PowerShell\n</system-reminder>"
+	if got := clientWorkingDir(nativeConv("SYS", "next", historyEntry{speaker: "User", text: env})); got != `D:\proj\中文目录` {
+		t.Fatalf("应从第一条 user 消息取出工作目录: %q", got)
+	}
+	if got := clientWorkingDir(nativeConv("SYS", env)); got != `D:\proj\中文目录` {
+		t.Fatalf("首轮时环境段落就在本轮消息里: %q", got)
+	}
+}
+
+// 读大文件被截短时，说明缺了哪几行、怎么补读（Read 的输出带行号）。
+func TestTruncateOutput_ReadHint(t *testing.T) {
+	var sb strings.Builder
+	for i := 1; i <= 3000; i++ {
+		fmt.Fprintf(&sb, "%6d\tline %d of the file with some padding text\n", i, i)
+	}
+	out := truncateOutput(sb.String(), 40<<10, true)
+	if len(out) > 40<<10+300 {
+		t.Fatalf("截后过长: %d", len(out))
+	}
+	m := regexp.MustCompile(`lines (\d+)-(\d+) were not shown; read them with offset=(\d+) limit=(\d+)`).FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("应注明缺的行号范围: %q", out[len(out)/2-200:len(out)/2+200])
+	}
+	from, _ := strconv.Atoi(m[1])
+	to, _ := strconv.Atoi(m[2])
+	if !strings.Contains(out, fmt.Sprintf("%6d\tline %d ", from-1, from-1)) || strings.Contains(out, fmt.Sprintf("%6d\tline %d ", from, from)) ||
+		!strings.Contains(out, fmt.Sprintf("%6d\tline %d ", to+1, to+1)) || strings.Contains(out, fmt.Sprintf("%6d\tline %d ", to, to)) {
+		t.Fatalf("行号范围与实际省略的不符: %d-%d", from, to)
+	}
+	// 截断落在整行上
+	if i := strings.Index(out, "…["); i <= 0 || out[i-1] != '\n' {
+		t.Fatal("开头部分应断在整行")
+	}
+	// 不带行号的输出给通用说明
+	plain := truncateOutput(strings.Repeat("abcdefghij\n", 10000), 8<<10, false)
+	if !strings.Contains(plain, "smaller pieces") || strings.Contains(plain, "offset=") {
+		t.Fatalf("无行号时的说明不对: %q", plain[len(plain)/2-120:len(plain)/2+120])
+	}
+	if s := "short"; truncateOutput(s, 100, true) != s {
+		t.Fatal("没超的不动")
+	}
+}
+
+// Claude Code 附在工具结果、user 消息里的剩余 token 计数不转给上游。
+func TestAnthropicChatMessages_DropsTokenNotes(t *testing.T) {
+	note := strconv.Quote("<system-reminder>\n<total_tokens>14985978 tokens left</total_tokens>\n</system-reminder>")
+	var msgs []AnthropicMessage
+	if err := json.Unmarshal([]byte(`[
+		{"role":"user","content":"read it"},
+		{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"a.go"}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"1\tpackage a"},{"type":"text","text":`+note+`}]},{"type":"text","text":`+note+`}]}
+	]`), &msgs); err != nil {
+		t.Fatal(err)
+	}
+	chat := anthropicChatMessages(msgs)
+	last := chat[len(chat)-1].Content.Text()
+	if strings.Contains(last, "total_tokens") || !strings.Contains(last, "1\tpackage a") {
+		t.Fatalf("计数提示应去掉、结果保留: %q", last)
 	}
 }
 
@@ -255,7 +318,7 @@ func TestNativeDelta_BranchTail(t *testing.T) {
 	if !ok || len(rest) != 1 || rest[0].text != "第三问" || main.branch != 1 {
 		t.Fatalf("主对话应接着同一个会话、跳过旁路的一条: ok=%v branch=%d %+v", ok, main.branch, rest)
 	}
-	items, _, _ := main.deltaItems(b, rest, 96<<10, "")
+	items, _, _, _ := main.deltaItems(b, rest, 96<<10, "")
 	if u := itemText(items[1]); !strings.HasPrefix(u, "[Note: the last 1 message(s)") || !strings.HasSuffix(u, "第三问") {
 		t.Fatalf("增量应先提醒忽略旁路的消息: %q", u)
 	}

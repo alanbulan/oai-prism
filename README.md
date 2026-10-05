@@ -62,7 +62,7 @@ OAIprism 把这些全部收进网关，对外只暴露你已经在用的标准�
     </td>
     <td width="33%" valign="top">
       <b>🛠️ Codex / Claude Code 工具桥</b><br><br>
-      上游负责思考，本地 Codex CLI 或 Claude Code 负责执行。命令在本机跑，文件真实落在你的磁盘上，Claude Code 的权限确认照常生效。
+      上游负责思考，本地 Codex CLI 或 Claude Code 负责执行。读文件、跑命令、调 MCP 工具都在本机，文件真实落在你的磁盘上，Claude Code 的权限确认照常生效。
     </td>
     <td width="33%" valign="top">
       <b>🧠 连续的长窗口记忆</b><br><br>

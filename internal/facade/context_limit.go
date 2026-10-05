@@ -84,16 +84,23 @@ func (r *Runner) upstreamPromptItems(req *RunRequest) []prism.InputItem {
 }
 
 // checkPromptSize 在占用账号、建项目、申请沙箱之前检查提示词大小。
+//
+// 原生续接的请求只要求本轮消息加精简 system 放得下：完整 system 放不下时单独发一轮
+// （见 native.go 的 deltaItems）。真正发出前 runOnce 还会按实际条目再量一次。
 func (r *Runner) checkPromptSize(req *RunRequest) error {
 	limit := r.cfg.Facade.PromptByteLimit()
 	if limit <= 0 {
 		return nil
 	}
 	items := r.upstreamPromptItems(req)
-	if n := promptBytes(items); n > limit {
-		return &contextTooLargeError{Bytes: n, Limit: limit, Tokens: countInputTokens(items)}
+	n := promptBytes(items)
+	if n <= limit {
+		return nil
 	}
-	return nil
+	if nt := req.Native; nt != nil && nt.conv != nil && nativeMinBytes(nt.conv)+promptOverheadReserve <= limit {
+		return nil
+	}
+	return &contextTooLargeError{Bytes: n, Limit: limit, Tokens: countInputTokens(items)}
 }
 
 // responsesErrorCode 是 response.failed 里的 error.code。Codex 只有收到

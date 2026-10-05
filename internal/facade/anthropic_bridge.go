@@ -46,8 +46,10 @@ const (
 	toolCatalogBudget = 24 << 10
 
 	// toolResultsBudget 是一条消息里全部工具结果的字节预算（按条数均分，每条至少 toolResultMin）。
-	// 增量轮次里它们就是发给上游的那条消息，超出单条上限整轮都发不出去。
-	toolResultsBudget = 40 << 10
+	// 增量轮次里它们就是发给上游的那条消息，超出单条上限整轮都发不出去。完整 system 不必和它
+	// 挤在一条里（放不下时单独发一轮，见 native.go），所以预算只给本轮的其余文字留余量：
+	// 一次 Read 默认最多 2000 行，绝大多数源文件整份到得了上游。
+	toolResultsBudget = 72 << 10
 	toolResultMin     = 4 << 10
 
 	// replayValueMax 是回放历史里工具参数单个字符串的上限（Write 的整份文件内容之类）。
@@ -407,6 +409,12 @@ func anthropicChatMessages(msgs []AnthropicMessage) []ChatMessage {
 // reVolatileSystem 匹配每轮都变、对上游没有意义的 system 提示（Claude Code 的剩余 token 计数）。
 var reVolatileSystem = regexp.MustCompile(`^<total_tokens>[^<]*</total_tokens>$`)
 
+// reVolatileNote 是同一个计数被 Claude Code 包在 <system-reminder> 里、作为文本块附在
+// 工具结果或 user 消息里的形态（2.1.289 实测两种都有）。
+var reVolatileNote = regexp.MustCompile(`^\s*(?:<system-reminder>\s*)?<total_tokens>[^<]*</total_tokens>\s*(?:</system-reminder>)?\s*$`)
+
+func isVolatileNote(s string) bool { return reVolatileNote.MatchString(s) }
+
 // assistantReplay 把助手消息回放成文本（正文 + 工具调用围栏），并取出这轮上游原文的指纹
 // （tool_use ID 里带着，见 bridgeToolUseIDs；没有时为 0）。
 func assistantReplay(blocks []anthropicBlock) (string, uint64) {
@@ -493,7 +501,7 @@ func userContent(blocks []anthropicBlock, calls map[string]anthropicBlock) Strin
 	for _, b := range blocks {
 		switch b.Type {
 		case "text":
-			if strings.TrimSpace(b.Text) != "" {
+			if strings.TrimSpace(b.Text) != "" && !isVolatileNote(b.Text) {
 				texts = append(texts, b.Text)
 			}
 		case "image":
@@ -570,7 +578,9 @@ func renderToolResult(b anthropicBlock, call anthropicBlock, budget int) (string
 	for _, c := range decodeAnthropicContent(b.Content) {
 		switch c.Type {
 		case "text":
-			texts = append(texts, c.Text)
+			if !isVolatileNote(c.Text) {
+				texts = append(texts, c.Text)
+			}
 		case "image":
 			if u := imageSourceURL(c); u != "" {
 				images = append(images, u)
@@ -582,7 +592,7 @@ func renderToolResult(b anthropicBlock, call anthropicBlock, budget int) (string
 			texts = append(texts, string(c.raw))
 		}
 	}
-	body := truncateMiddle(strings.Join(texts, "\n"), budget)
+	body := truncateOutput(strings.Join(texts, "\n"), budget, call.Name == "Read")
 	if strings.TrimSpace(body) == "" && len(images) == 0 {
 		body = "(no output)"
 	}
@@ -609,12 +619,66 @@ func truncateMiddle(s string, n int) string {
 	if n <= 0 || len(s) <= n {
 		return s
 	}
-	head := cutUTF8(s, n*2/3)
+	head, tail := splitMiddle(s, n)
+	return head + fmt.Sprintf("\n…[%d bytes of output omitted by the gateway]…\n", len(s)-len(head)-len(tail)) + tail
+}
+
+// splitMiddle 取 s 的开头约三分之二、结尾约三分之一（合计不超过 n 字节，不切开多字节字符）。
+func splitMiddle(s string, n int) (head, tail string) {
+	head = cutUTF8(s, n*2/3)
+	if i := strings.LastIndexByte(head, '\n'); i >= len(head)/2 {
+		head = head[:i+1] // 断在整行上：带行号的输出看得出缺了哪几行
+	}
 	tailStart := len(s) - n/3
 	for tailStart < len(s) && !utf8.RuneStart(s[tailStart]) {
 		tailStart++
 	}
-	return head + fmt.Sprintf("\n…[%d bytes of output omitted by the gateway]…\n", tailStart-len(head)) + s[tailStart:]
+	if i := strings.IndexByte(s[tailStart:], '\n'); i >= 0 && i < n/6 {
+		tailStart += i + 1
+	}
+	return head, s[tailStart:]
+}
+
+// truncateOutput 截短工具结果，并告诉模型怎么拿回中间缺的部分（读文件时给出缺的行号范围）。
+// 不截时原样返回。
+func truncateOutput(s string, n int, readTool bool) string {
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	head, tail := splitMiddle(s, n)
+	omitted := len(s) - len(head) - len(tail)
+	hint := "if you need the omitted part, get it again in smaller pieces (a narrower command, or a line range)"
+	if from, to, ok := omittedLines(head, tail); ok && readTool {
+		hint = fmt.Sprintf("lines %d-%d were not shown; read them with offset=%d limit=%d (or in smaller pieces) if you need them", from, to, from, to-from+1)
+	} else if ok {
+		hint = fmt.Sprintf("lines %d-%d were not shown; get them again with a line range if you need them", from, to)
+	}
+	return head + fmt.Sprintf("…[%d bytes omitted from the middle of this output by the gateway: %s]…\n", omitted, hint) + tail
+}
+
+// reLineNo 匹配带行号输出（cat -n、Claude Code 的 Read：「   12\t…」或「12→…」）一行开头的行号。
+var reLineNo = regexp.MustCompile(`^\s*(\d+)(?:\t|→)`)
+
+// omittedLines 从截断处两侧的行号推出被省略的行号范围（输出不带行号时 ok 为 false）。
+func omittedLines(head, tail string) (from, to int, ok bool) {
+	h := strings.TrimRight(head, "\n")
+	if i := strings.LastIndexByte(h, '\n'); i >= 0 {
+		h = h[i+1:]
+	}
+	t := tail
+	if i := strings.IndexByte(t, '\n'); i >= 0 {
+		t = t[:i]
+	}
+	mh, mt := reLineNo.FindStringSubmatch(h), reLineNo.FindStringSubmatch(t)
+	if mh == nil || mt == nil {
+		return 0, 0, false
+	}
+	a, _ := strconv.Atoi(mh[1])
+	b, _ := strconv.Atoi(mt[1])
+	if b-a < 2 {
+		return 0, 0, false
+	}
+	return a + 1, b - 1, true
 }
 
 // withClientToolReminder 把桥的提醒接在 user 条目最后一个文本块末尾（返回副本）。
@@ -1065,12 +1129,26 @@ func toolUseFingerprint(id string) uint64 {
 
 // ---------------------------- 沙箱文件兜底 ----------------------------
 
-// reClientCwd 从客户端的 system 里取工作目录（Claude Code 的环境段落）。
+// reClientCwd 从客户端的环境段落里取工作目录（Claude Code 有时放在 system 里，有时作为
+// <system-reminder> 放在第一条 user 消息里 —— 2.1.289 两种都见过）。
 var reClientCwd = regexp.MustCompile(`(?m)^[ \t]*-?[ \t]*(?:Primary working directory|Working directory):[ \t]*(\S.*?)[ \t]*$`)
 
-func clientWorkingDir(system string) string {
-	if m := reClientCwd.FindStringSubmatch(system); m != nil {
-		return strings.Trim(m[1], "`")
+// clientWorkingDir 依次在 system、往轮对话、本轮消息里找工作目录。
+func clientWorkingDir(conv *nativeConversation) string {
+	if conv == nil {
+		return ""
+	}
+	texts := []string{conv.system}
+	for _, e := range conv.history {
+		if e.speaker == "User" {
+			texts = append(texts, e.text)
+		}
+	}
+	texts = append(texts, itemText(conv.current))
+	for _, t := range texts {
+		if m := reClientCwd.FindStringSubmatch(t); m != nil {
+			return strings.Trim(m[1], "`")
+		}
 	}
 	return ""
 }

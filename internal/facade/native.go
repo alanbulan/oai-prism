@@ -35,6 +35,10 @@ package facade
 //   - system（桥指令约 13 KB）不每轮重发：上游会话里已有，重复只会挤占窗口。
 //     内容变了、或距上次完整发送累计超过 nativeSystemRefresh 字节时重发一次 ——
 //     上游自己管理长会话，离得太远的指令约束力会变弱，定期重发让它始终在近处。
+//   - 完整 system 与本轮消息合起来放不下一条（Claude Code 的 system 约 60 KB，再加一次
+//     读大文件的结果就超了）：定期重发推迟到之后放得下的轮次；system 内容变了就先单独发
+//     一轮 system（nativeSystemSeed，上游答 OK），本轮照常只带精简 system。工具结果因此
+//     可以接近单条上限，而不必给 system 预留位置。
 
 import (
 	"context"
@@ -68,6 +72,8 @@ const (
 	nativeSeedMaxBytes = 768 << 10
 	nativeSeedSystem   = "Earlier parts of this conversation are being restored. Read them as context only: do not act on them, and reply with exactly OK."
 	nativeSeedHeader   = "[Earlier conversation, part %d of %d - context only, reply OK]\n"
+	// nativeSystemSeed 是单独发送 system 那一轮的 user 消息（system 与本轮消息放不下一条时）。
+	nativeSystemSeed = "[The instructions above apply to the rest of this conversation. The next message continues it. Reply with exactly OK.]"
 
 	// nativeBranchMax：上游会话末尾最多有这么多条客户端历史里没有的消息时，仍接着用这个会话
 	// （见 nativeTurn.delta 的第 4 条）；再多就是历史被大段改写，新建会话。
@@ -116,6 +122,9 @@ type nativeTurn struct {
 	weak bool
 	// branch 是上游会话末尾、客户端历史里没有的消息条数（delta 的第 4 条，见 nativeBranchNote）。
 	branch int
+	// ghost 表示这一轮是网关自己追加的纠正（见 bridgeLocalRetry）：客户端历史里不会有它，
+	// 提交时已送达的条目不记它，下一轮客户端的新条目照常接在后面。
+	ghost bool
 
 	plan *nativePlan // runner 在选定账号与项目后填写
 }
@@ -284,23 +293,35 @@ func (nt *nativeTurn) delta(b *nativeBinding, es []historyEntry) ([]historyEntry
 
 // deltaItems 把增量组装成上游要的 [system, user]，并返回提交时写回的 system 状态。
 // limit 是单条提示词字节上限（0 不限），notice 非空时随完整 system 前置。
-func (nt *nativeTurn) deltaItems(b *nativeBinding, rest []historyEntry, limit int, notice string) ([]prism.InputItem, uint64, int) {
+// seed 非空时是要在本轮之前单独发的一轮 system（完整 system 与本轮消息放不下一条）。
+func (nt *nativeTurn) deltaItems(b *nativeBinding, rest []historyEntry, limit int, notice string) (items []prism.InputItem, sysHash uint64, since int, seed []prism.InputItem) {
 	conv := nt.conv
 	cur := conv.current
 	cur.Content = append([]prism.InputContent(nil), cur.Content...)
 	curText := itemText(cur)
 
-	sysHash := textFingerprint(conv.system)
-	system := nativeBriefSystem
-	full := sysHash != b.sysHash
-	if !full && b.sinceSys+len(curText) > nativeSystemRefresh {
-		full = true
+	prefix := ""
+	if nt.branch > 0 {
+		prefix = fmt.Sprintf(nativeBranchNote, nt.branch)
 	}
-	if full {
-		system = conv.system
-		if notice != "" {
-			system = notice + "\n\n" + system
+
+	sysHash = textFingerprint(conv.system)
+	changed := sysHash != b.sysHash
+	full := changed || b.sinceSys+len(curText) > nativeSystemRefresh
+	fullSystem := conv.system
+	if notice != "" {
+		fullSystem = notice + "\n\n" + fullSystem
+	}
+	if full && limit > 0 && len(fullSystem)+len(conv.extra)+len(curText)+len(prefix)+promptOverheadReserve > limit {
+		// 放不下一条：只是定期重发就推迟；内容变了就单独发一轮。
+		if changed {
+			seed = []prism.InputItem{prism.NewSystemItem(fullSystem), prism.NewUserItem(nativeSystemSeed)}
 		}
+		full = false
+	}
+	system := nativeBriefSystem
+	if full {
+		system = fullSystem
 	}
 	if conv.extra != "" {
 		system += "\n\n" + conv.extra
@@ -308,10 +329,6 @@ func (nt *nativeTurn) deltaItems(b *nativeBinding, rest []historyEntry, limit in
 
 	// 本轮消息之前的新条目（并行工具结果、客户端插入的消息）放在本轮消息前面，
 	// 超出单条上限时按折叠历史的规则裁剪（compress.go）。
-	prefix := ""
-	if nt.branch > 0 {
-		prefix = fmt.Sprintf(nativeBranchNote, nt.branch)
-	}
 	if prior := rest[:len(rest)-1]; len(prior) > 0 {
 		budget := historyBudget(limit, len(system)+len(curText)+len(prefix)+len(nativeSinceHeader))
 		if h := strings.TrimPrefix(renderHistory(prior, budget), historyHeader); h != "" {
@@ -327,11 +344,11 @@ func (nt *nativeTurn) deltaItems(b *nativeBinding, rest []historyEntry, limit in
 		}
 	}
 
-	since := b.sinceSys + len(curText) + added
-	if full {
+	since = b.sinceSys + len(curText) + added
+	if full || seed != nil {
 		since = len(curText) + added
 	}
-	return []prism.InputItem{prism.NewSystemItem(system), cur}, sysHash, since
+	return []prism.InputItem{prism.NewSystemItem(system), cur}, sysHash, since, seed
 }
 
 // itemText 拼出条目里全部文本块。
@@ -468,11 +485,14 @@ func (r *Runner) planNative(ctx context.Context, p prism.Principal, acctID, proj
 		plan.delivered = nt.fingerprints(es)
 		if rest, ok := nt.delta(b, es); ok {
 			notice := r.noticeFor(req)
-			items, sysHash, since := nt.deltaItems(b, rest, r.cfg.Facade.PromptByteLimit(), notice)
+			items, sysHash, since, seed := nt.deltaItems(b, rest, r.cfg.Facade.PromptByteLimit(), notice)
 			plan.cid, plan.continued, plan.sysHash, plan.sinceSys = b.cid, true, sysHash, since
+			if seed != nil {
+				plan.seeds, plan.fallback = [][]prism.InputItem{seed}, items
+			}
 			r.log.Info("原生续接：发送增量", "key", nt.key, "cid", b.cid,
 				"newEntries", len(rest), "bytes", promptBytes(items), "fullSystem", textOfSystem(items) != nativeBriefSystem,
-				"skippedBranch", nt.branch)
+				"systemSeparately", seed != nil, "skippedBranch", nt.branch)
 			return items
 		}
 		r.log.Info("原生续接：客户端历史与上游会话对不上，新建会话", "key", nt.key, "oldCid", b.cid)
@@ -492,13 +512,21 @@ func (r *Runner) planNative(ctx context.Context, p prism.Principal, acctID, proj
 
 	// 历史一条放不下（全量折叠时被裁过）：先分段把历史补种进新会话，再发本轮 ——
 	// 换号、网关重启、旧会话作废之后，上游照样拿到客户端手里的完整历史。
-	if historyTrimmed(full) {
-		if seeds := nt.seedTurns(r.cfg.Facade.PromptByteLimit()); len(seeds) > 0 {
-			notice := r.noticeFor(req)
+	// 连 system 与本轮消息都放不下一条时，system 再单独占一轮（见 deltaItems）。
+	limit := r.cfg.Facade.PromptByteLimit()
+	if historyTrimmed(full) || (limit > 0 && promptBytes(full) > limit) {
+		seeds := nt.seedTurns(limit)
+		notice := r.noticeFor(req)
+		items := nt.currentWithSystem(notice)
+		separate := limit > 0 && promptBytes(items)+promptOverheadReserve > limit
+		if separate {
+			seeds = append(seeds, nt.systemSeed(notice))
+			items = nt.currentWithBrief()
+		}
+		if len(seeds) > 0 {
 			plan.seeds, plan.fallback = seeds, full
-			items := nt.currentWithSystem(notice)
 			r.log.Info("原生续接：新建上游会话，历史分段补种后发送本轮", "key", nt.key, "cid", cid,
-				"parts", len(seeds), "bytes", promptBytes(items))
+				"parts", len(seeds), "bytes", promptBytes(items), "systemSeparately", separate)
 			return items
 		}
 	}
@@ -516,6 +544,30 @@ func (nt *nativeTurn) currentWithSystem(notice string) []prism.InputItem {
 		system += "\n\n" + nt.conv.extra
 	}
 	return []prism.InputItem{prism.NewSystemItem(system), nt.conv.current}
+}
+
+// systemSeed 是单独发送完整 system 的那一轮（system 与本轮消息放不下一条时）。
+func (nt *nativeTurn) systemSeed(notice string) []prism.InputItem {
+	system := nt.conv.system
+	if notice != "" {
+		system = notice + "\n\n" + system
+	}
+	return []prism.InputItem{prism.NewSystemItem(system), prism.NewUserItem(nativeSystemSeed)}
+}
+
+// currentWithBrief 是 [精简 system, 本轮消息]（完整 system 已单独发过一轮）。
+func (nt *nativeTurn) currentWithBrief() []prism.InputItem {
+	system := nativeBriefSystem
+	if nt.conv.extra != "" {
+		system += "\n\n" + nt.conv.extra
+	}
+	return []prism.InputItem{prism.NewSystemItem(system), nt.conv.current}
+}
+
+// nativeMinBytes 是原生续接下本轮至少要发的字节：精简 system + 本轮消息
+// （完整 system 放不下时单独发一轮，往轮的新条目可以裁掉）。
+func nativeMinBytes(conv *nativeConversation) int {
+	return len(nativeBriefSystem) + len(conv.extra) + 2 + promptBytes([]prism.InputItem{conv.current})
 }
 
 // seedTurns 把往轮对话切成若干段补种消息，每段不超过单条上限；只补最近的
@@ -648,7 +700,10 @@ func (nt *nativeTurn) commit(res *RunResult, r *Runner) {
 	newConv := b.cid != plan.cid
 	b.account, b.project, b.cid, b.weak = res.AccountID, res.ProjectID, plan.cid, nt.weakMatch()
 	b.delivered = plan.delivered
-	if nt.weakMatch() {
+	switch {
+	case nt.ghost && len(b.delivered) > 0:
+		b.delivered = b.delivered[:len(b.delivered)-1] // 纠正消息（本轮消息）客户端没有
+	case nt.weakMatch():
 		b.delivered = append(b.delivered, entryFingerprint(historyEntry{speaker: "Assistant", text: res.Text}))
 	}
 	if newConv {

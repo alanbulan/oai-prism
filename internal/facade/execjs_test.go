@@ -84,7 +84,6 @@ await tools.exec_command({ cmd: 'never' });`)
 func TestEvalExecJSRejects(t *testing.T) {
 	for name, js := range map[string]string{
 		"语法错误":     "Get-ChildItem | Select-Object Name",
-		"未知工具":     "await tools.view_image({ path: 'a.png' })",
 		"未定义变量":    "await tools.exec_command({ cmd: missing })",
 		"cmd 非字符串": "await tools.exec_command({ cmd: 42 })",
 	} {

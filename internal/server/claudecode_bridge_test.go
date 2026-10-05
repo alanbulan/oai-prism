@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/png"
 	"net/http"
@@ -318,6 +319,61 @@ func TestE2E_AnthropicImagesReachUpstream(t *testing.T) {
 	ccPost(t, ts.URL, ccBody(t, true, first, assistant, ccUser(result)), ccHdr)
 	if images(2, up) != 1 {
 		t.Fatal("Read 读到的图片应随工具结果转给上游")
+	}
+}
+
+// 读大文件：system（Claude Code 自带的提示词很长）与整份文件放不下一条时，system 先单独发一轮，
+// 文件内容完整到达上游，不再截掉中间、也不因超限整轮失败。
+func TestE2E_ClaudeCodeBridge_BigReadSystemSeparately(t *testing.T) {
+	up := &fakeUpstream{t: t}
+	ts, _ := newTestServer(t, up, goodAccount(), nil)
+	bigSystem := ccSystem + "\n\n" + strings.Repeat("Follow the coding guidelines carefully. ", 1600) // ≈ 64 KB
+	body := func(msgs ...any) string {
+		return mustJSON(t, map[string]any{
+			"model": "claude-sonnet-4-5", "max_tokens": 32000, "stream": true,
+			"system": []any{map[string]any{"type": "text", "text": bigSystem}}, "tools": ccTools(), "messages": msgs,
+		})
+	}
+
+	setReply(up, "```local-tool\n{\"name\": \"Read\", \"input\": {\"file_path\": \"C:\\\\work\\\\demo\\\\big.py\"}}\n```")
+	first := ccUser(ccText("读一下 big.py，告诉我 MAGIC 的值"))
+	blocks, _ := ccStream(t, ccPost(t, ts.URL, body(first), ccHdr))
+	if len(blocks) != 1 || blocks[0].Name != "Read" {
+		t.Fatalf("应回一个 Read 调用: %+v", blocks)
+	}
+	callID := blocks[0].ID
+	cid := startConv(t, up, 0)
+
+	// 约 60 KB 的文件，MAGIC 在正中间；同一轮对话中间又来了一条 system 消息（system 变了，要重发）
+	var file strings.Builder
+	for i := 1; i <= 1100; i++ {
+		if i == 550 {
+			file.WriteString("   550\tMAGIC = \"OBSIDIAN-3309\"\n")
+			continue
+		}
+		fmt.Fprintf(&file, "%6d\tdef helper_%d(x): return x * %d  # padding\n", i, i, i)
+	}
+	setReply(up, "MAGIC 是 OBSIDIAN-3309")
+	turn2 := []any{first, map[string]any{"role": "system", "content": "# Environment update\n - shell: pwsh"},
+		map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "tool_use", "id": callID, "name": "Read", "input": map[string]any{"file_path": `C:\work\demo\big.py`}}}},
+		ccUser(ccResult(callID, file.String(), false))}
+	blocks, stop := ccStream(t, ccPost(t, ts.URL, body(turn2...), ccHdr))
+	if stop != "end_turn" || len(blocks) != 1 || blocks[0].Text != "MAGIC 是 OBSIDIAN-3309" {
+		t.Fatalf("这一轮应正常完成: stop=%q %+v", stop, blocks)
+	}
+	if startConv(t, up, 1) != cid || startConv(t, up, 2) != cid {
+		t.Fatal("都应在同一个上游会话里")
+	}
+	sys, user := requireSystemUser(t, upstreamInput(t, up, 1))
+	if !strings.Contains(sys, "Follow the coding guidelines") || !strings.Contains(sys, "# Environment update") || !strings.Contains(user, "Reply with exactly OK") {
+		t.Fatalf("先单独发一轮新的完整 system: %.200q / %q", sys, user)
+	}
+	sys, user = requireSystemUser(t, upstreamInput(t, up, 2))
+	if strings.Contains(sys, "Follow the coding guidelines") || !strings.Contains(user, `MAGIC = \"OBSIDIAN-3309\"`) && !strings.Contains(user, `MAGIC = "OBSIDIAN-3309"`) {
+		t.Fatalf("本轮只带精简 system 与完整的文件: %.200q", sys)
+	}
+	if strings.Contains(user, "omitted") || len(sys)+len(user) > 96<<10 {
+		t.Fatalf("文件不应被截，且本轮不超上限（%d 字节）", len(sys)+len(user))
 	}
 }
 

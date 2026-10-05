@@ -96,6 +96,8 @@ type fakeUpstream struct {
 
 	// replyParts 覆盖默认的逐字生成内容（见 parts）。
 	replyParts []string
+	// replyQueue 非空时，每个新的生成请求依次取走一条作为整段回复（优先于 replyParts）。
+	replyQueue []string
 
 	// 会话登记（Server Action createProjectConversation）：convs 是登记过的会话 ID，
 	// actionFails 让登记失败，goneConvs 里的会话在 start 时回 conversation_too_large。
@@ -156,7 +158,8 @@ func (f *fakeUpstream) sandboxRoutes(mux *http.ServeMux) {
 // genState 是单个生成请求的状态。
 type genState struct {
 	polls int
-	seq   int // 下次应当收到的 turn_state.seq
+	seq   int      // 下次应当收到的 turn_state.seq
+	reply []string // 这个请求自己的回复（取自 replyQueue）；nil 用 parts()
 }
 
 // parts 是假上游"逐字生成"的内容。
@@ -362,6 +365,10 @@ func (f *fakeUpstream) handler() http.Handler {
 			f.gens = map[string]*genState{}
 		}
 		f.gens[rid] = &genState{polls: 0, seq: 1}
+		if len(f.replyQueue) > 0 {
+			f.gens[rid].reply = []string{f.replyQueue[0]}
+			f.replyQueue = f.replyQueue[1:]
+		}
 		f.mu.Unlock()
 
 		started := map[string]any{
@@ -426,9 +433,12 @@ func (f *fakeUpstream) handler() http.Handler {
 		}
 		st.polls++
 		n := st.polls
+		parts := st.reply
 		f.mu.Unlock()
 
-		parts := f.parts()
+		if parts == nil {
+			parts = f.parts()
+		}
 		upto := n
 		if upto > len(parts) {
 			upto = len(parts)

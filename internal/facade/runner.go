@@ -436,6 +436,16 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 				}
 				r.log.Warn("原生续接：历史补种失败，本轮改发全量（裁剪后）", "cid", convIDOut, "err", err)
 				inputItems = req.Native.plan.fallback
+				if req.Native.plan.continued {
+					req.Native.plan.sysHash = 0 // 单独发的 system 没送到：下一轮重发
+				}
+			}
+		}
+		// 回退路径（会话正忙、建会话失败、补种失败）发的是全量：放不下就别发 ——
+		// 上游只会回 too large，而且常被当成沙箱未就绪反复重试。
+		if limit := r.cfg.Facade.PromptByteLimit(); limit > 0 {
+			if n := promptBytes(inputItems); n > limit {
+				return result, &contextTooLargeError{Bytes: n, Limit: limit, Tokens: countInputTokens(inputItems)}
 			}
 		}
 	}

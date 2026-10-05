@@ -36,6 +36,9 @@ type responsesTurn struct {
 	// compaction 标识 Codex 的上下文压缩请求（见 codexRequestKind）：
 	// 回复只能是摘要正文，不能变成工具调用。
 	compaction bool
+
+	// clientTools 是客户端声明的额外工具（MCP 工具、tool_search 等，见 codex_tools.go）。
+	clientTools *codexClientTools
 }
 
 // codexRequestKind 取 Codex 在 x-codex-turn-metadata 里标注的请求种类（turn / compaction …）。
@@ -123,6 +126,10 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		compaction:   compaction,
 		nativePatch:  hasNativeApplyPatch(rawFields),
 	}
+	if bridge {
+		turn.clientTools = parseCodexClientTools(rawFields)
+		turn.clientTools.function = turn.execKind == "function"
+	}
 	// 桥判定诊断：CLI 有两条工具声明路径（use_responses_lite 决定）——
 	// true 走 input 里的 additional_tools 条目，false 走顶层 tools 字段。
 	h.log.Debug("桥判定",
@@ -146,7 +153,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	var native *nativeConversation
 	if bridge {
 		// UA 推断的 OS 事实声明随桥指令一起进首条 system（见 osDirective）。
-		input = bridgeInputItems(req.Input, osDirective(r.UserAgent()))
+		input = bridgeInputItemsWith(req.Input, osDirective(r.UserAgent()), turn.clientTools)
 		native = itemsConversation(input)
 		if compaction {
 			input = appendSystemText(input, compactionDirective)
@@ -498,15 +505,22 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		}
 		h.recordResponsesTurn(runReq, turn, res)
 
-		var usage *prism.Usage
-		if res != nil {
-			usage = res.Usage
-		}
 		text := sb.String()
 		js := ""
 		if !turn.compaction {
 			// 压缩请求的回复是摘要：Codex 只认一条 assistant 消息，变成工具调用压缩就失败了。
 			js = h.bridgeExecJS(r, turn, text, res)
+			if js == "" {
+				if res2, text2, ok := h.bridgeLocalRetry(r, runReq, turn, text, func(d Delta) error { return st.reasoningDelta(d.Reasoning) }); ok {
+					h.recordResponsesTurn(runReq, turn, res2)
+					res, text = res2, text2
+					js = h.bridgeExecJS(r, turn, text, res)
+				}
+			}
+		}
+		var usage *prism.Usage
+		if res != nil {
+			usage = res.Usage
 		}
 
 		finalRespID := id
@@ -564,6 +578,43 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 	}
 }
 
+// bridgeLocalRetry：桥模式下模型没发 codex-exec 块，回答却明显来自上游的远程容器（见
+// mentionsRemoteContainer）—— 它拿自带工具去读了容器里的"工作区"，读到的不是用户的文件。
+// 在同一个上游会话里纠正一次，让它改用 codex-exec 块；客户端只看到纠正后的回复。
+// 只在强会话键、续接得上的会话里做（纠正消息不进客户端历史，见 nativeTurn.ghost）。
+// 不需要或做不了时 ok 为 false。
+func (h *Handler) bridgeLocalRetry(r *http.Request, runReq *RunRequest, turn *responsesTurn, text string, emit func(Delta) error) (*RunResult, string, bool) {
+	nt := runReq.Native
+	if !turn.bridge || turn.compaction || turn.isAux || nt == nil || nt.conv == nil || !nt.strong || nt.weak || !mentionsRemoteContainer(text) {
+		return nil, "", false
+	}
+	nudge := bridgeLocalNudge(text)
+	conv := nt.conv
+	hist := append(conv.entries(), historyEntry{speaker: "Assistant", text: strings.TrimSpace(text)})
+	rreq := *runReq
+	rreq.Input = append(append([]prism.InputItem(nil), runReq.Input...), prism.NewAssistantItem(text), prism.NewUserItem(nudge))
+	rreq.Native = &nativeTurn{key: nt.key, strong: nt.strong, ghost: true,
+		conv: &nativeConversation{system: conv.system, history: hist, current: prism.NewUserItem(nudge), extra: conv.extra}}
+	h.log.Warn("工具桥：回复来自上游的远程容器（没有发 codex-exec 块），在同一会话里纠正一次", "key", nt.key)
+	var sb strings.Builder
+	res, err := h.runResponses(r, &rreq, func(d Delta) error {
+		sb.WriteString(d.Text)
+		if emit != nil {
+			return emit(Delta{Reasoning: d.Reasoning})
+		}
+		return nil
+	})
+	if err != nil || res == nil {
+		h.log.Warn("工具桥：纠正失败，沿用原回复", "err", err)
+		return nil, "", false
+	}
+	out := sb.String()
+	if out == "" {
+		out = res.Text
+	}
+	return res, out, true
+}
+
 // bridgeExecJS 从桥模式回复里取出要交给客户端执行的 JS。
 //
 // 优先用模型输出的 ```codex-exec 块；模型没输出、但上游沙箱里产生了文件变更时，
@@ -608,16 +659,20 @@ type bridgeToolCall struct {
 }
 
 // bridgeToolCalls 把桥要执行的内容包成客户端工具调用：custom 工具一条（JS 源码原样），
-// function 工具按 functionCallArgs 的结果（一般一条，超长分段时多条）。
+// function 工具按 functionCalls 的结果（exec 一般一条、超长分段时多条；MCP 等其他工具各一条）。
 func bridgeToolCalls(turn *responsesTurn, js string, isWindows bool) []bridgeToolCall {
 	if turn.execKind != "function" {
 		id := newID("ctc_")
 		return []bridgeToolCall{{id: id, item: customToolCallItemJSON(id, js, turn.execToolName), input: js}}
 	}
 	var out []bridgeToolCall
-	for _, args := range functionCallArgs(js, isWindows) {
+	for _, c := range functionCalls(js, isWindows, turn.execToolName, turn.clientTools) {
 		id := newID("ctc_")
-		out = append(out, bridgeToolCall{id: id, item: functionCallItemJSON(id, turn.execToolName, args)})
+		item := functionCallItemJSON(id, c.name, c.args, c.namespace)
+		if c.search {
+			item = toolSearchCallItemJSON(id, c.args)
+		}
+		out = append(out, bridgeToolCall{id: id, item: item})
 	}
 	return out
 }
@@ -636,6 +691,13 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 		return
 	}
 	h.recordResponsesTurn(runReq, turn, res)
+	if turn.bridge && res != nil && !turn.compaction && h.bridgeExecJS(r, turn, res.Text, res) == "" {
+		if res2, text2, ok := h.bridgeLocalRetry(r, runReq, turn, res.Text, nil); ok && res2 != nil {
+			h.recordResponsesTurn(runReq, turn, res2)
+			res = res2
+			res.Text = text2
+		}
+	}
 
 	text := ""
 	var usage *ResponsesUsage

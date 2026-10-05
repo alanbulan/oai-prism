@@ -118,7 +118,7 @@ func TestNativeDeltaItems_SystemRefresh(t *testing.T) {
 	b := &nativeBinding{sysHash: textFingerprint(sys), sinceSys: 100}
 	rest := nt.conv.entries()
 
-	items, _, since := nt.deltaItems(b, rest, 96<<10, "")
+	items, _, since, _ := nt.deltaItems(b, rest, 96<<10, "")
 	if got := itemText(items[0]); got != nativeBriefSystem {
 		t.Fatalf("system 未变时不应重发: %.60q", got)
 	}
@@ -127,7 +127,7 @@ func TestNativeDeltaItems_SystemRefresh(t *testing.T) {
 	}
 
 	b.sinceSys = nativeSystemRefresh
-	items, _, since = nt.deltaItems(b, rest, 96<<10, "NOTICE")
+	items, _, since, _ = nt.deltaItems(b, rest, 96<<10, "NOTICE")
 	if got := itemText(items[0]); !strings.HasPrefix(got, "NOTICE\n\n") || !strings.Contains(got, sys) {
 		t.Fatal("超过阈值应重发完整 system（连同平台声明）")
 	}
@@ -138,9 +138,38 @@ func TestNativeDeltaItems_SystemRefresh(t *testing.T) {
 	nt.conv.system = "changed"
 	nt.conv.extra = "<context_checkpoint>x</context_checkpoint>"
 	b.sinceSys = 0
-	items, h, _ := nt.deltaItems(b, rest, 96<<10, "")
+	items, h, _, _ := nt.deltaItems(b, rest, 96<<10, "")
 	if got := itemText(items[0]); got != "changed\n\n"+nt.conv.extra || h != textFingerprint("changed") {
 		t.Fatalf("system 变了应重发，附加指令每轮照发且不计入指纹: %q", got)
+	}
+}
+
+// 完整 system 与本轮消息放不下一条：定期重发推迟；system 变了就单独发一轮，本轮只带精简 system。
+func TestNativeDeltaItems_SystemDoesNotFit(t *testing.T) {
+	sys := strings.Repeat("claude code rules ", 3500) // ≈ 62 KB
+	result := "[CLIENT RESULT tool=Read]\n" + strings.Repeat("x", 50<<10)
+	nt := &nativeTurn{strong: true, conv: nativeConv(sys, result)}
+	rest := nt.conv.entries()
+
+	b := &nativeBinding{sysHash: textFingerprint(sys), sinceSys: nativeSystemRefresh}
+	items, h, since, seed := nt.deltaItems(b, rest, 96<<10, "")
+	if seed != nil || itemText(items[0]) != nativeBriefSystem || h != b.sysHash {
+		t.Fatalf("只是定期重发时应推迟: seed=%v system=%.40q", seed != nil, itemText(items[0]))
+	}
+	if since != nativeSystemRefresh+len(result) {
+		t.Fatalf("推迟后累计不清零: %d", since)
+	}
+
+	b = &nativeBinding{sysHash: textFingerprint("old rules")}
+	items, h, since, seed = nt.deltaItems(b, rest, 96<<10, "NOTICE")
+	if len(seed) != 2 || itemText(seed[0]) != "NOTICE\n\n"+sys || itemText(seed[1]) != nativeSystemSeed {
+		t.Fatalf("system 变了且放不下应单独发一轮: %v", seed != nil)
+	}
+	if itemText(items[0]) != nativeBriefSystem || itemText(items[1]) != result || h != textFingerprint(sys) || since != len(result) {
+		t.Fatalf("本轮应只带精简 system 与完整结果: %.40q since=%d", itemText(items[0]), since)
+	}
+	if n := promptBytes(items); n > 96<<10 {
+		t.Fatalf("本轮仍超限: %d", n)
 	}
 }
 
@@ -149,7 +178,7 @@ func TestNativeDeltaItems_PriorEntries(t *testing.T) {
 	nt := &nativeTurn{strong: true, conv: nativeConv("S", "[CLIENT RESULT] last")}
 	b := &nativeBinding{sysHash: textFingerprint("S")}
 	rest := []historyEntry{{speaker: "User", text: "[CLIENT RESULT] first"}, {speaker: "User", text: "[CLIENT RESULT] last"}}
-	items, _, _ := nt.deltaItems(b, rest, 0, "")
+	items, _, _, _ := nt.deltaItems(b, rest, 0, "")
 	user := itemText(items[1])
 	if !strings.HasPrefix(user, nativeSinceHeader+"User: [CLIENT RESULT] first\n\n") || !strings.HasSuffix(user, "[CLIENT RESULT] last") {
 		t.Fatalf("新条目应按序放在本轮消息之前: %q", user)
@@ -160,7 +189,7 @@ func TestNativeDeltaItems_PriorEntries(t *testing.T) {
 		big = append(big, historyEntry{speaker: "User", text: "[CLIENT RESULT] " + strings.Repeat("o", 2000)})
 	}
 	big = append(big, historyEntry{speaker: "User", text: "[CLIENT RESULT] last"})
-	items, _, _ = nt.deltaItems(b, big, 12000, "")
+	items, _, _, _ = nt.deltaItems(b, big, 12000, "")
 	if n := promptBytes(items); n > 12000 || !strings.Contains(itemText(items[1]), historyOmittedMark) {
 		t.Fatalf("超限应裁剪并注明（%d 字节）", n)
 	}

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -28,10 +29,26 @@ import (
 
 // execCall 是块里的一次工具调用。
 type execCall struct {
-	Tool  string         // exec_command | apply_patch
+	Tool  string         // exec_command | apply_patch | 其他客户端工具（MCP 工具、tool_search、view_image …）
 	Cmd   string         // exec_command 的命令
-	Args  map[string]any // exec_command 除 cmd 外的参数（workdir 等），原样转交
+	Args  map[string]any // exec_command 除 cmd 外的参数（workdir 等）；其他工具是全部参数。原样转交
 	Patch string         // apply_patch 的补丁正文
+}
+
+// reToolRef 找出块里用到的工具（tools.xxx）：exec_command / apply_patch 以外的也挂上记录参数的桩，
+// function 形态下换成对应的 function_call（见 codex_tools.go）。
+var reToolRef = regexp.MustCompile(`\btools\.([A-Za-z_$][A-Za-z0-9_$]*)`)
+
+// looksLikeExecJS 判断块内容是 JS（而不是直接写进围栏的 shell 命令）。
+// 只调 text() / ALL_TOOLS 的块也是 JS：早先只认 tools. 与 await，
+// `text(JSON.stringify(ALL_TOOLS…))` 被当成 PowerShell 命令执行（2026-10-05 实测）。
+func looksLikeExecJS(s string) bool {
+	for _, sig := range []string{"tools.", "await ", "text(", "ALL_TOOLS"} {
+		if strings.Contains(s, sig) {
+			return true
+		}
+	}
+	return false
 }
 
 const (
@@ -97,7 +114,19 @@ func evalExecJS(js string) ([]execCall, error) {
 		calls = append(calls, execCall{Tool: "apply_patch", Patch: patch})
 		return vm.ToValue("")
 	})
+	for _, m := range reToolRef.FindAllStringSubmatch(js, -1) {
+		name := m[1]
+		if name == "exec_command" || name == "apply_patch" || tools.Get(name) != nil {
+			continue
+		}
+		_ = tools.Set(name, func(c goja.FunctionCall) goja.Value {
+			calls = append(calls, execCall{Tool: name, Args: toolArgs(vm, c.Argument(0))})
+			// 桩的返回值像一个空的 MCP CallToolResult：块里读 .content 不至于抛错
+			return vm.ToValue(map[string]any{"content": []any{map[string]any{"type": "text", "text": ""}}, "isError": false})
+		})
+	}
 	_ = vm.Set("tools", tools)
+	_ = vm.Set("ALL_TOOLS", vm.NewArray())
 
 	noop := func(goja.FunctionCall) goja.Value { return goja.Undefined() }
 	exitVal := vm.NewObject()
@@ -132,28 +161,104 @@ func evalExecJS(js string) ([]execCall, error) {
 	return calls, nil
 }
 
-// functionCallArgs 把要交给客户端的块内容换成 function 形态 exec_command 的参数（JSON）。
-//
-// 块里的多次调用合成一条命令顺序执行：一次回复里发多条 function_call，Codex 会并行执行
-// exec_command（supports_parallel_tool_calls），先后顺序就没了。一般返回一条；Windows 上
-// 整条命令超出命令行长度上限、压缩后仍放不下时才分段（见 fitPowerShell）。
-func functionCallArgs(block string, isWindows bool) []string {
+// toolArgs 把桩收到的参数换成 JSON 对象：对象原样；JSON 字符串解析；其他字符串当 query / input。
+func toolArgs(vm *goja.Runtime, v goja.Value) map[string]any {
+	if v == nil || goja.IsUndefined(v) || goja.IsNull(v) {
+		return map[string]any{}
+	}
+	switch x := v.Export().(type) {
+	case map[string]any:
+		return x
+	case string:
+		var m map[string]any
+		if json.Unmarshal([]byte(x), &m) == nil && m != nil {
+			return m
+		}
+		return map[string]any{"input": x}
+	}
+	b, err := json.Marshal(v.Export())
+	var m map[string]any
+	if err == nil && json.Unmarshal(b, &m) == nil && m != nil {
+		return m
+	}
+	panic(vm.NewTypeError("工具参数必须是对象"))
+}
+
+// fnCall 是交给 function 形态客户端的一次调用。
+type fnCall struct {
+	name, namespace string
+	args            string // arguments（JSON 文本）
+	search          bool   // tool_search_call（arguments 是对象，不是字符串）
+}
+
+// functionCalls 把块内容换成 function 形态客户端的调用：exec_command / apply_patch 合成
+// exec 工具的一条命令（见 functionCallArgs）；其余工具（MCP、tool_search、view_image …）
+// 各成一条 function_call，MCP 工具按 ct 拆出 namespace。顺序与块里一致。
+func functionCalls(block string, isWindows bool, execName string, ct *codexClientTools) []fnCall {
 	t := strings.TrimSpace(block)
-	legacy := func() []string {
-		return []string{toFunctionArguments(ensureExecJS(rewriteApplyPatch(t, false, isWindows, true)))}
+	execOnly := func(args []string) []fnCall {
+		out := make([]fnCall, 0, len(args))
+		for _, a := range args {
+			out = append(out, fnCall{name: execName, args: a})
+		}
+		return out
 	}
 	// 模型偶尔直接给 {"cmd": "..."}
 	if strings.HasPrefix(t, "{") && json.Valid([]byte(t)) {
-		return []string{toFunctionArguments(t)}
+		return execOnly([]string{toFunctionArguments(t)})
 	}
 	calls := []execCall{{Tool: "exec_command", Cmd: t}} // 不像 JS：整块就是一条 shell 命令
-	if strings.Contains(t, "tools.") || strings.Contains(t, "await") {
+	if looksLikeExecJS(t) {
 		c, err := evalExecJS(t)
 		if err != nil || len(c) == 0 {
-			return legacy()
+			return execOnly([]string{toFunctionArguments(ensureExecJS(rewriteApplyPatch(t, false, isWindows, true)))})
 		}
 		calls = c
 	}
+	var out []fnCall
+	var run []execCall
+	flush := func() {
+		if len(run) > 0 {
+			out = append(out, execOnly(execCallArgs(run, isWindows))...)
+			run = nil
+		}
+	}
+	for _, c := range calls {
+		if c.Tool == "exec_command" || c.Tool == "apply_patch" {
+			run = append(run, c)
+			continue
+		}
+		flush()
+		args := marshalNoEscape(c.Args)
+		if c.Tool == "tool_search" {
+			out = append(out, fnCall{search: true, args: args})
+			continue
+		}
+		ns, name := ct.resolve(c.Tool)
+		out = append(out, fnCall{name: name, namespace: ns, args: args})
+	}
+	flush()
+	return out
+}
+
+// functionCallArgs 把要交给客户端的块内容换成 function 形态 exec_command 的参数（JSON），
+// 只取 exec_command / apply_patch（其余工具见 functionCalls）。
+func functionCallArgs(block string, isWindows bool) []string {
+	var out []string
+	for _, c := range functionCalls(block, isWindows, "exec_command", nil) {
+		if c.name == "exec_command" && c.namespace == "" && !c.search {
+			out = append(out, c.args)
+		}
+	}
+	return out
+}
+
+// execCallArgs 把一串 exec_command / apply_patch 调用换成 exec 工具的参数。
+//
+// 多次调用合成一条命令顺序执行：一次回复里发多条 function_call，Codex 会并行执行
+// exec_command（supports_parallel_tool_calls），先后顺序就没了。一般返回一条；Windows 上
+// 整条命令超出命令行长度上限、压缩后仍放不下时才分段（见 fitPowerShell）。
+func execCallArgs(calls []execCall, isWindows bool) []string {
 	script, extra := callsToScript(calls, isWindows)
 	cmds := []string{script}
 	if isWindows {
@@ -168,7 +273,7 @@ func functionCallArgs(block string, isWindows bool) []string {
 		args["cmd"] = c
 		b, err := json.Marshal(args)
 		if err != nil {
-			return legacy()
+			b, _ = json.Marshal(map[string]string{"cmd": c})
 		}
 		out = append(out, string(b))
 	}
