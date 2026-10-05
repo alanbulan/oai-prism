@@ -36,7 +36,24 @@ export interface ChatMessage {
   attachments?: ChatAttachment[]; // 仅 user 消息：随消息持久化的图片附件
   reasoning?: string;         // 模型思考过程（ThoughtChain 呈现）
   status?: 'loading' | 'success' | 'error';
+  /** user：发送时间；assistant：生成中为开始时间，完成后为完成时间（与服务端入库时间一致） */
   createdAt: string;
+  /** assistant：从发送到回复完成（或失败）的耗时 */
+  durationMs?: number;
+  /** assistant：本轮 token 用量（网关按实际收发内容计数；输入 = 本轮发给模型的完整上下文） */
+  usage?: ChatUsage;
+}
+
+/** 回复的本地附加信息（耗时、用量）：服务端只存正文，这部分留在浏览器里 */
+export interface ChatMessageMeta {
+  durationMs?: number;
+  usage?: ChatUsage;
+}
+
+/** 会话的模型与推理强度偏好（只存浏览器本地） */
+export interface ChatSessionPrefs {
+  model: string;
+  effort: ReasoningEffort;
 }
 
 export interface ChatSession {
@@ -51,6 +68,9 @@ export interface ChatSession {
 
 export interface SendMessageOptions {
   sessionId: string;
+  /** 本轮 user / assistant 消息的 ID：入库用同一个 ID，刷新后本地附加信息才对得上 */
+  userMsgId: string;
+  assistantMsgId: string;
   content: string;
   attachments?: ChatAttachment[];
   model: string;
@@ -70,4 +90,10 @@ export interface IChatRepository {
   listSessions(): Promise<ChatSession[]>;
   saveSession(session: ChatSession): Promise<void>;
   deleteSession(id: string): Promise<void>;
+  // 以下只读写浏览器本地存储
+  loadSessionPrefs(id: string): ChatSessionPrefs | null;
+  saveSessionPrefs(id: string, prefs: ChatSessionPrefs): void;
+  saveMessageMeta(sessionId: string, msgId: string, meta: ChatMessageMeta): void;
+  loadActiveSessionId(): string | null;
+  saveActiveSessionId(id: string | null): void;
 }

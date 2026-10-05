@@ -2,14 +2,74 @@ import type {
   ChatAttachment,
   ChatModelInfo,
   ChatMessage,
+  ChatMessageMeta,
   ChatSession,
+  ChatSessionPrefs,
   IChatRepository,
   SendMessageOptions,
 } from '../../domain/chat/entity';
 import { compareModelNewestFirst, pickMainModels } from '../../domain/modelFilter';
 import { getApiKey, httpClient } from '../http/client';
 
+// 浏览器本地存储：会话的模型 / 推理强度偏好、回复的耗时与用量、上次打开的会话。
+// 服务端只存会话与消息正文；这些是调试台自己的展示状态，不值得改库表。
+const PREFS_KEY = 'oaiprism_chat_prefs';
+const META_KEY = 'oaiprism_chat_meta';
+const ACTIVE_KEY = 'oaiprism_chat_active';
+
+function readJSON<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJSON(key: string, value: unknown): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // 存储已满或被禁用：只影响本地展示，忽略
+  }
+}
+
+type MetaStore = Record<string, Record<string, ChatMessageMeta>>; // 会话 ID → 消息 ID → 附加信息
+
 export class ChatRepositoryImpl implements IChatRepository {
+  loadSessionPrefs(id: string): ChatSessionPrefs | null {
+    return readJSON<Record<string, ChatSessionPrefs>>(PREFS_KEY, {})[id] ?? null;
+  }
+
+  saveSessionPrefs(id: string, prefs: ChatSessionPrefs): void {
+    const all = readJSON<Record<string, ChatSessionPrefs>>(PREFS_KEY, {});
+    all[id] = prefs;
+    writeJSON(PREFS_KEY, all);
+  }
+
+  saveMessageMeta(sessionId: string, msgId: string, meta: ChatMessageMeta): void {
+    const all = readJSON<MetaStore>(META_KEY, {});
+    all[sessionId] = { ...all[sessionId], [msgId]: meta };
+    writeJSON(META_KEY, all);
+  }
+
+  loadActiveSessionId(): string | null {
+    return readJSON<string | null>(ACTIVE_KEY, null);
+  }
+
+  saveActiveSessionId(id: string | null): void {
+    writeJSON(ACTIVE_KEY, id);
+  }
+
+  private dropLocal(sessionId: string): void {
+    const prefs = readJSON<Record<string, ChatSessionPrefs>>(PREFS_KEY, {});
+    const meta = readJSON<MetaStore>(META_KEY, {});
+    delete prefs[sessionId];
+    delete meta[sessionId];
+    writeJSON(PREFS_KEY, prefs);
+    writeJSON(META_KEY, meta);
+  }
+
   async fetchModelCatalog(): Promise<{ mains: ChatModelInfo[]; allIds: string[] }> {
     try {
       const res = await httpClient.get<any>('/v1/models');
@@ -72,7 +132,8 @@ export class ChatRepositoryImpl implements IChatRepository {
         return [defaultSession];
       }
 
-      // 获取每个会话的消息历史
+      // 获取每个会话的消息历史（并入本地记录的耗时与用量）
+      const meta = readJSON<MetaStore>(META_KEY, {});
       const sessionsWithMessages = await Promise.all(
         list.map(async (s: any): Promise<ChatSession> => {
           let msgs: ChatMessage[] = [];
@@ -107,6 +168,7 @@ export class ChatRepositoryImpl implements IChatRepository {
                 reasoning: m.reasoning || '',
                 status: m.status || 'success',
                 createdAt: m.created_at || new Date().toISOString(),
+                ...meta[s.id]?.[m.id],
               };
             });
           } catch {
@@ -157,6 +219,7 @@ export class ChatRepositoryImpl implements IChatRepository {
     } catch {
       // 异常忽略
     }
+    this.dropLocal(id);
   }
 
   /**
@@ -194,7 +257,7 @@ export class ChatRepositoryImpl implements IChatRepository {
   }
 
   async sendMessageStream(options: SendMessageOptions): Promise<void> {
-    const { sessionId, model, reasoningEffort, content, attachments, history, onChunk, onUsage, onError, onFinish } = options;
+    const { sessionId, userMsgId, assistantMsgId, model, reasoningEffort, content, attachments, history, onChunk, onUsage, onError, onFinish } = options;
 
     try {
       // 组装 OpenAI 多模态消息：无附件 = 纯字符串；有附件 = text + image_url 内容块
@@ -208,7 +271,6 @@ export class ChatRepositoryImpl implements IChatRepository {
       const persistContent = typeof userContent === 'string' ? userContent : JSON.stringify(userContent);
 
       // 1. 先将用户消息持久化入库（多模态内容以 JSON 串存储，读取端解析）
-      const userMsgId = `msg_u_${Date.now()}`;
       await httpClient.post(`/admin/chat/sessions/${sessionId}/messages`, {
         id: userMsgId,
         role: 'user',
@@ -266,7 +328,7 @@ export class ChatRepositoryImpl implements IChatRepository {
           if (dataStr === '[DONE]') {
             // 将 assistant 回复持久化入库
             await httpClient.post(`/admin/chat/sessions/${sessionId}/messages`, {
-              id: `msg_a_${Date.now()}`,
+              id: assistantMsgId,
               role: 'assistant',
               content: fullAssistantText,
               reasoning: fullAssistantReasoning,
@@ -305,7 +367,7 @@ export class ChatRepositoryImpl implements IChatRepository {
       // 如果流自然结束但没有收到 [DONE]
       if (fullAssistantText || fullAssistantReasoning) {
         await httpClient.post(`/admin/chat/sessions/${sessionId}/messages`, {
-          id: `msg_a_${Date.now()}`,
+          id: assistantMsgId,
           role: 'assistant',
           content: fullAssistantText,
           reasoning: fullAssistantReasoning,

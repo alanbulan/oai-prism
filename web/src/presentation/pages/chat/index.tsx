@@ -1,5 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { Avatar, Button, Card, Dropdown, Input, List, Modal, Popconfirm, Space, Tooltip, Typography, Upload, message, theme } from 'antd';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { Avatar, Button, Card, Dropdown, Input, List, Modal, Pagination, Popconfirm, Space, Tooltip, Typography, Upload, message, theme } from 'antd';
 import {
   RobotOutlined,
   UserOutlined,
@@ -24,6 +24,8 @@ import { useChatStore } from '../../../application/chat/store';
 import { BrandLogo } from '../../components/BrandLogo';
 import { SPECTRUM } from '../../theme/tokens';
 import { MarkdownView } from './markdown/MarkdownView';
+import { ContextMeter } from './ContextMeter';
+import { MessageMeta } from './MessageMeta';
 
 const { Text } = Typography;
 
@@ -36,6 +38,10 @@ const EFFORT_LABELS: Record<ReasoningEffort, string> = {
 };
 const EFFORT_ORDER: ReasoningEffort[] = ['low', 'medium', 'high', 'xhigh'];
 
+/** 会话列表一行的高度（含行间距）与分页条高度：每页条数按列表区实际高度算，不留大片空白 */
+const CONV_ROW = 34;
+const CONV_PAGER = 40;
+
 
 export const ChatPlaygroundPage: React.FC = () => {
   const { token } = theme.useToken();
@@ -47,7 +53,6 @@ export const ChatPlaygroundPage: React.FC = () => {
     selectedModel,
     reasoningEffort,
     isStreaming,
-    lastUsage,
     init,
     selectSession,
     createNewSession,
@@ -63,9 +68,24 @@ export const ChatPlaygroundPage: React.FC = () => {
   const msgListRef = useRef<HTMLDivElement>(null);
 
   // 会话列表分页 + 重命名
-  const [convPage, setConvPage] = useState(1);
-  const convPageSize = 8;
+  const [convNav, setConvNav] = useState<{ page: number; anchor: string | null; size: number } | null>(null);
+  const convBoxRef = useRef<HTMLDivElement>(null);
+  const [convBoxHeight, setConvBoxHeight] = useState(0);
   const [renaming, setRenaming] = useState<{ id: string; title: string } | null>(null);
+
+  useLayoutEffect(() => {
+    const el = convBoxRef.current;
+    if (!el) return;
+    const fit = () => setConvBoxHeight(el.clientHeight);
+    fit();
+    const ro = new ResizeObserver(fit);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  // 一页放得下就不分页；放不下时给分页条让出一行的位置再算每页条数
+  const convRowsAll = Math.max(1, Math.floor(convBoxHeight / CONV_ROW));
+  const convPaged = sessions.length > convRowsAll;
+  const convPageSize = convPaged ? Math.max(3, Math.floor((convBoxHeight - CONV_PAGER) / CONV_ROW)) : convRowsAll;
 
   useEffect(() => {
     init();
@@ -144,9 +164,15 @@ export const ChatPlaygroundPage: React.FC = () => {
     },
   ];
 
-  // 会话列表 dataSource（List 组件自带分页切片）
+  // 默认停在当前会话所在的那一页；手动翻页只在"同一个当前会话、同样的每页条数"下有效 ——
+  // 切换 / 新建 / 删除会话或窗口高度变了，就回到当前会话所在页
   const convPageCount = Math.max(1, Math.ceil(sessions.length / convPageSize));
+  const activeIdx = sessions.findIndex((s) => s.id === currentSessionId);
+  const followPage = activeIdx >= 0 ? Math.floor(activeIdx / convPageSize) + 1 : 1;
+  const convPage =
+    convNav && convNav.anchor === currentSessionId && convNav.size === convPageSize ? convNav.page : followPage;
   const safeConvPage = Math.min(convPage, convPageCount);
+  const convPageItems = sessions.slice((safeConvPage - 1) * convPageSize, safeConvPage * convPageSize);
 
   // Bubble 列表转换
   const bubbleItems = messages.map((m) => {
@@ -166,12 +192,23 @@ export const ChatPlaygroundPage: React.FC = () => {
             body: { flex: 1, minWidth: 0 },
             content: { width: '100%', padding: '4px 0 0' },
           },
-      footer:
-        !isUser && !streaming && m.content ? (
-          <Tooltip title="复制整条回复">
-            <Button type="text" size="small" icon={<CopyOutlined />} onClick={() => copyMessage(m.content)} />
-          </Tooltip>
-        ) : undefined,
+      // 底部一行：发送 / 回复时间、本轮耗时与用量（回复完成后带复制按钮）
+      footerPlacement: (isUser ? 'outer-end' : 'outer-start') as 'outer-end' | 'outer-start',
+      footer: (
+        <MessageMeta m={m}>
+          {!isUser && !streaming && m.content && (
+            <Tooltip title="复制整条回复">
+              <Button
+                type="text"
+                size="small"
+                icon={<CopyOutlined />}
+                onClick={() => copyMessage(m.content)}
+                style={{ marginInlineStart: -6 }}
+              />
+            </Tooltip>
+          )}
+        </MessageMeta>
+      ),
       avatar: isUser ? (
         <Avatar icon={<UserOutlined />} style={{ background: `linear-gradient(135deg, ${token.colorPrimary}, #a855f7)` }} />
       ) : (
@@ -288,22 +325,22 @@ export const ChatPlaygroundPage: React.FC = () => {
             <span><BulbOutlined /> 会话列表</span>
             <Text type="secondary" style={{ fontSize: 12 }}>共 {sessions.length} 个</Text>
           </div>
+          {/* 列表区撑满剩余高度，每页条数按它的高度算；分页条贴在底部 */}
+          <div ref={convBoxRef} style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           <List
             size="small"
-            dataSource={sessions}
-            pagination={
-              sessions.length > convPageSize
-                ? { pageSize: convPageSize, size: 'small', current: safeConvPage, total: sessions.length, onChange: (pg) => setConvPage(pg), style: { marginBottom: 0 } }
-                : false
-            }
+            split={false}
+            dataSource={convPageItems}
             locale={{ emptyText: '暂无会话' }}
+            style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}
             renderItem={(s) => (
               <List.Item
                 className="conv-item"
                 onClick={() => selectSession(s.id)}
                 style={{
                   cursor: 'pointer',
-                  padding: '6px 10px',
+                  height: CONV_ROW - 2,
+                  padding: '0 10px',
                   borderRadius: 6,
                   marginBottom: 2,
                   background: s.id === currentSessionId ? token.colorPrimaryBg : 'transparent',
@@ -351,6 +388,21 @@ export const ChatPlaygroundPage: React.FC = () => {
               </List.Item>
             )}
           />
+          {convPaged && (
+            <div style={{ height: CONV_PAGER, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', borderTop: `1px solid ${token.colorBorderSecondary}` }}>
+              <Pagination
+                size="small"
+                simple={convPageCount > 5}
+                showLessItems
+                showSizeChanger={false}
+                current={safeConvPage}
+                pageSize={convPageSize}
+                total={sessions.length}
+                onChange={(pg) => setConvNav({ page: pg, anchor: currentSessionId, size: convPageSize })}
+              />
+            </div>
+          )}
+          </div>
         </div>
 
         {/* 右侧对话主体区（官方 Bubble.List + Sender） */}
@@ -381,15 +433,6 @@ export const ChatPlaygroundPage: React.FC = () => {
             )}
           </div>
 
-          {/* 上下文窗口指示：本轮 prompt ≈ 当前会话累计上下文占用（网关估算） */}
-          {lastUsage && (
-            <div style={{ padding: '6px 20px 0', display: 'flex', justifyContent: 'flex-end' }}>
-              <Text type="secondary" style={{ fontSize: 11 }}>
-                上下文窗口 ≈ {lastUsage.promptTokens.toLocaleString()} tokens（本轮输出 {lastUsage.completionTokens}）
-              </Text>
-            </div>
-          )}
-
           {/* 底部输入框（官方 Sender）：模型/强度切换与附件按钮都在输入框内，ChatGPT 式交互 */}
           <div style={{ padding: '12px 20px 16px', borderTop: `1px solid ${token.colorBorderSecondary}` }}>
             <Sender
@@ -398,6 +441,12 @@ export const ChatPlaygroundPage: React.FC = () => {
               onSubmit={handleSend}
               loading={isStreaming}
               placeholder="输入调试指令，例如：生成一个鹈鹕骑自行车的 SVG，用 HTML 实现..."
+              suffix={(ori) => (
+                <Space size={4} align="center">
+                  <ContextMeter messages={messages} />
+                  {ori}
+                </Space>
+              )}
               header={
                 attachments.length > 0 ? (
                   <div style={{ padding: '10px 12px 0', display: 'flex', gap: 10, flexWrap: 'wrap' }}>
