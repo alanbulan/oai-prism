@@ -207,3 +207,24 @@ func TestLooksLikeExecJS(t *testing.T) {
 		t.Error("shell 命令不是 JS")
 	}
 }
+
+// 桥 system 开头点名"用户的文件在哪"：客户端工作目录（取自 Codex 的 <environment_context>）与远程容器的样子。
+func TestBridgeInputItems_WorkspaceFact(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>C:\\Users\\me\\proj</cwd>\n  <shell>powershell</shell>\n</environment_context>"}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"列一下文件"}]}]`)
+	sys := itemText(bridgeInputItems(raw, "CLIENT OS FACT: Windows.")[0])
+	fact := strings.Index(sys, "WORKSPACE FACT")
+	if fact < 0 || !strings.HasPrefix(sys, "CLIENT OS FACT") || fact > strings.Index(sys, "<local_tool_bridge>") {
+		t.Fatalf("工作区事实应紧跟 OS 事实、在桥指令之前: %.300q", sys)
+	}
+	for _, want := range []string{"at `C:\\Users\\me\\proj` (shell: powershell)", "/codex_workspace/<id>", "`.git`, `.agents`, `.codex`", "never conclude that a user file is missing"} {
+		if !strings.Contains(sys, want) {
+			t.Errorf("缺 %q", want)
+		}
+	}
+	// 拿不到工作目录时说"客户端的工作目录"
+	if s := workspaceFact("", ""); !strings.Contains(s, "in the client's working directory") {
+		t.Fatalf("无 cwd: %q", s)
+	}
+}

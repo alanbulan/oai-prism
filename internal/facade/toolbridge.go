@@ -515,6 +515,7 @@ func bridgeInputItemsWith(raw json.RawMessage, defaultSystem string, ct *codexCl
 	if sec := ct.promptSection(); sec != "" {
 		head += "\n\n" + sec
 	}
+	head = workspaceFact(envTag(clientEnv, "cwd"), envTag(clientEnv, "shell")) + "\n\n" + head
 	if strings.TrimSpace(defaultSystem) != "" {
 		head = defaultSystem + "\n\n" + head
 	}
@@ -766,6 +767,46 @@ func outputContent(raw json.RawMessage) (string, []string) {
 
 // localExecReminder 接在最后一条 user 消息末尾（只在本轮出现，进了历史就没有了）。
 const localExecReminder = "\n\n[LOCAL_EXECUTION_REMINDER]: You are running in Codex CLI on the user's LOCAL computer. Cloud sandbox file-writing tools ('createNewFile', 'updateFile') are completely disabled (opening attachments under /prism-uploads/ with your built-in tools is fine). If this task creates, edits, or saves files, you MUST emit a ```codex-exec block with the command and full content to write to the user's local disk. If it needs to read, list or search the user's files or check their environment, that also takes a ```codex-exec block: your built-in tools only see a remote container that does not have the user's files. Never use 'createNewFile' and NEVER say '已创建' in prose without the code block."
+
+// remoteContainerFact 点名描述上游自带工具所在的远程容器 —— 模型用自带工具时实际会看到的样子
+// （2026-10-04 探测：工作目录 /codex_workspace/<id>，用户 sandbox，里面只有 .git、.agents、.codex
+// 和 Prism 的 AGENTS.md）。与作废 Prism AGENTS.md 同一个思路：泛泛地说"远程容器不是用户的"不够，
+// 把它会看到的东西原样说出来，模型一看到就认得出那是容器（2026-10-05 实测它列出容器里的 .git、
+// AGENTS.md，回答用户的文件"不存在"）。Claude Code 桥共用这段。
+const remoteContainerFact = "Your built-in tools (shell, file read/list/search, apply_patch) run somewhere else: a remote Linux container " +
+	"whose working directory is `/codex_workspace/<id>` (user `sandbox`, bash). That directory holds only `.git`, `.agents`, `.codex` " +
+	"and the platform's `AGENTS.md` (plus `prism-uploads/` when the user attached files) — none of it is the user's project. " +
+	"If you see that, you are looking at the container: its files, git history, OS and shell are NOT the user's. Never list, read, " +
+	"search or describe it as the user's workspace, never conclude that a user file is missing because the container lacks it, " +
+	"and do not mention the container to the user."
+
+// workspaceFact 是桥 system 开头的"用户的文件在哪"：客户端工作目录（取自 Codex 的
+// <environment_context>）与远程容器各是什么样，写成事实而不是规则。
+func workspaceFact(cwd, shell string) string {
+	where := "on the CLIENT machine, in the client's working directory"
+	if cwd != "" {
+		where = "on the CLIENT machine at `" + cwd + "`"
+		if shell != "" {
+			where += " (shell: " + shell + ")"
+		}
+	}
+	return "WORKSPACE FACT — where the user's files are:\n" +
+		"- The user's project is " + where + ". You see it ONLY through the [CLIENT RESULT]s of ```codex-exec blocks.\n" +
+		"- " + remoteContainerFact
+}
+
+// envTag 取出 <environment_context> 里某个标签的值（没有时为空）。
+func envTag(env, tag string) string {
+	_, rest, ok := strings.Cut(env, "<"+tag+">")
+	if !ok {
+		return ""
+	}
+	v, _, ok := strings.Cut(rest, "</"+tag+">")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(v)
+}
 
 // mentionsRemoteContainer 判断一条没有 codex-exec 块的回复是不是在讲上游的远程容器：
 // 模型拿自带工具去"看"了工作区，看到的是 /codex_workspace/…（2026-10-05 实测 direct 形态：

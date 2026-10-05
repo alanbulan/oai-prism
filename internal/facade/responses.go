@@ -588,6 +588,10 @@ func (h *Handler) bridgeLocalRetry(r *http.Request, runReq *RunRequest, turn *re
 	if !turn.bridge || turn.compaction || turn.isAux || nt == nil || nt.conv == nil || !nt.strong || nt.weak || !mentionsRemoteContainer(text) {
 		return nil, "", false
 	}
+	// 本轮是工具结果之后的回复（任务里已经在本地执行过）：结尾顺带提到容器不算，不纠正。
+	if cur := strings.TrimSpace(itemText(nt.conv.current)); strings.HasPrefix(cur, "[CLIENT RESULT") {
+		return nil, "", false
+	}
 	nudge := bridgeLocalNudge(text)
 	conv := nt.conv
 	hist := append(conv.entries(), historyEntry{speaker: "Assistant", text: strings.TrimSpace(text)})

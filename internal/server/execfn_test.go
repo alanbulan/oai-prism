@@ -155,3 +155,22 @@ func TestE2E_BridgeCorrectsRemoteContainerRead(t *testing.T) {
 		t.Fatalf("增量应只是工具结果: %q", u)
 	}
 }
+
+// 本地读过文件之后的最终回答顺带提到远程容器：不是误读，不纠正。
+func TestE2E_BridgeNoCorrectionAfterClientResult(t *testing.T) {
+	up := &fakeUpstream{t: t, replyQueue: []string{"app.py 定义了 main()（这是你本机的文件，不是远程的 /codex_workspace 容器）。"}}
+	ts, _ := newTestServer(t, up, goodAccount(), nil)
+	hdr := map[string]string{"Content-Type": "application/json", "X-Oaiprism-Session": "codex-remote-read-2"}
+	raw, _ := json.Marshal(map[string]any{"model": "gpt-5", "stream": true, "tools": json.RawMessage(fnTools), "input": []any{
+		map[string]any{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "读一下 src/app.py"}}},
+		map[string]any{"type": "function_call", "name": "exec_command", "call_id": "c1", "arguments": `{"cmd":"Get-Content src/app.py -Raw"}`},
+		map[string]any{"type": "function_call_output", "call_id": "c1", "output": "def main():\n    pass\n"},
+	}})
+	code, out := doLocal(t, http.MethodPost, ts.URL+"/v1/responses", string(raw), hdr)
+	if code != http.StatusOK || !strings.Contains(out, "app.py 定义了 main()") {
+		t.Fatalf("应原样给出最终回答 (%d): %.300s", code, out)
+	}
+	if n := startCount(up); n != 1 {
+		t.Fatalf("工具结果之后的回答不该触发纠正: %d 次", n)
+	}
+}
