@@ -147,6 +147,13 @@ func (s *SQLiteStore) initSchema() error {
 	if err := s.addColumnIfMissing("accounts", "oauth_client_id", "TEXT"); err != nil {
 		return err
 	}
+	// enabled：NULL 视为启用（旧行与没给这个字段的导入）；priority：调度优先级，NULL 视为 0。
+	if err := s.addColumnIfMissing("accounts", "enabled", "INTEGER"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("accounts", "priority", "INTEGER"); err != nil {
+		return err
+	}
 
 	// 不再内置默认密钥：写死在源码里的 Key 对所有人公开，等于没有鉴权。
 	// 没有任何 Key 时鉴权中间件只放行本机请求，用户在 Dashboard 生成
@@ -240,7 +247,7 @@ func (s *SQLiteStore) Load() ([]config.AccountConfig, error) {
 
 	rows, err := s.db.Query(`
 		SELECT id, name, plan, email, cookies, access_token, refresh_token, max_concurrency, tags,
-		       COALESCE(oauth_client_id, '')
+		       COALESCE(oauth_client_id, ''), enabled, COALESCE(priority, 0)
 		FROM accounts
 		ORDER BY updated_at DESC
 	`)
@@ -253,6 +260,7 @@ func (s *SQLiteStore) Load() ([]config.AccountConfig, error) {
 	for rows.Next() {
 		var a config.AccountConfig
 		var tagsStr, clientID string
+		var enabled sql.NullInt64
 		err := rows.Scan(
 			&a.ID,
 			&a.Name,
@@ -264,9 +272,15 @@ func (s *SQLiteStore) Load() ([]config.AccountConfig, error) {
 			&a.MaxConcurrency,
 			&tagsStr,
 			&clientID,
+			&enabled,
+			&a.Priority,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("读取账号行失败: %w", err)
+		}
+		if enabled.Valid {
+			on := enabled.Int64 != 0
+			a.Enabled = &on
 		}
 		if tagsStr != "" {
 			_ = json.Unmarshal([]byte(tagsStr), &a.Tags)
@@ -313,9 +327,17 @@ func (s *SQLiteStore) SaveAccount(a config.AccountConfig) error {
 	}
 
 	// oauth_client_id 与 token 同理：Dashboard 编辑不会带它，空值时保留库内原值。
+	// enabled 没给（nil）时同样保留原值：重新导入同一个账号不会把停用的账号悄悄启用。
+	var enabled sql.NullInt64
+	if a.Enabled != nil {
+		enabled.Valid = true
+		if *a.Enabled {
+			enabled.Int64 = 1
+		}
+	}
 	query := `
-	INSERT INTO accounts (id, name, plan, email, cookies, access_token, refresh_token, max_concurrency, tags, oauth_client_id, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	INSERT INTO accounts (id, name, plan, email, cookies, access_token, refresh_token, max_concurrency, tags, oauth_client_id, enabled, priority, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 	ON CONFLICT(id) DO UPDATE SET
 		name = excluded.name,
 		plan = excluded.plan,
@@ -326,6 +348,8 @@ func (s *SQLiteStore) SaveAccount(a config.AccountConfig) error {
 		max_concurrency = excluded.max_concurrency,
 		tags = excluded.tags,
 		oauth_client_id = COALESCE(excluded.oauth_client_id, accounts.oauth_client_id),
+		enabled = COALESCE(excluded.enabled, accounts.enabled),
+		priority = excluded.priority,
 		updated_at = CURRENT_TIMESTAMP;
 	`
 	_, err := s.db.Exec(query,
@@ -339,6 +363,8 @@ func (s *SQLiteStore) SaveAccount(a config.AccountConfig) error {
 		a.MaxConcurrency,
 		tagsJSON,
 		nullIfEmpty(a.EffectiveOAuthClientID()), // 兼容旧 accounts.json 迁移进来的 Headers 写法
+		enabled,
+		a.Priority,
 	)
 	if err != nil {
 		return fmt.Errorf("保存账号 %s 至 SQLite 失败: %w", a.ID, err)
@@ -398,6 +424,21 @@ func (s *SQLiteStore) UpdateTokens(id string, t TokenUpdate) error {
 		return fmt.Errorf("%w: %s", ErrAccountNotInStore, id)
 	}
 	return nil
+}
+
+// parseDBTime 解析 TIMESTAMP 列读成的字符串（CURRENT_TIMESTAMP 写入，UTC）。
+//
+// 驱动按列的声明类型把它转成时间再交给 string，得到的是 RFC 3339（2026-10-05T11:48:15Z），
+// 不是库里存的 "2006-01-02 15:04:05"。早先只认后者：会话、消息、API Key 的时间全部解析失败
+// 成了零值，Dashboard 调试台的消息时间显示成 "-"。
+func parseDBTime(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05.999999999-07:00", "2006-01-02 15:04:05.999999999", "2006-01-02T15:04:05.999999999"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // nullIfEmpty 把空串（含纯空白）映射为 SQL NULL，配合 COALESCE 表达"不改"。
@@ -885,10 +926,10 @@ func (s *SQLiteStore) ListChatSessions() ([]ChatSessionRecord, error) {
 		if err := rows.Scan(&r.ID, &r.Title, &r.Model, &r.ReasoningEffort, &cStr, &uStr); err != nil {
 			continue
 		}
-		if t, err := time.Parse("2006-01-02 15:04:05", cStr); err == nil {
+		if t, ok := parseDBTime(cStr); ok {
 			r.CreatedAt = t
 		}
-		if t, err := time.Parse("2006-01-02 15:04:05", uStr); err == nil {
+		if t, ok := parseDBTime(uStr); ok {
 			r.UpdatedAt = t
 		}
 		list = append(list, r)
@@ -977,7 +1018,7 @@ func (s *SQLiteStore) ListChatMessages(sessionID string) ([]ChatMessageRecord, e
 		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Status, &cStr); err != nil {
 			continue
 		}
-		if t, err := time.Parse("2006-01-02 15:04:05", cStr); err == nil {
+		if t, ok := parseDBTime(cStr); ok {
 			m.CreatedAt = t
 		}
 		list = append(list, m)
@@ -1077,7 +1118,7 @@ func (s *SQLiteStore) ListAPIKeys() ([]APIKeyItem, error) {
 		if err := rows.Scan(&it.Key, &it.Name, &cStr); err != nil {
 			continue
 		}
-		if t, err := time.Parse("2006-01-02 15:04:05", cStr); err == nil {
+		if t, ok := parseDBTime(cStr); ok {
 			it.CreatedAt = t
 		}
 		list = append(list, it)

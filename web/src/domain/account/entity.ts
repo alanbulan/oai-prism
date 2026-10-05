@@ -3,10 +3,19 @@
  * 严格与后端 internal/account/account.go 的 Stats 结构体 1:1 对应，杜绝随意编造
  */
 
+/** 账号状态：手动停用 / 冷却中 / 凭据失效 / 满并发 / 正常 */
+export type AccountState = 'disabled' | 'cooling' | 'unusable' | 'busy' | 'ok';
+
 export interface AccountStats {
   id: string;
   name: string;
+  /** 此刻能接新请求（没停用、没冷却、凭据可用、没满并发） */
   enabled: boolean;
+  /** 被手动停用：不进调度池，列表里照常显示 */
+  disabled?: boolean;
+  state?: AccountState;
+  /** 调度优先级，数值越大越先用 */
+  priority?: number;
   plan: string;
   email: string;
   has_access_token: boolean;

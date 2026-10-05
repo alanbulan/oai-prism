@@ -60,8 +60,13 @@ const OAuthImportPane: React.FC<{ onDone: () => void }> = ({ onDone }) => {
             setErrMsg(st.data?.error || '未知错误');
             setPhase('error');
           }
-        } catch {
-          // 单次轮询失败忽略，下个周期重试
+        } catch (err: any) {
+          // 会话查不到（网关重启过或已过期）：再等也不会有结果，停下来说明原因；其它错误下个周期重试
+          if (err?.response?.status === 404) {
+            window.clearInterval(timerRef.current!);
+            setErrMsg('授权会话已失效（网关重启过或超过 30 分钟），请重新点击“打开官方授权页”');
+            setPhase('error');
+          }
         }
       }, 2000);
     } catch (err: any) {

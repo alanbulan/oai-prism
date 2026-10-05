@@ -355,8 +355,18 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 		now := time.Now()
 		accounts := s.pool.Accounts()
 		out := make([]account.Stats, 0, len(accounts))
+		inPool := make(map[string]bool, len(accounts))
 		for _, a := range accounts {
 			out = append(out, a.Stats(now))
+			inPool[a.ID] = true
+		}
+		// 停用的账号不进调度池，但列表里要有：不然停用之后就再也找不到、启用不回来
+		if list, err := s.loadPoolAccounts(); err == nil {
+			for _, ac := range list {
+				if !ac.IsEnabled() && !inPool[ac.ID] {
+					out = append(out, account.DisabledStats(ac))
+				}
+			}
 		}
 		credsFile := s.store.Path()
 		if s.sqlite != nil {
@@ -406,6 +416,12 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 				a := &batch[i]
 				if a.ID == "" {
 					a.ID = importedAccountID(existing, *a)
+				}
+				// 重新导入已有账号：导入文件不带优先级时沿用原来的（启用状态在 SaveAccount 里同样保留）
+				for _, old := range existing {
+					if old.ID == a.ID && a.Priority == 0 {
+						a.Priority = old.Priority
+					}
 				}
 				if a.Name == "" {
 					a.Name = a.Email

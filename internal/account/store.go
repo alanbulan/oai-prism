@@ -416,6 +416,12 @@ func MergeAccountPatch(base config.AccountConfig, raw []byte) (config.AccountCon
 	if has("tags") {
 		out.Tags = strs(m, "tags")
 	}
+	if v, ok := boolp(m, "enabled"); ok {
+		out.Enabled = &v
+	}
+	if has("priority") {
+		out.Priority = integer(m, "priority")
+	}
 	// 凭据只在给了非空值时替换（SaveAccount 对空凭据本来就保留旧值）
 	for _, f := range []struct {
 		dst  *string

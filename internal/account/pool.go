@@ -125,7 +125,10 @@ func (p *Pool) Build(cfgs []config.AccountConfig) error {
 	}
 
 	sort.SliceStable(built, func(i, j int) bool {
-		// 高权重优先，让 least_inflight 在平票时也倾向优质账号。
+		// 优先级高的在前（pick 按优先级分档）；同档内高权重优先，让 least_inflight 在平票时也倾向优质账号。
+		if built[i].Priority != built[j].Priority {
+			return built[i].Priority > built[j].Priority
+		}
 		return built[i].Weight > built[j].Weight
 	})
 
@@ -328,8 +331,24 @@ func (p *Pool) waitSticky(ctx context.Context, a *Account, stickyKey string) *Le
 	return nil
 }
 
-// pick 依据策略选一个可用账号。
+// pick 依据优先级与策略选一个可用账号：先在优先级最高的一档里按策略挑，这一档全部不可用
+// （冷却、满并发、凭据失效）才轮到下一档。all 已按优先级降序排好（见 Build）。
 func (p *Pool) pick(all []*Account, now time.Time) *Account {
+	for start := 0; start < len(all); {
+		end := start + 1
+		for end < len(all) && all[end].Priority == all[start].Priority {
+			end++
+		}
+		if a := p.pickIn(all[start:end], now); a != nil {
+			return a
+		}
+		start = end
+	}
+	return nil
+}
+
+// pickIn 在同一档优先级的账号里按策略选一个。
+func (p *Pool) pickIn(all []*Account, now time.Time) *Account {
 	switch p.cfg.Strategy {
 	case "round_robin":
 		n := len(all)
@@ -523,6 +542,15 @@ func (p *Pool) refreshAll(ctx context.Context, r *creds.Refresher) {
 	skew := p.creds.RefreshSkew
 	if skew <= 0 {
 		skew = 5 * time.Minute
+	}
+	// 提前量至少要比巡检周期多一点：默认每 10 分钟巡检、提前 5 分钟刷新，巡检时离过期还剩
+	// 6 ~ 10 分钟的账号这一轮不刷，下一轮时访问令牌已经过期，中间的请求全部 401。
+	interval := p.creds.RefreshInterval
+	if interval <= 0 {
+		interval = 10 * time.Minute
+	}
+	if min := interval + time.Minute; skew < min {
+		skew = min
 	}
 	now := time.Now()
 

@@ -9,6 +9,7 @@ import {
 } from '@ant-design/icons';
 import { useAccountStore } from '../../../application/account/store';
 import { formatDateTime } from '../../utils/format';
+import { planLabel } from '../../utils/plan';
 
 const { Text } = Typography;
 
@@ -45,8 +46,8 @@ export const PlanDetailDrawer: React.FC = () => {
           </Descriptions.Item>
           <Descriptions.Item label="调度状态">
             <Badge
-              status={selectedAccount.enabled ? 'success' : 'error'}
-              text={selectedAccount.enabled ? '正常调度' : '已暂停'}
+              status={selectedAccount.disabled ? 'default' : selectedAccount.enabled ? 'success' : 'error'}
+              text={selectedAccount.disabled ? '已停用' : selectedAccount.enabled ? '正常调度' : '暂不可用'}
             />
           </Descriptions.Item>
         </Descriptions>
@@ -56,7 +57,7 @@ export const PlanDetailDrawer: React.FC = () => {
         <Descriptions title="计划与凭据" bordered column={1} size="small">
           <Descriptions.Item label="计划等级">
             <Tag color="gold" icon={<CrownOutlined />}>
-              {(selectedAccount.plan || 'pro').toUpperCase()}
+              {planLabel(selectedAccount.plan)}
             </Tag>
           </Descriptions.Item>
           <Descriptions.Item label="Token 到期">

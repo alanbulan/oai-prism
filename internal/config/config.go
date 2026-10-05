@@ -202,6 +202,10 @@ type AccountConfig struct {
 	// Weight 用于加权轮询。
 	Weight int `yaml:"weight"`
 
+	// Priority 是调度优先级，数值越大越先用（默认 0）。调度先在最高的一档里按策略挑，
+	// 这一档全部不可用（冷却、满并发、凭据失效）才轮到下一档。
+	Priority int `yaml:"priority"`
+
 	Headers map[string]string `yaml:"headers"`
 	Tags    []string          `yaml:"tags"`
 }

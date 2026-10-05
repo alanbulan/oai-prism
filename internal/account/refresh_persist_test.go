@@ -385,3 +385,24 @@ func TestSQLiteStore_MigratesOAuthClientIDColumn(t *testing.T) {
 			got.Name, got.OAuthClientID, got.Headers)
 	}
 }
+
+// 后台巡检的提前量至少比巡检周期多一分钟：默认每 10 分钟巡检、提前 5 分钟刷新时，
+// 离过期还剩 8 分钟的账号这一轮不刷，下一轮访问令牌已经过期。
+func TestRefreshAll_SkewCoversInterval(t *testing.T) {
+	tok := newFakeTokenEndpoint(t)
+	store := openTestStore(t, filepath.Join(t.TempDir(), "accounts.db"))
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.SaveAccount(config.AccountConfig{
+		ID:           "oauth-8m",
+		AccessToken:  fakeJWT(t, map[string]any{"exp": time.Now().Add(8 * time.Minute).Unix()}),
+		RefreshToken: "rt-8m",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p, r := poolFromStore(t, tok, store)
+	p.creds.RefreshSkew, p.creds.RefreshInterval = 5*time.Minute, 10*time.Minute
+	p.refreshAll(context.Background(), r)
+	if rt, _, _ := tok.last(); rt != "rt-8m" {
+		t.Fatal("离过期 8 分钟（短于巡检周期）的账号这一轮就该刷新")
+	}
+}

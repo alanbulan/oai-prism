@@ -19,10 +19,11 @@ import (
 // 因此这些字段全部用 atomic；只有限流桶用了 mutex（临界区仅几纳秒，
 // 且只在账号显式配置了速率限制时才存在）。
 type Account struct {
-	ID     string
-	Name   string
-	Tags   []string
-	Weight int
+	ID       string
+	Name     string
+	Tags     []string
+	Weight   int
+	Priority int // 调度优先级，数值越大越先用（见 Pool.pick）
 
 	// Client 是该账号专属的上游客户端（可能走独立出口代理）。
 	Client *httpc.Client
@@ -185,9 +186,15 @@ func (a *Account) Cooldown(now time.Time, d time.Duration) {
 
 // Stats 是账号的运行态快照，供 /admin 输出。
 type Stats struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name"`
-	Enabled      bool     `json:"enabled"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"` // 此刻能接新请求（没停用、没冷却、凭据可用、没满并发）
+	// Disabled 是被手动停用（不进调度池）；State 是给界面的状态：
+	// disabled / cooling / unusable（凭据失效）/ busy（满并发）/ ok。
+	Disabled bool   `json:"disabled"`
+	State    string `json:"state"`
+	Priority int    `json:"priority"`
+
 	Plan         string   `json:"plan"`
 	Email        string   `json:"email"`
 	HasToken     bool     `json:"has_access_token"`
@@ -213,6 +220,7 @@ func (a *Account) Stats(now time.Time) Stats {
 		ID:         a.ID,
 		Name:       a.Name,
 		Enabled:    a.Available(now),
+		Priority:   a.Priority,
 		Inflight:   a.inflight.Load(),
 		MaxConcur:  a.maxConc,
 		FailStreak: a.failStreak.Load(),
@@ -222,6 +230,16 @@ func (a *Account) Stats(now time.Time) Stats {
 	}
 	if d := a.CooldownRemaining(now); d > 0 {
 		s.CooldownSec = d.Seconds()
+	}
+	switch {
+	case s.CooldownSec > 0:
+		s.State = "cooling"
+	case !c.Usable():
+		s.State = "unusable"
+	case a.maxConc > 0 && s.Inflight >= a.maxConc:
+		s.State = "busy"
+	default:
+		s.State = "ok"
 	}
 	if c != nil {
 		s.Plan = c.Plan
@@ -241,15 +259,52 @@ func (a *Account) Stats(now time.Time) Stats {
 	return s
 }
 
+// DisabledStats 是被停用账号（不在调度池里）给 /admin 的快照：只有配置里的信息，没有运行态。
+func DisabledStats(cfg config.AccountConfig) Stats {
+	s := Stats{
+		ID:        cfg.ID,
+		Name:      cfg.Name,
+		Disabled:  true,
+		State:     "disabled",
+		Priority:  cfg.Priority,
+		Plan:      cfg.Plan,
+		Email:     cfg.Email,
+		MaxConcur: int64(cfg.MaxConcurrency),
+		Tags:      cfg.Tags,
+		Source:    "sqlite",
+	}
+	if s.Name == "" {
+		s.Name = s.ID
+	}
+	if c := creds.FromAccountConfig(cfg); c != nil {
+		if c.Plan != "" {
+			s.Plan = c.Plan
+		}
+		if c.Email != "" {
+			s.Email = c.Email
+		}
+		s.Source = c.Source
+		s.HasToken = c.AccessToken != ""
+		s.HasRefresh = c.RefreshToken != ""
+		s.HasSession = c.SessionToken != "" || creds.HasSessionCookie(c.CookieHeader)
+		if !c.ExpiresAt.IsZero() {
+			s.TokenExpires = c.ExpiresAt.UTC().Format(time.RFC3339)
+			s.ExpiresInSec = int64(time.Until(c.ExpiresAt).Seconds())
+		}
+	}
+	return s
+}
+
 // newAccount 从配置构造账号。client 由调用方注入（可能带独立代理）。
 func newAccount(cfg config.AccountConfig, client *httpc.Client, c *creds.Credential) *Account {
 	a := &Account{
-		ID:      cfg.ID,
-		Name:    cfg.Name,
-		Tags:    cfg.Tags,
-		Weight:  cfg.Weight,
-		Client:  client,
-		maxConc: int64(cfg.MaxConcurrency),
+		ID:       cfg.ID,
+		Name:     cfg.Name,
+		Tags:     cfg.Tags,
+		Weight:   cfg.Weight,
+		Priority: cfg.Priority,
+		Client:   client,
+		maxConc:  int64(cfg.MaxConcurrency),
 	}
 	if a.Name == "" {
 		a.Name = a.ID

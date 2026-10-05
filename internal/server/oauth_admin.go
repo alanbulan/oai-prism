@@ -28,6 +28,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -56,6 +57,7 @@ type oauthSession struct {
 	ClientID     string
 	CreatedAt    time.Time
 
+	claimed bool   // 已有人拿着授权码去换 token（回调与手动粘贴只能有一个去换）
 	done    bool   // 已拿到 code 并完成（或失败）
 	account string // 成功时：入库的账号 ID
 	errMsg  string // 失败时：错误描述
@@ -356,18 +358,40 @@ func (s *Server) handleLocalCallback(w http.ResponseWriter, r *http.Request, ses
 	_, _ = w.Write([]byte(oauthResultHTML("授权成功", "账号 "+acctID+" 已入库并进入调度池，可关闭此页回到控制台查看。")))
 }
 
-// finishOAuthSession 记录会话终态并从反查表移除。
+// finishOAuthSession 记录会话终态。
+//
+// 只从 state 反查表里摘掉（同一个回调不能再用一次），按会话 ID 仍查得到，直到过期：
+// 控制台靠它轮询结果、手动粘贴回调也凭它认领。早先这里把会话整个删掉 —— 回调页显示
+// "授权成功"，控制台的轮询却只拿到"会话不存在"（被当成网络抖动忽略），一直转圈；
+// 再去粘贴回调地址，又报会话已过期。
 func (s *Server) finishOAuthSession(sess *oauthSession, accountID string, err error) {
+	oauthSessions.mu.Lock()
+	defer oauthSessions.mu.Unlock()
 	sess.done = true
 	sess.account = accountID
 	if err != nil {
 		sess.errMsg = err.Error()
 	}
-	oauthSessions.remove(sess)
+	delete(oauthSessions.byState, sess.State)
+}
+
+// oauthResult 返回会话的终态（未完成时 done 为 false）。
+func oauthResult(sess *oauthSession) (done bool, account, errMsg string) {
+	oauthSessions.mu.Lock()
+	defer oauthSessions.mu.Unlock()
+	return sess.done, sess.account, sess.errMsg
 }
 
 // completeOAuthLogin 换 token 并把账号写入 SQLite、热重载进池。
 func (s *Server) completeOAuthLogin(sess *oauthSession, code string) (string, error) {
+	oauthSessions.mu.Lock()
+	if sess.claimed {
+		oauthSessions.mu.Unlock()
+		return "", errors.New("这次授权正在导入或已经完成，稍等片刻看控制台的结果")
+	}
+	sess.claimed = true
+	oauthSessions.mu.Unlock()
+
 	tok, err := oauthExchangeToken(sess.ClientID, code, sess.CodeVerifier, sess.RedirectURI)
 	if err != nil {
 		s.finishOAuthSession(sess, "", err)
@@ -422,13 +446,13 @@ func (s *Server) handleOAuthStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := map[string]any{"status": "waiting", "session_id": sess.ID}
-	if sess.done {
-		if sess.errMsg != "" {
+	if done, acct, errMsg := oauthResult(sess); done {
+		if errMsg != "" {
 			out["status"] = "error"
-			out["error"] = sess.errMsg
+			out["error"] = errMsg
 		} else {
 			out["status"] = "success"
-			out["account_id"] = sess.account
+			out["account_id"] = acct
 		}
 	}
 	writeOAuthJSON(w, out)
@@ -446,7 +470,16 @@ func (s *Server) handleOAuthExchange(w http.ResponseWriter, r *http.Request) {
 	}
 	sess := oauthSessions.getByID(strings.TrimSpace(body.SessionID))
 	if sess == nil {
-		writeAdminErr(w, http.StatusNotFound, "会话不存在或已过期")
+		writeAdminErr(w, http.StatusNotFound, "授权会话不存在或已过期（网关重启过，或已超过 30 分钟），请重新点击“打开官方授权页”")
+		return
+	}
+	// 回调已经由本地监听器处理过：直接给出结果（授权码只能换一次，不能再拿去换）
+	if done, acct, errMsg := oauthResult(sess); done {
+		if errMsg != "" {
+			writeAdminErr(w, http.StatusBadRequest, "这次授权已经失败："+errMsg+"。请重新点击“打开官方授权页”")
+			return
+		}
+		writeOAuthJSON(w, map[string]any{"status": "success", "account_id": acct})
 		return
 	}
 

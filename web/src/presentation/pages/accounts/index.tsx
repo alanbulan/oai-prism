@@ -15,6 +15,7 @@ import {
   Typography,
   Popconfirm,
   Empty,
+  Switch,
   theme,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
@@ -33,7 +34,7 @@ import {
   FieldTimeOutlined,
   DisconnectOutlined,
 } from '@ant-design/icons';
-import type { AccountStats } from '../../../domain/account/entity';
+import type { AccountState, AccountStats } from '../../../domain/account/entity';
 import { useAccountStore } from '../../../application/account/store';
 import { useAuthStore } from '../../../application/auth/store';
 import { AccountImportModal } from './AccountImportModal';
@@ -42,10 +43,19 @@ import { AccountEditModal } from './AccountEditModal';
 import { StatCard } from '../../components/StatCard';
 import { SPECTRUM } from '../../theme/tokens';
 import { formatDate } from '../../utils/format';
+import { planColor, planKey, planLabel, planRank } from '../../utils/plan';
 
 const { Text } = Typography;
 
 const EXPIRING_WINDOW_SEC = 7 * 86400;
+
+/** 账号状态（后端没给 state 的旧版本按原来的字段推断） */
+function stateOf(a: AccountStats): AccountState {
+  if (a.state) return a.state;
+  if (a.disabled) return 'disabled';
+  if (a.cooldown_sec > 0) return 'cooling';
+  return a.enabled ? 'ok' : 'unusable';
+}
 
 export const AccountsPage: React.FC = () => {
   const { token } = theme.useToken();
@@ -58,6 +68,7 @@ export const AccountsPage: React.FC = () => {
     reloadPool,
     refreshAccount,
     deleteAccount,
+    updateAccount,
     openDetailDrawer,
     openEditModal,
     setImportModalOpen,
@@ -73,6 +84,20 @@ export const AccountsPage: React.FC = () => {
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
+  const [togglingId, setTogglingId] = useState<string | null>(null);
+
+  // 启用 / 停用：停用的账号不再接新请求（进行中的请求照常完成），列表里保留，随时可以再启用
+  const handleToggle = async (record: AccountStats, on: boolean) => {
+    setTogglingId(record.id);
+    try {
+      await updateAccount(record.id, { enabled: on });
+      message.success(on ? `已启用 ${record.name}` : `已停用 ${record.name}，不再接新请求`);
+    } catch (err: any) {
+      message.error(`${on ? '启用' : '停用'}失败: ${err.message}`);
+    } finally {
+      setTogglingId(null);
+    }
+  };
 
   useEffect(() => {
     fetchAccounts();
@@ -87,36 +112,56 @@ export const AccountsPage: React.FC = () => {
         acc.id.toLowerCase().includes(searchText.toLowerCase()) ||
         (acc.email && acc.email.toLowerCase().includes(searchText.toLowerCase()));
 
-      const matchPlan =
-        planFilter === 'all' || acc.plan.toLowerCase() === planFilter.toLowerCase();
+      const matchPlan = planFilter === 'all' || planKey(acc.plan) === planFilter;
 
+      const st = stateOf(acc);
       const matchStatus =
         statusFilter === 'all' ||
-        (statusFilter === 'enabled' && acc.enabled) ||
-        (statusFilter === 'disabled' && !acc.enabled) ||
-        (statusFilter === 'cooldown' && acc.cooldown_sec > 0);
+        (statusFilter === 'enabled' && (st === 'ok' || st === 'busy')) ||
+        (statusFilter === 'disabled' && st === 'disabled') ||
+        (statusFilter === 'unusable' && st === 'unusable') ||
+        (statusFilter === 'cooldown' && st === 'cooling');
 
       return matchSearch && matchPlan && matchStatus;
     });
   }, [accounts, searchText, planFilter, statusFilter]);
 
+  // 计划筛选项取自现有账号的实际计划（free / plus / prolite …），不写死
+  const planFilterOptions = useMemo(() => {
+    const keys = new Map<string, string>();
+    for (const a of accounts) {
+      const k = planKey(a.plan);
+      if (k && !keys.has(k)) keys.set(k, a.plan);
+    }
+    if (planFilter !== 'all' && !keys.has(planFilter)) keys.set(planFilter, planFilter);
+    return [
+      { value: 'all', label: '全部计划' },
+      ...[...keys.entries()]
+        .sort((a, b) => planRank(a[1]) - planRank(b[1]))
+        .map(([k, raw]) => ({ value: k, label: `${planLabel(raw)} 计划` })),
+    ];
+  }, [accounts, planFilter]);
+
   // 账号池概览指标
   const overview = useMemo(() => {
     let cooling = 0;
     let disabled = 0;
+    let unusable = 0;
     let inflight = 0;
     let expiring = 0;
     let earliest: string | undefined;
     for (const a of accounts) {
-      if (a.cooldown_sec > 0) cooling++;
-      else if (!a.enabled) disabled++;
+      const st = stateOf(a);
+      if (st === 'cooling') cooling++;
+      else if (st === 'disabled') disabled++;
+      else if (st === 'unusable') unusable++;
       inflight += a.inflight;
       if (a.token_expires && (a.expires_in_sec ?? 0) > 0) {
         if ((a.expires_in_sec ?? 0) < EXPIRING_WINDOW_SEC) expiring++;
         if (!earliest || a.token_expires < earliest) earliest = a.token_expires;
       }
     }
-    return { cooling, disabled, inflight, expiring, earliest };
+    return { cooling, disabled, unusable, inflight, expiring, earliest };
   }, [accounts]);
 
   const readyPct = accounts.length > 0 ? Math.round((readyCount / accounts.length) * 100) : 0;
@@ -179,38 +224,73 @@ export const AccountsPage: React.FC = () => {
       dataIndex: 'plan',
       key: 'plan',
       width: 96,
-      render: (plan) => {
-        const p = (plan || 'pro').toLowerCase();
-        const color = p.includes('team') || p.includes('enterprise') ? 'gold' : p.includes('pro') ? 'blue' : 'default';
-        return (
-          <Tag bordered={false} color={color} style={{ fontWeight: 600, textTransform: 'uppercase', marginInlineEnd: 0 }}>
-            {plan || '未知'}
-          </Tag>
-        );
-      },
+      render: (plan) => (
+        <Tag bordered={false} color={planColor(plan)} style={{ fontWeight: 600, marginInlineEnd: 0 }}>
+          {planLabel(plan)}
+        </Tag>
+      ),
+    },
+    {
+      title: (
+        <Tooltip title="停用后不再接新请求（进行中的请求照常完成），随时可以再启用">启用</Tooltip>
+      ),
+      key: 'switch',
+      width: 64,
+      render: (_, record) => (
+        <Switch
+          size="small"
+          checked={!record.disabled}
+          loading={togglingId === record.id}
+          onChange={(on) => handleToggle(record, on)}
+        />
+      ),
     },
     {
       title: '调度状态',
       dataIndex: 'enabled',
       key: 'enabled',
       width: 108,
-      render: (enabled, record) => {
-        if (record.cooldown_sec > 0) {
-          return (
-            <Tooltip title={`冷却中：因失败过多暂时避让，剩余 ${Math.round(record.cooldown_sec)} 秒后自动解除`}>
-              <Badge status="warning" text={`冷却 ${Math.round(record.cooldown_sec)}s`} />
-            </Tooltip>
-          );
+      render: (_, record) => {
+        switch (stateOf(record)) {
+          case 'disabled':
+            return <Badge status="default" text="已停用" />;
+          case 'cooling':
+            return (
+              <Tooltip title={`冷却中：因失败过多暂时避让，剩余 ${Math.round(record.cooldown_sec)} 秒后自动解除`}>
+                <Badge status="warning" text={`冷却 ${Math.round(record.cooldown_sec)}s`} />
+              </Tooltip>
+            );
+          case 'unusable':
+            return (
+              <Tooltip title={`凭据不可用（缺少或已失效），连续失败 ${record.fail_streak} 次；可尝试“刷新凭据”或重新导入`}>
+                <Badge status="error" text="凭据失效" />
+              </Tooltip>
+            );
+          case 'busy':
+            return (
+              <Tooltip title="并发已满，新请求会等它空出槽位或改用其它账号">
+                <Badge status="processing" text="满载" />
+              </Tooltip>
+            );
+          default:
+            return <Badge status="success" text="健康可用" />;
         }
-        if (enabled) {
-          return <Badge status="success" text="健康可用" />;
-        }
-        return (
-          <Tooltip title={`已停用，连续失败 ${record.fail_streak} 次`}>
-            <Badge status="error" text="已停用" />
-          </Tooltip>
-        );
       },
+    },
+    {
+      title: (
+        <Tooltip title="数值越大越先用；同一优先级内按调度策略分摊，高优先级的账号都不可用（冷却、满载、失效）时才用低优先级的。在“编辑”里修改">
+          优先级
+        </Tooltip>
+      ),
+      dataIndex: 'priority',
+      key: 'priority',
+      width: 76,
+      render: (p?: number) => (
+        <Text type={p ? undefined : 'secondary'} strong={!!p} style={{ fontVariantNumeric: 'tabular-nums' }}>
+          {p ?? 0}
+        </Text>
+      ),
     },
     {
       title: '凭据构成',
@@ -346,13 +426,13 @@ export const AccountsPage: React.FC = () => {
       </Col>
       <Col xs={12} xl={6}>
         <StatCard
-          title="冷却 / 停用"
-          value={kpi(overview.cooling + overview.disabled)}
+          title="冷却 / 停用 / 失效"
+          value={kpi(overview.cooling + overview.disabled + overview.unusable)}
           suffix={unit}
           icon={<WarningOutlined />}
           color={token.colorWarning}
           loading={loading && accounts.length === 0}
-          footer={`冷却中 ${overview.cooling} · 已停用 ${overview.disabled}`}
+          footer={`冷却 ${overview.cooling} · 停用 ${overview.disabled} · 失效 ${overview.unusable}`}
         />
       </Col>
       <Col xs={12} xl={6}>
@@ -431,13 +511,8 @@ export const AccountsPage: React.FC = () => {
               setPlanFilter(v);
               setCurrentPage(1);
             }}
-            style={{ width: 120 }}
-            options={[
-              { value: 'all', label: '全部计划' },
-              { value: 'pro', label: 'Pro 计划' },
-              { value: 'team', label: 'Team 计划' },
-              { value: 'free', label: 'Free 计划' },
-            ]}
+            style={{ width: 140 }}
+            options={planFilterOptions}
           />
         </Space>
 
@@ -454,6 +529,7 @@ export const AccountsPage: React.FC = () => {
               { value: 'all', label: '全部状态' },
               { value: 'enabled', label: '健康可用' },
               { value: 'cooldown', label: '冷却中' },
+              { value: 'unusable', label: '凭据失效' },
               { value: 'disabled', label: '已停用' },
             ]}
           />
@@ -483,7 +559,7 @@ export const AccountsPage: React.FC = () => {
           dataSource={filteredAccounts}
           loading={loading}
           // x = 账号列最小 200 + 其余列宽之和；容器更宽时余量全部归账号列
-          scroll={{ x: 932, y: 200 }}
+          scroll={{ x: 1072, y: 200 }}
           locale={{
             emptyText: blocked ? (
               <Empty

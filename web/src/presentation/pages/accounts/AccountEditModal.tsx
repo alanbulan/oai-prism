@@ -1,6 +1,7 @@
 import React, { useEffect } from 'react';
-import { Modal, Form, Input, Select, InputNumber, message } from 'antd';
+import { Modal, Form, Input, Select, InputNumber, Switch, message } from 'antd';
 import { useAccountStore } from '../../../application/account/store';
+import { planKey, planOptions } from '../../utils/plan';
 
 export const AccountEditModal: React.FC = () => {
   const { editingAccount, editModalOpen, closeEditModal, updateAccount } = useAccountStore();
@@ -11,8 +12,10 @@ export const AccountEditModal: React.FC = () => {
       form.setFieldsValue({
         name: editingAccount.name,
         email: editingAccount.email,
-        plan: editingAccount.plan || 'pro',
+        plan: planKey(editingAccount.plan) || 'pro',
         max_concurrency: editingAccount.max_concurrency || 2,
+        enabled: !editingAccount.disabled,
+        priority: editingAccount.priority ?? 0,
       });
     }
   }, [editingAccount, form]);
@@ -54,14 +57,7 @@ export const AccountEditModal: React.FC = () => {
         </Form.Item>
 
         <Form.Item name="plan" label="上游计划等级">
-          <Select
-            options={[
-              { value: 'pro', label: 'Pro 计划' },
-              { value: 'team', label: 'Team 计划' },
-              { value: 'enterprise', label: 'Enterprise 计划' },
-              { value: 'free', label: 'Free 计划' },
-            ]}
-          />
+          <Select options={planOptions(editingAccount?.plan)} />
         </Form.Item>
 
         <Form.Item
@@ -70,6 +66,23 @@ export const AccountEditModal: React.FC = () => {
           extra="设置允许同时在上游执行推理的请求数，超出将在网关排队调度"
         >
           <InputNumber min={1} max={64} style={{ width: '100%' }} />
+        </Form.Item>
+
+        <Form.Item
+          name="priority"
+          label="调度优先级"
+          extra="数值越大越先用（默认 0）。同一优先级内按调度策略分摊；高优先级的账号都不可用（冷却、满载、凭据失效）时才用低优先级的。已在进行中的会话继续用原来的账号"
+        >
+          <InputNumber min={-100} max={100} precision={0} style={{ width: '100%' }} />
+        </Form.Item>
+
+        <Form.Item
+          name="enabled"
+          label="参与调度"
+          valuePropName="checked"
+          extra="关闭后不再接新请求（进行中的请求照常完成），账号保留在列表里，随时可以再打开"
+        >
+          <Switch checkedChildren="启用" unCheckedChildren="停用" />
         </Form.Item>
       </Form>
     </Modal>
