@@ -187,7 +187,9 @@ facade:
   # api_keys:
   #   - sk-oaiprism-your-secret
 
-  default_model: gpt-6.1-sol
+  # 请求不带模型时用的对外模型名。留空 = 跟随上游：取上游在售清单里的第一个
+  # （与 Prism 网页的默认选择一致）；配了但上游已不再提供时同样回落到清单第一个。
+  default_model: ""
 
   # 允许 chat 接口按 X-Local-Workspace 头把上游产物写到网关所在机器的目录。
   # 默认关闭（等于让调用方指定网关主机上的写入位置）；开启后也只接受本机请求。
@@ -204,76 +206,27 @@ facade:
   # 超出时直接回 context_length_exceeded，不发上游。-1 关闭检查。
   max_prompt_bytes: 98304
 
-  # 对外模型名 -> 上游真名 + 推理强度。
-  # label 是 /v1/models 里的展示名（可选，不填则不带 name 字段）。
-  models:
-    # 清单来源：Statsig 动态配置 prism_codex_models（2026-10-01 实测）。
-    # 只保留 4 个现役模型 x 各自的推理档位；已下线模型（astra 系）与
-    # 历史别名一律不再对外暴露 —— 维护时以 Statsig 下发的清单为准。
-    #
-    # ---- 6.1 Sol（当前旗舰）----
-    gpt-6.1-sol:
-      model: gpt-6.1-sol
-      reasoning_effort: medium
-      label: "6.1 Sol"
-    gpt-6.1-sol-low:
-      model: gpt-6.1-sol
-      reasoning_effort: low
-      label: "6.1 Sol (Low)"
-    gpt-6.1-sol-high:
-      model: gpt-6.1-sol
-      reasoning_effort: high
-      label: "6.1 Sol (High)"
-    gpt-6.1-sol-xhigh:
-      model: gpt-6.1-sol
-      reasoning_effort: xhigh
-      label: "6.1 Sol (Extra High)"
+  # 模型名、展示名与推理档位都来自上游，不在这里写死：
+  #   - 在售模型取自 GET /api/inference/models（Prism 网页模型下拉框的来源），按上游顺序；
+  #   - 推理档位取自 Prism 网页的推理强度选项（low / medium / high / xhigh，默认 medium，以上游为准）。
+  # /v1/models 列出每个在售模型，外加每个非默认档位一个 "<模型>-<档位>" 变体（如 gpt-5.6-sol-high）。
+  # 上游下架的模型（客户端还配着它）自动改用默认模型，不再交给上游白等五分钟。
+  model_catalog:
+    enabled: true
+    refresh_interval: 30m
 
-    # ---- 6 Luna ----
-    gpt-6-luna:
-      model: gpt-6-luna
-      reasoning_effort: medium
-      label: "6 Luna"
-    gpt-6-luna-high:
-      model: gpt-6-luna
-      reasoning_effort: high
-      label: "6 Luna (High)"
-    gpt-6-luna-xhigh:
-      model: gpt-6-luna
-      reasoning_effort: xhigh
-      label: "6 Luna (Extra High)"
+  # 上游没给出推理档位时的兜底（由低到高）；留空 = 不兜底，客户端给什么档位就原样交给上游。
+  # reasoning_efforts: [low, medium, high, xhigh]
+  # default_reasoning_effort: medium
 
-    # ---- 5.6 Sol ----
-    gpt-5.6-sol:
-      model: gpt-5.6-sol
-      reasoning_effort: medium
-      label: "5.6 Sol"
-    gpt-5.6-sol-low:
-      model: gpt-5.6-sol
-      reasoning_effort: low
-      label: "5.6 Sol (Low)"
-    gpt-5.6-sol-high:
-      model: gpt-5.6-sol
-      reasoning_effort: high
-      label: "5.6 Sol (High)"
-    gpt-5.6-sol-xhigh:
-      model: gpt-5.6-sol
-      reasoning_effort: xhigh
-      label: "5.6 Sol (Extra High)"
-
-    # ---- 5.6 Terra ----
-    gpt-5.6-terra:
-      model: gpt-5.6-terra
-      reasoning_effort: medium
-      label: "5.6 Terra"
-    gpt-5.6-terra-high:
-      model: gpt-5.6-terra
-      reasoning_effort: high
-      label: "5.6 Terra (High)"
-    gpt-5.6-terra-xhigh:
-      model: gpt-5.6-terra
-      reasoning_effort: xhigh
-      label: "5.6 Terra (Extra High)"
+  # 自定义别名（可选，优先于上游清单）：对外名 -> 上游模型 + 推理强度。
+  # label 是 /v1/models 里的展示名。映射到的模型下架后按默认模型处理。
+  models: {}
+  # models:
+  #   codex-fast:
+  #     model: gpt-5.6-sol
+  #     reasoning_effort: low
+  #     label: "Codex Fast"
 
   # -------------------------------------------------------------------------
   # 上游协议字段名映射

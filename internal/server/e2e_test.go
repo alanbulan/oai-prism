@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/oai-prism/oaiprism/internal/config"
+	"github.com/oai-prism/oaiprism/internal/facade"
 	"github.com/oai-prism/oaiprism/internal/logx"
 	"github.com/oai-prism/oaiprism/internal/tokens"
 )
@@ -105,6 +107,23 @@ type fakeUpstream struct {
 	convSeq     int
 	actionFails bool
 	goneConvs   map[string]bool
+
+	// models 是 /api/inference/models 的返回（nil = 404，网关拿不到在售清单）；
+	// frontendJS 非空时首页引用一个脚本、内容就是它（推理档位从这里解析）。
+	// goneModels 里的模型在 start 时回 "Error while processing conversation"（已下架的模型就是这样）。
+	models     []map[string]string
+	frontendJS string
+	goneModels map[string]bool
+}
+
+// setModels 换一份在售清单（模拟上游上架 / 下架模型）。
+func (f *fakeUpstream) setModels(ids ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.models = nil
+	for _, id := range ids {
+		f.models = append(f.models, map[string]string{"id": id, "label": "L " + id})
+	}
 }
 
 // sandboxAlive 报告请求所带的沙箱令牌是否仍可用；不可用时直接回 502。
@@ -215,7 +234,32 @@ func (f *fakeUpstream) handler() http.Handler {
 	}
 
 	// --- 会话登记：Next.js Server Action（POST 页面路径 + Next-Action 头，回 RSC 流）---
+	mux.HandleFunc("/api/inference/models", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		models := f.models
+		f.mu.Unlock()
+		if models == nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(models)
+	})
+	mux.HandleFunc("/_next/static/chunks/app.js", func(w http.ResponseWriter, r *http.Request) {
+		if f.frontendJS == "" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, f.frontendJS)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" && r.Method == http.MethodGet && f.frontendJS != "" {
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = io.WriteString(w, `<html><script src="/_next/static/chunks/app.js"></script>`+
+				`<script>self.i18n={"en":{"reasoningEffortLowLabel":"Low","reasoningEffortMediumLabel":"Medium",`+
+				`"reasoningEffortHighLabel":"High","reasoningEffortExtraHighLabel":"Extra high"}}</script></html>`)
+			return
+		}
 		if r.URL.Path != "/" || r.Method != http.MethodPost || r.Header.Get("Next-Action") == "" {
 			http.NotFound(w, r)
 			return
@@ -318,6 +362,15 @@ func (f *fakeUpstream) handler() http.Handler {
 		model := ""
 		if meta, _ := body["metadata"].(map[string]any); meta != nil {
 			model, _ = meta["model"].(string)
+		}
+		f.mu.Lock()
+		gone := f.goneModels[model]
+		f.mu.Unlock()
+		if gone {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"completed","request_id":"req-gone-model",` +
+				`"response":{"status":"error","payload":{"reason":"unknown","message":"Error while processing conversation (400 Bad Request). Please submit prompt again."}}}`))
+			return
 		}
 		if model == "failing-model" {
 			w.Header().Set("Content-Type", "application/json")
@@ -1384,30 +1437,138 @@ func TestE2E_ResponsesAPI(t *testing.T) {
 }
 
 func TestE2E_Models(t *testing.T) {
-	ts, _ := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), nil)
+	ts, _ := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), func(c *config.Config) {
+		c.Facade.DefaultModel = "my-model"
+	})
 
-	resp, err := http.Get(ts.URL + "/v1/models")
+	// 上游清单拉不到：只列配置里的默认模型，不内置任何模型名。
+	out := getModels(t, ts.URL)
+	if out.Object != "list" || len(out.Data) != 1 || out.Data[0].ID != "my-model" || !out.Data[0].Default {
+		t.Fatalf("模型列表错误: %+v", out)
+	}
+}
+
+// fakeFrontendJS 仿 Prism 前端代码：推理强度下拉框的选项与存 localStorage 时的回落值。
+const fakeFrontendJS = `let Ac="medium";function Ad(e){return"low"===e||"medium"===e||"high"===e||"xhigh"===e}` +
+	`let If=[{value:"low",labelKey:"reasoningEffortLowLabel"},{value:"medium",labelKey:"reasoningEffortMediumLabel"},` +
+	`{value:"high",labelKey:"reasoningEffortHighLabel"},{value:"xhigh",labelKey:"reasoningEffortExtraHighLabel"}];` +
+	`x=(0,Au.default)("prism:ai-assistant:reasoning-effort:v1",Ac);`
+
+func getModels(t *testing.T, base string) ModelList {
+	t.Helper()
+	resp, err := http.Get(base + "/v1/models")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-
 	var out ModelList
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if out.Object != "list" || len(out.Data) == 0 {
-		t.Fatalf("模型列表错误: %+v", out)
+	return out
+}
+
+// 模型名、展示名、推理档位与默认模型都取自上游：/api/inference/models + Prism 网页的推理强度选项。
+func TestE2E_ModelsFromUpstreamCatalog(t *testing.T) {
+	up := &fakeUpstream{t: t, frontendJS: fakeFrontendJS}
+	up.setModels("gpt-5.6-sol", "gpt-6-luna")
+	ts, _, srv := newTestServerWithSrv(t, up, goodAccount(), nil)
+	if err := srv.runner.Catalog().Refresh(context.Background(), 0); err != nil {
+		t.Fatal(err)
 	}
-	var found bool
+
+	out := getModels(t, ts.URL)
+	var ids []string
+	byID := map[string]ModelInfo{}
 	for _, m := range out.Data {
-		if m.ID == config.DefaultPrismModel {
-			found = true
-		}
+		ids = append(ids, m.ID)
+		byID[m.ID] = m
 	}
-	if !found {
-		t.Fatalf("默认模型 %s 应当出现在列表里", config.DefaultPrismModel)
+	want := "gpt-5.6-sol,gpt-5.6-sol-low,gpt-5.6-sol-high,gpt-5.6-sol-xhigh,gpt-6-luna,gpt-6-luna-low,gpt-6-luna-high,gpt-6-luna-xhigh"
+	if got := strings.Join(ids, ","); got != want {
+		t.Fatalf("模型列表 = %s\nwant     %s", got, want)
 	}
+	if !byID["gpt-5.6-sol"].Default || byID["gpt-6-luna"].Default {
+		t.Fatalf("默认模型应是上游清单第一个: %+v", out.Data)
+	}
+	if m := byID["gpt-6-luna-xhigh"]; m.Name != "L gpt-6-luna (Extra high)" || m.UpstreamModel != "gpt-6-luna" || m.ReasoningEffort != "xhigh" {
+		t.Fatalf("档位变体不对: %+v", m)
+	}
+	if m := byID["gpt-5.6-sol"]; strings.Join(m.ReasoningEfforts, ",") != "low,medium,high,xhigh" || m.DefaultReasoningEffort != "medium" {
+		t.Fatalf("主条目的档位不对: %+v", m)
+	}
+}
+
+// 上游已下架的模型（客户端还配着它）：直接换成默认模型发，档位后缀保留。
+func TestE2E_RemovedModelUsesDefault(t *testing.T) {
+	up := &fakeUpstream{t: t, frontendJS: fakeFrontendJS}
+	up.setModels("gpt-5.6-sol", "gpt-6-luna")
+	ts, _, srv := newTestServerWithSrv(t, up, goodAccount(), nil)
+	if err := srv.runner.Catalog().Refresh(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"gpt-6.1-sol-xhigh","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	up.mu.Lock()
+	meta, _ := up.startBodies[0]["metadata"].(map[string]any)
+	up.mu.Unlock()
+	if meta["model"] != "gpt-5.6-sol" || meta["reasoning_effort"] != "xhigh" {
+		t.Fatalf("应换成默认模型并保留档位: model=%v effort=%v", meta["model"], meta["reasoning_effort"])
+	}
+}
+
+// 清单还没反映出下架（上次拉取时还在售）：上游回 "Error while processing conversation" 时
+// 网关刷新清单核对，确认下架后立刻换默认模型重发，不按沙箱未就绪重试十次。
+func TestE2E_ModelRemovedMidwaySwitches(t *testing.T) {
+	up := &fakeUpstream{t: t, frontendJS: fakeFrontendJS, goneModels: map[string]bool{"gpt-6.1-sol": true}}
+	ts, _, srv := newTestServerWithSrv(t, up, goodAccount(), func(c *config.Config) {
+		c.Facade.DefaultModel = "gpt-6.1-sol"
+	})
+	// 落盘的旧清单里还有 gpt-6.1-sol（网关重启后载入，还没来得及刷新）。
+	old, _ := json.Marshal(map[string]any{"models": []map[string]string{
+		{"id": "gpt-6.1-sol", "label": "6.1 Sol"}, {"id": "gpt-5.6-sol", "label": "5.6 Sol"}}})
+	srv.runner.UseCatalogStore(stubCatalogStore{data: old})
+	up.setModels("gpt-5.6-sol", "gpt-6-luna")
+
+	started := time.Now()
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"gpt-6.1-sol","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	if d := time.Since(started); d > 5*time.Second {
+		t.Fatalf("不应按沙箱未就绪退避重试，耗时 %s", d)
+	}
+	up.mu.Lock()
+	defer up.mu.Unlock()
+	if len(up.startBodies) != 2 {
+		t.Fatalf("应只重发一次，start 次数 = %d", len(up.startBodies))
+	}
+	meta, _ := up.startBodies[1]["metadata"].(map[string]any)
+	if meta["model"] != "gpt-5.6-sol" {
+		t.Fatalf("重发应换成在售清单第一个模型，得到 %v", meta["model"])
+	}
+}
+
+type stubCatalogStore struct{ data []byte }
+
+func (s stubCatalogStore) SaveModelCatalog([]byte, time.Time) error { return nil }
+func (s stubCatalogStore) LoadModelCatalog() ([]byte, time.Time, error) {
+	return s.data, time.Now(), nil
 }
 
 // ---------------------------- 原样反代 ----------------------------
@@ -1994,14 +2155,11 @@ func readBody(resp *http.Response) (string, error) {
 	return buf.String(), err
 }
 
-// ModelList 是 /v1/models 的最小结构（测试用，避免跨包依赖）。
-type ModelList struct {
-	Object string `json:"object"`
-	Data   []struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	} `json:"data"`
-}
+// ModelList / ModelInfo 是 /v1/models 的返回结构。
+type (
+	ModelList = facade.ModelList
+	ModelInfo = facade.ModelInfo
+)
 
 func TestDashboard_Serving(t *testing.T) {
 	ts, _ := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), nil)

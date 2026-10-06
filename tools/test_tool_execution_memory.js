@@ -69,7 +69,7 @@ async function run() {
   // 轮 1: 要求执行命令
   console.log("\n--- [轮 1] 要求在本地执行命令创建 demo_prism.txt ---");
   const p1 = {
-    model: "gpt-6.1-sol",
+    model: process.env.OAIPRISM_MODEL, // 不设 = 网关的默认模型（跟随上游在售清单）
     stream: true,
     tools: tools,
     input: [
@@ -100,7 +100,7 @@ async function run() {
   ];
 
   const p2 = {
-    model: "gpt-6.1-sol",
+    model: process.env.OAIPRISM_MODEL, // 不设 = 网关的默认模型（跟随上游在售清单）
     stream: true,
     tools: tools,
     input: input2

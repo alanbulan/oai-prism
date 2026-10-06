@@ -19,7 +19,6 @@ import {
 } from '@ant-design/icons';
 import { Bubble, Sender, ThoughtChain, Prompts } from '@ant-design/x';
 import type { ReasoningEffort } from '../../../domain/chat/entity';
-import { effortsForModel } from '../../../domain/modelFilter';
 import { useChatStore } from '../../../application/chat/store';
 import { BrandLogo } from '../../components/BrandLogo';
 import { SPECTRUM } from '../../theme/tokens';
@@ -29,14 +28,14 @@ import { MessageMeta } from './MessageMeta';
 
 const { Text } = Typography;
 
-/** 推理强度档位的展示名（顺序 = 低/中/高/极高） */
-const EFFORT_LABELS: Record<ReasoningEffort, string> = {
+/** 推理强度档位的中文展示名（档位本身来自上游；不认识的档位直接显示原值） */
+const EFFORT_LABELS: Record<string, string> = {
   low: '低 (Low)',
   medium: '中 (Medium)',
   high: '高 (High)',
   xhigh: '极高 (xHigh)',
 };
-const EFFORT_ORDER: ReasoningEffort[] = ['low', 'medium', 'high', 'xhigh'];
+const effortText = (e: ReasoningEffort) => EFFORT_LABELS[e] ?? e;
 
 /** 会话列表一行的高度（含行间距）与分页条高度：每页条数按列表区实际高度算，不留大片空白 */
 const CONV_ROW = 34;
@@ -47,7 +46,6 @@ export const ChatPlaygroundPage: React.FC = () => {
   const { token } = theme.useToken();
   const {
     models,
-    allModelIds,
     sessions,
     currentSessionId,
     selectedModel,
@@ -91,8 +89,8 @@ export const ChatPlaygroundPage: React.FC = () => {
     init();
   }, [init]);
 
-  // 当前模型的可用推理档位（由后端清单中的档位变体推导，如 6 Luna 没有 low）
-  const availableEfforts = effortsForModel(selectedModel, allModelIds);
+  // 当前模型的可用推理档位（由低到高，来自上游；上游没给时为空，不显示档位下拉）
+  const availableEfforts = models.find((m) => m.id === selectedModel)?.efforts ?? [];
 
   // 消息区自动滚底：切换会话时直接到底；流式增量只在用户本就停在底部时跟随，
   // 往上翻阅历史时不被新内容拽回去。
@@ -121,7 +119,7 @@ export const ChatPlaygroundPage: React.FC = () => {
   const activeSession = sessions.find((s) => s.id === currentSessionId);
   const messages = activeSession?.messages || [];
   const currentModel = models.find((m) => m.id === selectedModel);
-  const effortLabel = EFFORT_LABELS[reasoningEffort];
+  const effortLabel = reasoningEffort ? effortText(reasoningEffort) : '默认档位';
 
   const handleSend = () => {
     if (!input.trim() || isStreaming) return;
@@ -273,13 +271,13 @@ export const ChatPlaygroundPage: React.FC = () => {
     onClick: ({ key }: { key: string }) => setModel(key),
   };
 
-  // 推理强度下拉（选项随模型动态变化：各模型的档位由后端配置决定）
+  // 推理强度下拉（选项随模型动态变化：各模型的档位由上游决定）
   const effortMenu = {
-    items: EFFORT_ORDER.filter((e) => availableEfforts.includes(e)).map((e) => ({
+    items: availableEfforts.map((e) => ({
       key: e,
       label: (
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, minWidth: 120 }}>
-          <span>{EFFORT_LABELS[e]}</span>
+          <span>{effortText(e)}</span>
           {e === reasoningEffort && <CheckOutlined style={{ color: token.colorPrimary }} />}
         </div>
       ),
@@ -477,12 +475,14 @@ export const ChatPlaygroundPage: React.FC = () => {
                       <DownOutlined style={{ fontSize: 10, color: token.colorTextTertiary }} />
                     </Button>
                   </Dropdown>
-                  <Dropdown menu={effortMenu} trigger={['click']} placement="topLeft">
-                    <Button type="text" shape="round" icon={<ThunderboltOutlined style={{ color: token.colorWarning }} />}>
-                      {effortLabel}
-                      <DownOutlined style={{ fontSize: 10, color: token.colorTextTertiary }} />
-                    </Button>
-                  </Dropdown>
+                  {availableEfforts.length > 0 && (
+                    <Dropdown menu={effortMenu} trigger={['click']} placement="topLeft">
+                      <Button type="text" shape="round" icon={<ThunderboltOutlined style={{ color: token.colorWarning }} />}>
+                        {effortLabel}
+                        <DownOutlined style={{ fontSize: 10, color: token.colorTextTertiary }} />
+                      </Button>
+                    </Dropdown>
+                  )}
                   <Upload accept="image/*" showUploadList={false} beforeUpload={handleAttach}>
                     <Button type="text" shape="round" icon={<PaperClipOutlined style={{ color: token.colorPrimary }} />} title="附加图片（多模态输入）" />
                   </Upload>

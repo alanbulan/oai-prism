@@ -67,7 +67,7 @@ async function run() {
   // 轮 1
   console.log("\n--- [轮 1] 注入身份与暗号 ---");
   const p1 = {
-    model: "gpt-6.1-sol",
+    model: process.env.OAIPRISM_MODEL, // 不设 = 网关的默认模型（跟随上游在售清单）
     stream: true,
     tools: tools,
     input: [
@@ -81,7 +81,7 @@ async function run() {
   // 轮 2（全量回传前序问答，完全模拟真实 Codex CLI）
   console.log("\n--- [轮 2] 追问名字与暗号（全量回传 input，不传 previousResponseId） ---");
   const p2 = {
-    model: "gpt-6.1-sol",
+    model: process.env.OAIPRISM_MODEL, // 不设 = 网关的默认模型（跟随上游在售清单）
     stream: true,
     tools: tools,
     input: [

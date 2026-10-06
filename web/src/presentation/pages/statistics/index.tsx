@@ -24,7 +24,6 @@ import {
   FieldTimeOutlined,
 } from '@ant-design/icons';
 import { Column, Pie } from '@ant-design/plots';
-import { stripEffort } from '../../../domain/modelFilter';
 import { useStatisticsStore } from '../../../application/statistics/store';
 import { useAccountStore } from '../../../application/account/store';
 import type { RequestLog } from '../../../domain/statistics/entity';
@@ -138,15 +137,14 @@ export const StatisticsPage: React.FC = () => {
     },
   };
 
-  // 现役主模型过滤：以「当前 /v1/models 清单」为准（后端 config 已剔除下线模型），
-  // SQLite 历史流水里的旧模型（astra 系等）与档位变体不再出现在分布图中：
-  //   剥离档位后缀 → 必须在当前清单内；变体调用量归并到主模型（加权平均时延）。
-  const currentModelIds = useStatisticsStore((s) => s.currentModelIds);
+  // 在售模型过滤：以当前 /v1/models（上游在售清单）为准，档位变体的调用量归并到主模型（加权平均时延），
+  // 不在清单里的旧模型不出现在分布图中。
+  const modelMainOf = useStatisticsStore((s) => s.modelMainOf);
   const activeUsages = useMemo(() => {
     const merged = new Map<string, { requests: number; avgLatencyMs: number; tokens: number }>();
     for (const u of modelUsages) {
-      const main = stripEffort(u.model);
-      if (currentModelIds.length > 0 && !currentModelIds.includes(main)) continue;
+      const main = modelMainOf[u.model];
+      if (!main) continue;
       const prev = merged.get(main) || { requests: 0, avgLatencyMs: 0, tokens: 0 };
       // 加权平均时延
       const total = prev.requests + u.requests;
@@ -167,7 +165,7 @@ export const StatisticsPage: React.FC = () => {
         percentage: Math.round((v.requests / totalReq) * 1000) / 10,
       }))
       .sort((a, b) => b.requests - a.requests);
-  }, [modelUsages, currentModelIds]);
+  }, [modelUsages, modelMainOf]);
 
   // 流水筛选用原始模型名（含档位变体），按调用量排序
   const modelOptions = useMemo(

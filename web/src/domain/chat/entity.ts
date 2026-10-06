@@ -5,9 +5,13 @@
 export interface ChatModelInfo {
   id: string;
   name: string;
+  /** 可用推理档位（由低到高）与默认档位 —— 来自上游，空数组表示上游没给（档位原样透传） */
+  efforts: ReasoningEffort[];
+  defaultEffort: ReasoningEffort;
 }
 
-export type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
+/** 推理档位（low / medium / high / xhigh …），取值以上游为准，前端不写死 */
+export type ReasoningEffort = string;
 
 /** 一轮推理的 token 用量（OpenAI include_usage 语义） */
 export interface ChatUsage {
@@ -85,9 +89,10 @@ export interface SendMessageOptions {
 }
 
 export interface IChatRepository {
-  fetchModelCatalog(): Promise<{ mains: ChatModelInfo[]; allIds: string[] }>;
+  fetchModelCatalog(): Promise<{ mains: ChatModelInfo[]; defaultModel?: string }>;
   sendMessageStream(options: SendMessageOptions): Promise<void>;
-  listSessions(): Promise<ChatSession[]>;
+  /** defaultModel：服务端还没有会话时，引导会话用的模型 */
+  listSessions(defaultModel?: ChatModelInfo): Promise<ChatSession[]>;
   saveSession(session: ChatSession): Promise<void>;
   deleteSession(id: string): Promise<void>;
   // 以下只读写浏览器本地存储

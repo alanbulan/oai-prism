@@ -134,7 +134,7 @@ func (s *SQLiteStore) initSchema() error {
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);
 	`
-	_, err := s.db.Exec(schema + nativeBindingsSchema)
+	_, err := s.db.Exec(schema + nativeBindingsSchema + modelCatalogSchema)
 	if err != nil {
 		return fmt.Errorf("初始化 sqlite 表结构失败: %w", err)
 	}

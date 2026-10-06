@@ -110,29 +110,37 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = enc.Encode(v)
 }
 
-// resolveModel 把对外模型名映射到上游模型与推理强度。
+// resolveModel 把对外模型名映射到上游模型与推理强度（模型名与档位取自上游在售清单，见 catalog.go）。
 //
 // 解析优先级（后者覆盖前者）：
 //
-//	默认模型  <  models 映射表  <  客户端显式 reasoning_effort  <  X-Oaiprism-* 头
+//	默认档位  <  名字自带的档位（"<id>-high"、models 映射表）  <  客户端显式 reasoning_effort  <  X-Oaiprism-* 头
 func (h *Handler) resolveModel(requested, effort string) (model string, outEffort string) {
-	f := &h.cfg.Facade
+	res := h.catalog().resolve(&h.cfg.Facade, requested, effort)
+	return res.Model, res.Effort
+}
 
-	model = strings.TrimSpace(requested)
-	if model == "" {
-		model = f.DefaultModel
+// resolveRequest 解析本请求的模型，返回上游模型、推理强度与实际用的对外名。没带模型、或请求的模型
+// 上游已不在售而换成了默认模型时，流水记实际用的名字。
+// X-Oaiprism-Model 头直接指定上游模型，由 applyHeaderOverrides 覆盖，这里不做替换。
+func (h *Handler) resolveRequest(r *http.Request, requested, effort string) (model, outEffort, name string) {
+	if r.Header.Get(HeaderModel) != "" {
+		res := (*ModelCatalog)(nil).resolve(&h.cfg.Facade, requested, effort)
+		return res.Model, res.Effort, res.Name
 	}
-	outEffort = strings.TrimSpace(effort)
+	res := h.catalog().resolve(&h.cfg.Facade, requested, effort)
+	if res.Substituted || strings.TrimSpace(requested) == "" {
+		middleware.RecordLogModel(r, res.Name)
+	}
+	return res.Model, res.Effort, res.Name
+}
 
-	if m, ok := f.Models[model]; ok {
-		if m.Model != "" {
-			model = m.Model
-		}
-		if outEffort == "" && m.ReasoningEffort != "" {
-			outEffort = m.ReasoningEffort
-		}
+// catalog 返回上游在售模型清单；没有运行器（单元测试）时为 nil，等同于清单未知。
+func (h *Handler) catalog() *ModelCatalog {
+	if h.runner == nil {
+		return nil
 	}
-	return model, outEffort
+	return h.runner.catalog
 }
 
 // applyHeaderOverrides 处理 X-Oaiprism-* 头的覆盖。

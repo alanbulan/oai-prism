@@ -21,7 +21,7 @@ async function testMultimodal() {
   console.log(`准备发送图片: ${testDescription}, base64 长度: ${b64ToSend.length}`);
 
   const payload = {
-    model: "gpt-6.1-sol",
+    model: process.env.OAIPRISM_MODEL, // 不设 = 网关的默认模型（跟随上游在售清单）
     stream: false,
     input: [
       {

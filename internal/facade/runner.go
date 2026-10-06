@@ -172,6 +172,8 @@ type Runner struct {
 	app     *metrics.App
 	// nativeStore 让原生续接的绑定落盘（见 native_store.go）；nil 时只在内存里。
 	nativeStore NativeStore
+	// catalog 是上游在售模型清单（见 catalog.go）。
+	catalog *ModelCatalog
 
 	bucketSeq atomic.Uint64
 
@@ -192,6 +194,7 @@ func NewRunner(cfg *config.Config, log *slog.Logger, pool *account.Pool, client 
 		app:            app,
 		accountRetries: 2,
 	}
+	r.catalog = newModelCatalog(cfg, log, r.fetchCatalog)
 	go r.projects.gc(context.Background())
 	go r.sandboxes.gc(context.Background())
 	go func() {
@@ -555,6 +558,15 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		}
 		if !isSandboxNotReady(startResp) {
 			break
+		}
+		// 下架的模型上游也只回这句 400：第一次碰到时核对一下在售清单，已下架就换默认模型再发，
+		// 不必按沙箱未就绪白等五分钟（2026-10-06 gpt-6.1-sol 下架）。
+		if attempt == 1 && isProcessingError(startResp) {
+			if m, e, ok := r.catalog.replacement(ctx, &r.cfg.Facade, req.Model, req.Effort); ok {
+				r.log.Warn("上游已不再提供该模型，改用在售清单里的默认模型", "model", req.Model, "now", m, "effort", e)
+				req.Model, req.Effort = m, e
+				continue
+			}
 		}
 		r.app.SandboxOps.Inc("start", "not_ready")
 		r.log.Info("沙箱未就绪，稍后重试",
@@ -1251,6 +1263,13 @@ func isSandboxNotReady(resp *prism.StartResponse) bool {
 		return true
 	}
 	return false
+}
+
+// isProcessingError 报告 start 是否失败于 "Error while processing conversation"：沙箱没就绪、
+// 模型已下架时上游都回这一句。
+func isProcessingError(resp *prism.StartResponse) bool {
+	return resp != nil && resp.Initial != nil && resp.Initial.Fail &&
+		strings.Contains(strings.ToLower(resp.Initial.Error), "error while processing conversation")
 }
 
 func sandboxReason(resp *prism.StartResponse) string {

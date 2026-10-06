@@ -8,7 +8,7 @@ import type {
   RequestLogQueryResult,
   IStatisticsRepository,
 } from '../../domain/statistics/entity';
-import { pickMainModels } from '../../domain/modelFilter';
+import type { ModelEntry } from '../../domain/modelFilter';
 import { httpClient } from '../http/client';
 
 export class StatisticsRepositoryImpl implements IStatisticsRepository {
@@ -81,15 +81,15 @@ export class StatisticsRepositoryImpl implements IStatisticsRepository {
     };
   }
 
-  /** 当前对外模型 id 清单（configs 的 models 映射，已剔除下线/别名）——
-   *  统计聚合用它过滤 SQLite 历史流水里的旧模型。 */
-  async getAvailableModelIds(): Promise<string[]> {
+  /** 对外模型名 → 上游模型（来自 /v1/models，即上游在售清单）。统计聚合按它把档位变体归到主模型，
+   *  不在清单里的（已下架的旧模型）不计入分布图。 */
+  async getModelMainMap(): Promise<Record<string, string>> {
     try {
       const res = await httpClient.get<any>('/v1/models');
-      const data = res.data?.data || [];
-      return pickMainModels(data).map((m: any) => m.id);
+      const data: ModelEntry[] = Array.isArray(res.data?.data) ? res.data.data : [];
+      return Object.fromEntries(data.filter((m) => m.upstream_model).map((m) => [m.id, m.upstream_model as string]));
     } catch {
-      return [];
+      return {};
     }
   }
 

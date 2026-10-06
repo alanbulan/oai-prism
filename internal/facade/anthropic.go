@@ -41,7 +41,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	if mapped != req.Model && r.Header.Get(HeaderModel) == "" {
 		middleware.RecordLogModel(r, mapped) // 流水记实际用的模型，不是客户端发来的 claude-*
 	}
-	model, effort := h.resolveModel(mapped, "")
+	model, effort, _ := h.resolveRequest(r, mapped, "")
 	accountID, projectID := applyHeaderOverrides(r, &model, &effort)
 
 	// 工具桥：声明了工具的客户端（Claude Code）由上游决策、本地执行（见 anthropic_bridge.go）。
@@ -153,22 +153,18 @@ func (h *Handler) anthropicBridgeOutcome(r *http.Request, runReq *RunRequest, bt
 	return prose, calls
 }
 
-// anthropicModel 把模型表里没有的名字换成默认模型。
+// anthropicModel 把认不出的名字换成默认模型。
 //
 // Claude Code 发的是 claude-sonnet-4-5 这类名字，原样交给上游会整轮回
 // "Error while processing conversation (400)"，又被当成沙箱未就绪重试 10 次 —— 客户端
 // 卡上五六分钟后失败（2026-10-05 实测）。回给客户端的仍是它请求的名字。
 func (h *Handler) anthropicModel(requested string) string {
 	f := &h.cfg.Facade
-	if _, ok := f.Models[requested]; ok || requested == "" || requested == f.DefaultModel {
+	cat := h.catalog()
+	if requested == "" || cat.known(f, requested) {
 		return requested
 	}
-	for _, m := range f.Models {
-		if m.Model == requested {
-			return requested
-		}
-	}
-	return f.DefaultModel
+	return cat.defaultName(f)
 }
 
 var anthropicKnownFields = map[string]struct{}{

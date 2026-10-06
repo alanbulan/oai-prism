@@ -37,7 +37,10 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	if strings.TrimSpace(effort) == "" {
 		effort = metadataEffort(rawFields)
 	}
-	model, resolvedEffort := h.resolveModel(req.Model, effort)
+	model, resolvedEffort, name := h.resolveRequest(r, req.Model, effort)
+	if strings.TrimSpace(req.Model) == "" {
+		req.Model = name // 回给客户端实际用的默认模型（请求了别的名字时照旧回它请求的名字）
+	}
 	effort = resolvedEffort
 	accountID, projectID := applyHeaderOverrides(r, &model, &effort)
 

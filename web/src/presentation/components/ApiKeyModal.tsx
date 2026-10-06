@@ -3,6 +3,7 @@ import { Modal, Table, Button, Space, Typography, message, Input, Tabs, Popconfi
 import { KeyOutlined, CopyOutlined, PlusOutlined, DeleteOutlined, CodeOutlined } from '@ant-design/icons';
 import { getApiKey, setApiKey, httpClient } from '../../infrastructure/http/client';
 import { formatDateTime } from '../utils/format';
+import { defaultMainModel } from '../../domain/modelFilter';
 
 const { Text, Paragraph } = Typography;
 
@@ -24,6 +25,8 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
   const [newKeyName, setNewKeyName] = useState('');
   const [manualKey, setManualKey] = useState('');
   const [loadError, setLoadError] = useState('');
+  // 示例里的模型名：网关当前的默认模型（上游在售清单第一个），不写死
+  const [exampleModel, setExampleModel] = useState('');
 
   const fetchKeys = async (): Promise<ApiKeyItem[]> => {
     setLoading(true);
@@ -46,6 +49,10 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
   useEffect(() => {
     if (open) {
       fetchKeys();
+      httpClient
+        .get<any>('/v1/models')
+        .then((res) => setExampleModel(defaultMainModel(Array.isArray(res.data?.data) ? res.data.data : []) ?? ''))
+        .catch(() => setExampleModel(''));
     }
   }, [open]);
 
@@ -157,12 +164,13 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
   ];
 
   const firstKey = getApiKey() || keys[0]?.key || '<你的 API Key>';
+  const model = exampleModel || '<模型名，见 GET /v1/models>';
 
   const curlExample = `curl http://localhost:8787/v1/chat/completions \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer ${firstKey}" \\
   -d '{
-    "model": "gpt-6.1-sol",
+    "model": "${model}",
     "messages": [{"role": "user", "content": "你好！"}]
   }'`;
 
@@ -174,14 +182,14 @@ client = OpenAI(
 )
 
 resp = client.chat.completions.create(
-    model="gpt-6.1-sol",
+    model="${model}",
     messages=[{"role": "user", "content": "你好！"}]
 )
 print(resp.choices[0].message.content)`;
 
   const codexExample = `# ~/.codex/config.toml
 model_provider = "oaiprism"
-model = "gpt-6.1-sol"
+model = "${model}"
 model_context_window = 16384
 
 [model_providers.oaiprism]

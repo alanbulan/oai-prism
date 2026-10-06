@@ -39,6 +39,7 @@ type Server struct {
 	store  *account.Store
 	sqlite *account.SQLiteStore
 	rec    *capture.Recorder
+	runner *facade.Runner
 	srv    *http.Server
 	gwPort string // 网关自身端口（OAuth 回调降级路由用）
 
@@ -132,6 +133,8 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	if sqliteErr == nil {
 		// 原生续接的会话绑定落盘：网关重启后客户端会话接回原来的上游会话（见 facade/native_store.go）。
 		runner.UseNativeStore(sqliteStore)
+		// 上游在售模型清单落盘：重启后立即可用，不必等第一次拉取（见 facade/catalog.go）。
+		runner.UseCatalogStore(sqliteStore)
 	}
 	facadeHandler := facade.NewHandler(cfg, log, runner, app)
 	rawHandler := rawproxy.New(cfg, log, pool, client, app, rec)
@@ -144,6 +147,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		store:  store,
 		sqlite: sqliteStore,
 		rec:    rec,
+		runner: runner,
 		admins: newAdminSessions(),
 	}
 	if sqliteStore != nil {
@@ -554,6 +558,20 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 		s.log.Info("账号池已手动重载", "count", s.pool.Size())
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"accounts": s.pool.Size()})
+	})
+
+	// 上游在售模型清单（/v1/models、默认模型与推理档位的来源，见 facade/catalog.go）。
+	mux.HandleFunc("GET /admin/models/catalog", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(runner.Catalog().Status())
+	})
+	mux.HandleFunc("POST /admin/models/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if err := runner.Catalog().Refresh(r.Context(), 0); err != nil {
+			writeAdminErr(w, http.StatusBadGateway, "拉取上游模型清单失败: "+err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(runner.Catalog().Status())
 	})
 
 	mux.HandleFunc("GET /admin/stats", func(w http.ResponseWriter, r *http.Request) {
@@ -1022,6 +1040,8 @@ func (s *Server) Run(ctx context.Context) error {
 	defer bgCancel()
 
 	s.pool.StartBackground(bgCtx)
+	// 上游在售模型清单：启动时拉一次，之后定时刷新。
+	s.runner.Catalog().Start(bgCtx)
 	// 凭据文件热重载只在没有 SQLite 时启用：有 SQLite 时文件里的令牌早已过时
 	// （续期轮换只写回数据库），按文件重建会丢掉控制台导入的账号、换回作废的令牌。
 	if (s.cfg.Creds.Mode == "file" || s.cfg.Creds.Mode == "hybrid") && s.sqlite == nil {

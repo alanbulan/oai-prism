@@ -110,8 +110,10 @@ go build -o oaiprism.exe ./cmd/oaiprism
 curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer $OAIPRISM_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-6.1-sol","stream":true,"messages":[{"role":"user","content":"你好"}]}'
+  -d '{"stream":true,"messages":[{"role":"user","content":"你好"}]}'
 ```
+
+不带 `model` 时用上游当前的默认模型；可用的模型名见 `GET /v1/models`。
 
 ## 接入客户端
 
@@ -119,7 +121,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 ```toml
 model_provider = "oaiprism"
-model = "gpt-6.1-sol"
+model = "gpt-5.6-sol"            # 任选 GET /v1/models 里的名字；上游下架后网关自动改用默认模型
 model_context_window = 1000000
 
 [model_providers.oaiprism]
@@ -138,7 +140,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="<你的 Key>")
 resp = client.chat.completions.create(
-    model="gpt-6.1-sol",
+    model="gpt-5.6-sol",
     messages=[{"role": "user", "content": "你好"}],
 )
 print(resp.choices[0].message.content)
@@ -154,7 +156,7 @@ import anthropic
 
 client = anthropic.Anthropic(base_url="http://127.0.0.1:8787", api_key="<你的 Key>")
 msg = client.messages.create(
-    model="gpt-6.1-sol",
+    model="gpt-5.6-sol",  # claude-* 等认不出的名字会换成默认模型
     max_tokens=1024,
     messages=[{"role": "user", "content": "你好"}],
 )
@@ -166,14 +168,15 @@ print(msg.content[0].text)
 <details>
 <summary><b>可用模型</b></summary>
 
-| 模型 | 推理强度变体 |
-|---|---|
-| `gpt-6.1-sol`（默认） | `-low` / `-high` / `-xhigh` |
-| `gpt-6-luna` | `-high` / `-xhigh` |
-| `gpt-5.6-sol` | `-low` / `-high` / `-xhigh` |
-| `gpt-5.6-terra` | `-high` / `-xhigh` |
+模型名、展示名和推理档位都跟着上游走，网关不内置任何模型清单：
 
-以 `GET /v1/models` 为准，映射表在 `facade.models` 中可按需增删。
+- 在售模型取自 Prism 网页模型下拉框的来源（`/api/inference/models`），按上游的顺序，第一个是默认模型；
+- 推理档位取自 Prism 网页的推理强度选项，每个非默认档位对应一个 `<模型>-<档位>` 变体（如 `gpt-5.6-sol-high`），
+  也可以用请求里的 `reasoning_effort` / `reasoning.effort` 指定；
+- 网关启动时拉取，之后每 30 分钟刷新；上游下架的模型（客户端还配着它）自动改用默认模型。
+
+以 `GET /v1/models` 为准。2026-10-06 的上游清单：`gpt-5.6-sol`（默认）、`gpt-5.6-terra`、`gpt-6-luna`，
+档位 `low` / `medium`（默认）/ `high` / `xhigh`。自定义别名可写在 `facade.models`。
 
 </details>
 

@@ -50,19 +50,27 @@ func waitLogs(t *testing.T, base string, n int) []logRow {
 }
 
 func TestRequestLog_ActualModel(t *testing.T) {
-	ts, _, srv := newTestServerWithSrv(t, &fakeUpstream{t: t}, goodAccount(), nil)
-	// Claude Code 发 claude-* 模型名：流水记网关实际用的默认模型；OpenAI 客户端请求的名字照记
-	if code, out := doLocal(t, http.MethodPost, ts.URL+"/v1/messages",
-		`{"model":"claude-x","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}`, jsonHdr); code != http.StatusOK {
-		t.Fatalf("状态码 %d: %s", code, out)
+	up := &fakeUpstream{t: t, frontendJS: fakeFrontendJS}
+	up.setModels("gpt-5.6-sol", "gpt-6-luna")
+	ts, _, srv := newTestServerWithSrv(t, up, goodAccount(), nil)
+	if err := srv.runner.Catalog().Refresh(context.Background(), 0); err != nil {
+		t.Fatal(err)
 	}
-	if code, out := doLocal(t, http.MethodPost, ts.URL+"/v1/chat/completions",
-		`{"model":"gpt-5","messages":[{"role":"user","content":"你好"}]}`, jsonHdr); code != http.StatusOK {
-		t.Fatalf("状态码 %d: %s", code, out)
+	// Claude Code 发 claude-* 模型名、OpenAI 客户端还配着已下架的模型或没带模型：流水记网关实际用的
+	// 默认模型；在售的名字照记。
+	for _, c := range []struct{ path, body string }{
+		{"/v1/messages", `{"model":"claude-x","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}`},
+		{"/v1/chat/completions", `{"model":"gpt-6.1-sol","messages":[{"role":"user","content":"你好"}]}`},
+		{"/v1/chat/completions", `{"model":"gpt-6-luna-high","messages":[{"role":"user","content":"你好"}]}`},
+		{"/v1/chat/completions", `{"messages":[{"role":"user","content":"你好"}]}`},
+	} {
+		if code, out := doLocal(t, http.MethodPost, ts.URL+c.path, c.body, jsonHdr); code != http.StatusOK {
+			t.Fatalf("状态码 %d: %s", code, out)
+		}
 	}
-	rows := waitLogs(t, ts.URL, 2)
-	if rows[0].Model != "gpt-5" || rows[1].Model != srv.cfg.Facade.DefaultModel {
-		t.Fatalf("流水模型不对: chat=%q messages=%q（默认模型 %q）", rows[0].Model, rows[1].Model, srv.cfg.Facade.DefaultModel)
+	rows := waitLogs(t, ts.URL, 4)
+	if rows[0].Model != "gpt-5.6-sol" || rows[1].Model != "gpt-6-luna-high" || rows[2].Model != "gpt-5.6-sol" || rows[3].Model != "gpt-5.6-sol" {
+		t.Fatalf("流水模型不对: %+v", rows[:4])
 	}
 }
 

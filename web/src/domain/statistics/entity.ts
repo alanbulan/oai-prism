@@ -88,7 +88,7 @@ export interface IStatisticsRepository {
   getAdminStats(): Promise<GlobalAdminStats>;
   getModelUsages(): Promise<ModelUsage[]>;
   getTimeSeries(): Promise<TimeSeriesPoint[]>;
-  getAvailableModelIds(): Promise<string[]>;
+  getModelMainMap(): Promise<Record<string, string>>;
   queryRequestLogs(filter: RequestLogFilter): Promise<RequestLogQueryResult>;
 }
 

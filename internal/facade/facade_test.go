@@ -892,10 +892,9 @@ func TestIssue256_ModelAliases(t *testing.T) {
 		t.Errorf("prism-sol 应原样透传（不再内置重定向）: got %q", m1)
 	}
 
-	// 已下线模型（astra 系）与历史别名（prism-sol / gpt-5 / 短别名等）已于
-	// 2026-10-02 从对外清单整体移除（configs/config.yaml 与内置默认同步）：
-	// /v1/models 不再展示，resolveModel 也不再重定向 —— 未知名原样透传，
-	// 由上游决定行为。这里锁定的是"清单干净、无隐藏别名"这个契约。
+	// 代码与默认配置里不内置任何模型名或别名：上游在售清单未知时（这里没有运行器），
+	// 未知名原样透传，由上游决定行为；清单已知时的替换见 catalog_test.go。
+	// 这里锁定的是"无隐藏别名"这个契约。
 	m2, _ := h.resolveModel("prism-astra", "")
 	if m2 != "prism-astra" {
 		t.Errorf("prism-astra 应原样透传（不再内置重定向）: got %q", m2)

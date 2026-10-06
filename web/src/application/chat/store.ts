@@ -1,15 +1,14 @@
 import { create } from 'zustand';
 import type { ChatAttachment, ChatMessage, ChatModelInfo, ChatSession, ChatSessionPrefs, ReasoningEffort } from '../../domain/chat/entity';
-import { effortsForModel } from '../../domain/modelFilter';
 import { ChatRepositoryImpl } from '../../infrastructure/repositories/chat.repo.impl';
 
 const repo = new ChatRepositoryImpl();
 
-const FALLBACK_MODEL = 'gpt-6.1-sol';
-
 interface ChatState {
+  /** 在售主模型（含各自的推理档位），来自后端 /v1/models —— 即上游在售清单 */
   models: ChatModelInfo[];
-  allModelIds: string[]; // 全量 id（含档位变体）—— 推导各模型的可用推理档位
+  /** 默认模型（上游清单第一个，或配置的 default_model） */
+  defaultModel: string;
   sessions: ChatSession[];
   currentSessionId: string | null;
   /** 当前会话的模型与推理强度：每个会话各记各的（浏览器本地），切换会话时随之切换 */
@@ -29,12 +28,14 @@ interface ChatState {
   sendMessage: (text: string, attachments?: ChatAttachment[]) => Promise<void>;
 }
 
-/** 推理强度落到模型支持的档位上：不支持就回落 medium（各模型的档位由后端配置决定，如 6 Luna 没有 low） */
-function fitEffort(model: string, allIds: string[], ...wanted: (ReasoningEffort | undefined)[]): ReasoningEffort {
-  const available = effortsForModel(model, allIds);
+/** 推理强度落到模型支持的档位上：不支持就用该模型的默认档位（档位由上游决定）。上游没给档位时原样沿用。 */
+function fitEffort(model: string, models: ChatModelInfo[], ...wanted: (ReasoningEffort | undefined)[]): ReasoningEffort {
+  const info = models.find((m) => m.id === model);
+  const available = info?.efforts ?? [];
+  if (available.length === 0) return wanted.find((e): e is ReasoningEffort => !!e) ?? '';
   return (
     wanted.find((e): e is ReasoningEffort => !!e && available.includes(e)) ??
-    (available.includes('medium') ? 'medium' : (available[0] ?? 'medium'))
+    (info?.defaultEffort && available.includes(info.defaultEffort) ? info.defaultEffort : available[0])
   );
 }
 
@@ -42,16 +43,19 @@ function fitEffort(model: string, allIds: string[], ...wanted: (ReasoningEffort 
  * 会话的模型与推理强度：本地记过的优先，其次是会话建立时的设置，最后沿用当前选择。
  * 模型已下线（不在清单里）时回落到清单第一个。
  */
-function prefsFor(session: ChatSession | undefined, state: Pick<ChatState, 'models' | 'allModelIds' | 'selectedModel' | 'reasoningEffort'>): ChatSessionPrefs {
+function prefsFor(
+  session: ChatSession | undefined,
+  state: Pick<ChatState, 'models' | 'defaultModel' | 'selectedModel' | 'reasoningEffort'>,
+): ChatSessionPrefs {
   const saved = session ? repo.loadSessionPrefs(session.id) : null;
   const ids = state.models.map((m) => m.id);
   const model =
-    [saved?.model, session?.model, state.selectedModel].find((m): m is string => !!m && ids.includes(m)) ??
+    [saved?.model, session?.model, state.selectedModel, state.defaultModel].find((m): m is string => !!m && ids.includes(m)) ??
     ids[0] ??
-    FALLBACK_MODEL;
+    '';
   return {
     model,
-    effort: fitEffort(model, state.allModelIds, saved?.effort, session?.reasoningEffort, state.reasoningEffort),
+    effort: fitEffort(model, state.models, saved?.effort, session?.reasoningEffort, state.reasoningEffort),
   };
 }
 
@@ -64,26 +68,27 @@ function patchMessage(sessions: ChatSession[], sessionId: string, msgId: string,
 
 export const useChatStore = create<ChatState>((set, get) => ({
   models: [],
-  allModelIds: [],
+  defaultModel: '',
   sessions: [],
   currentSessionId: null,
-  selectedModel: FALLBACK_MODEL,
-  reasoningEffort: 'medium',
+  selectedModel: '',
+  reasoningEffort: '',
   isStreaming: false,
   loaded: false,
 
   init: async () => {
     // 生成中离开页面再回来：不重新拉取，免得把正在写入的回复覆盖掉
     if (get().isStreaming) return;
-    const [{ mains, allIds }, sessions] = await Promise.all([repo.fetchModelCatalog(), repo.listSessions()]);
+    const { mains, defaultModel = '' } = await repo.fetchModelCatalog();
+    const sessions = await repo.listSessions(mains.find((m) => m.id === defaultModel) ?? mains[0]);
     // 回到上次打开的会话（页面内切换、离开页面再回来、刷新浏览器都一样）
     const keep = [get().currentSessionId, repo.loadActiveSessionId()].find((id) => id && sessions.some((s) => s.id === id));
     const currentSessionId = keep ?? sessions[0]?.id ?? null;
-    const base = { models: mains, allModelIds: allIds, selectedModel: get().selectedModel, reasoningEffort: get().reasoningEffort };
+    const base = { models: mains, defaultModel, selectedModel: get().selectedModel, reasoningEffort: get().reasoningEffort };
     const prefs = prefsFor(sessions.find((s) => s.id === currentSessionId), base);
     set({
       models: mains,
-      allModelIds: allIds,
+      defaultModel,
       sessions,
       currentSessionId,
       selectedModel: prefs.model,
@@ -142,8 +147,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   setModel: (model: string) => {
-    const { allModelIds, reasoningEffort, currentSessionId } = get();
-    const effort = fitEffort(model, allModelIds, reasoningEffort);
+    const { models, reasoningEffort, currentSessionId } = get();
+    const effort = fitEffort(model, models, reasoningEffort);
     if (currentSessionId) repo.saveSessionPrefs(currentSessionId, { model, effort });
     set({ selectedModel: model, reasoningEffort: effort });
   },

@@ -267,6 +267,8 @@ type FacadeConfig struct {
 	Enabled bool     `yaml:"enabled"`
 	APIKeys []string `yaml:"api_keys"` // 空 = 不校验（仅建议本地）
 
+	// DefaultModel 是请求没带模型时用的对外模型名。留空 = 跟随上游：取上游在售清单里的
+	// 第一个（与 Prism 网页的默认选择一致）。配了但上游已不再提供时同样回落到清单第一个。
 	DefaultModel string `yaml:"default_model"`
 
 	// LocalWorkspaceWrite 允许 chat 接口按 X-Local-Workspace 请求头把上游
@@ -291,9 +293,20 @@ type FacadeConfig struct {
 	// 默认 96 KiB，给上游自己的包装文本留余量；设为 -1 关闭检查。
 	MaxPromptBytes int `yaml:"max_prompt_bytes"`
 
-	// Models 把对外模型名映射到 Prism 内部的 model / reasoning effort。
-	// 例：gpt-5-codex-fast -> {model: gpt-5, effort: high}
+	// Models 是手写的对外模型名 -> 上游 model / reasoning effort 映射（可选，优先于上游清单）。
+	// 例：codex-fast -> {model: gpt-5.6-sol, reasoning_effort: low}
+	//
+	// 模型名、展示名与推理档位默认全部来自上游（见 ModelCatalog），这里只放自定义别名。
+	// 映射到的上游模型已不在售时，按默认模型处理。
 	Models map[string]ModelMapping `yaml:"models"`
+
+	// ModelCatalog 控制从上游拉取在售模型清单（internal/facade/catalog.go）。
+	ModelCatalog ModelCatalogConfig `yaml:"model_catalog"`
+
+	// ReasoningEfforts / DefaultReasoningEffort 只在上游没给出推理档位时兜底（由低到高）。
+	// 档位平时取自 Prism 网页的推理强度选项；留空 = 不兜底，客户端给什么档位就原样交给上游。
+	ReasoningEfforts       []string `yaml:"reasoning_efforts"`
+	DefaultReasoningEffort string   `yaml:"default_reasoning_effort"`
 
 	// 上游协议字段名——留成可配置是因为这套内部 API 会变，
 	// 改字段不该逼着重新编译。
@@ -361,6 +374,15 @@ func (f FacadeConfig) RateLimitPerSecond() float64 { return f.RatePerSecond }
 
 // RateLimitBurst 返回令牌桶容量。
 func (f FacadeConfig) RateLimitBurst() int { return f.RateBurst }
+
+// ModelCatalogConfig 控制上游在售模型清单的拉取。
+type ModelCatalogConfig struct {
+	// Enabled 默认开启：/v1/models、默认模型与推理档位都跟着上游走。
+	Enabled bool `yaml:"enabled"`
+	// RefreshInterval 是定时刷新的间隔（默认 30 分钟）。上游对某个模型回
+	// "Error while processing conversation" 时会提前刷新一次，确认它是否已下架。
+	RefreshInterval time.Duration `yaml:"refresh_interval"`
+}
 
 // ModelMapping 对外模型名 -> 上游参数。
 type ModelMapping struct {
@@ -546,31 +568,9 @@ func Default() *Config {
 			HealthCheckTimeout:  15 * time.Second,
 		},
 		Facade: FacadeConfig{
-			Enabled:      true,
-			DefaultModel: DefaultPrismModel,
-			// 内置清单 = 4 个现役模型 x 各自的推理档位，与 configs/config.yaml 保持一致。
-			// 已下线模型（astra 系）与历史别名（gpt-5、短别名等）不再内置 —— 以
-			// Statsig prism_codex_models 实测清单为准，维护时同步改这里和 yaml。
-			Models: map[string]ModelMapping{
-				// 6.1 Sol（当前旗舰）
-				"gpt-6.1-sol":       {Model: "gpt-6.1-sol", ReasoningEffort: "medium", Label: "6.1 Sol"},
-				"gpt-6.1-sol-low":   {Model: "gpt-6.1-sol", ReasoningEffort: "low", Label: "6.1 Sol (Low)"},
-				"gpt-6.1-sol-high":  {Model: "gpt-6.1-sol", ReasoningEffort: "high", Label: "6.1 Sol (High)"},
-				"gpt-6.1-sol-xhigh": {Model: "gpt-6.1-sol", ReasoningEffort: "xhigh", Label: "6.1 Sol (Extra High)"},
-				// 6 Luna
-				"gpt-6-luna":       {Model: "gpt-6-luna", ReasoningEffort: "medium", Label: "6 Luna"},
-				"gpt-6-luna-high":  {Model: "gpt-6-luna", ReasoningEffort: "high", Label: "6 Luna (High)"},
-				"gpt-6-luna-xhigh": {Model: "gpt-6-luna", ReasoningEffort: "xhigh", Label: "6 Luna (Extra High)"},
-				// 5.6 Sol
-				"gpt-5.6-sol":       {Model: "gpt-5.6-sol", ReasoningEffort: "medium", Label: "5.6 Sol"},
-				"gpt-5.6-sol-low":   {Model: "gpt-5.6-sol", ReasoningEffort: "low", Label: "5.6 Sol (Low)"},
-				"gpt-5.6-sol-high":  {Model: "gpt-5.6-sol", ReasoningEffort: "high", Label: "5.6 Sol (High)"},
-				"gpt-5.6-sol-xhigh": {Model: "gpt-5.6-sol", ReasoningEffort: "xhigh", Label: "5.6 Sol (Extra High)"},
-				// 5.6 Terra
-				"gpt-5.6-terra":       {Model: "gpt-5.6-terra", ReasoningEffort: "medium", Label: "5.6 Terra"},
-				"gpt-5.6-terra-high":  {Model: "gpt-5.6-terra", ReasoningEffort: "high", Label: "5.6 Terra (High)"},
-				"gpt-5.6-terra-xhigh": {Model: "gpt-5.6-terra", ReasoningEffort: "xhigh", Label: "5.6 Terra (Extra High)"},
-			},
+			Enabled: true,
+			// 模型名、展示名与推理档位不再内置：全部取自上游在售清单（facade/catalog.go）。
+			ModelCatalog:        ModelCatalogConfig{Enabled: true, RefreshInterval: 30 * time.Minute},
 			Schema:              defaultSchema(),
 			ReuseProject:        true,
 			ProjectTTL:          30 * time.Minute,
@@ -720,17 +720,6 @@ const DefaultFacadeSystemPrompt = "You are a helpful assistant. Answer the user'
 // DefaultFacadeMaxPromptBytes 是 facade.max_prompt_bytes 的默认值（见 FacadeConfig.MaxPromptBytes）。
 const DefaultFacadeMaxPromptBytes = 96 << 10
 
-// DefaultPrismModel 是上游对话模型的默认值。
-//
-// 来自前端 bundle 里的 `let n="gpt-5.6-sol"`（UI 显示为 "5.6 Sol"）。
-// 真实可用列表由 Statsig 开关 prism_codex_models 动态下发，
-// 因此这个值可能随上游灰度变化 —— 变更时改配置即可，不用改代码。
-// 清单来源：Statsig 动态配置 prism_codex_models（2026-10 实测）。
-// 上游会下线/新增模型：gpt-6-astra 已下线（上游路由到
-// codex_v2_restore_start 并返回 400，无创建入口），
-// gpt-6.1-sol / gpt-6-luna 为当前在售。维护时以该配置为准。
-const DefaultPrismModel = "gpt-6.1-sol"
-
 const (
 	// DefaultUserAgent 与 Codex CLI 保持一致的形态，避免被上游按"未知客户端"降级。
 	DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -842,8 +831,8 @@ func (c *Config) normalize() error {
 	}
 
 	f := &c.Facade
-	if f.DefaultModel == "" {
-		f.DefaultModel = DefaultPrismModel
+	if f.ModelCatalog.RefreshInterval <= 0 {
+		f.ModelCatalog.RefreshInterval = 30 * time.Minute
 	}
 	if f.Schema.StartPath == "" || f.Schema.StatusPath == "" {
 		def := defaultSchema()
