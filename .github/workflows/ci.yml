@@ -6,7 +6,7 @@
 #   web-check  Dashboard 门禁（回归测试 → tsc 类型检查 → vite 构建）
 #
 # 本地等价命令（提交前必须全绿，见 README「开发与校验」）：
-#   go vet ./... && go test ./... && go test -race ./...
+#   go vet ./... && go test ./... && go test -race -p 1 ./...
 #   cd web && pnpm test && npx tsc --noEmit && pnpm build
 #
 # 说明：race 检测不是可选项 —— 本项目有账号池/粘性表/SSE 写出/热重载
@@ -43,7 +43,9 @@ jobs:
         run: go test ./...
 
       - name: 并发竞态测试
-        run: go test -race ./...
+        # 逐包运行，避免共享 runner 的包间 CPU 争用干扰耗时断言。
+        # 包内 goroutine 的竞态检测及全部测试仍照常执行。
+        run: go test -race -p 1 ./...
 
       - name: 构建（本机架构）
         run: go build -trimpath -o bin/oaiprism ./cmd/oaiprism
