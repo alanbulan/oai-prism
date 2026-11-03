@@ -58,13 +58,16 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
 
   const handleCreate = async () => {
     try {
-      await httpClient.post('/admin/apikeys', { name: newKeyName || '新访问密钥' });
+      const { data: createdKey } = await httpClient.post<ApiKeyItem>('/admin/apikeys', {
+        name: newKeyName || '新访问密钥',
+      });
+      // 第一把 Key 创建后，后端会立即启用鉴权。先持久化响应中的 Key，
+      // 再刷新列表，凭据变更触发的其他请求也能携带它。
+      // 保持“生成即设为默认”，不依赖列表刷新是否成功或列表排序。
+      setApiKey(createdKey.key);
       message.success('已生成新的对外 API 密钥！');
       setNewKeyName('');
-      // 生成即设为默认：页面内所有 /v1 与 /admin 请求自动携带
-      // （fetchKeys 返回最新列表，避免 stale closure 拿到旧 keys）
-      const list = await fetchKeys();
-      if (list[0]?.key) setApiKey(list[0].key);
+      await fetchKeys();
     } catch (err: any) {
       message.error(`生成失败: ${err.message}`);
     }

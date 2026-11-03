@@ -3,11 +3,11 @@
 #
 # 两个并行 job：
 #   go-check   Go 门禁（vet → test → race → 构建产物）
-#   web-check  Dashboard 门禁（tsc 类型检查 → vite 构建）
+#   web-check  Dashboard 门禁（回归测试 → tsc 类型检查 → vite 构建）
 #
 # 本地等价命令（提交前必须全绿，见 README「开发与校验」）：
 #   go vet ./... && go test ./... && go test -race ./...
-#   cd web && npx tsc --noEmit && pnpm build
+#   cd web && pnpm test && npx tsc --noEmit && pnpm build
 #
 # 说明：race 检测不是可选项 —— 本项目有账号池/粘性表/SSE 写出/热重载
 # 等大量并发结构，历史上靠并发测试抓到过越界 panic。
@@ -61,7 +61,7 @@ jobs:
           retention-days: 7
 
   web-check:
-    name: Dashboard 门禁（tsc / vite build）
+    name: Dashboard 门禁（test / tsc / vite build）
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -81,6 +81,9 @@ jobs:
 
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
+
+      - name: 回归测试
+        run: pnpm test
 
       - name: 类型检查
         run: npx tsc --noEmit
