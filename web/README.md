@@ -9,6 +9,7 @@ OAIprism 网关内置的管理控制台，由网关在 `/dashboard/` 下直接�
 ```bash
 pnpm install
 pnpm dev        # http://localhost:5173 ，/v1 /admin /metrics 代理到 127.0.0.1:8787
+pnpm test       # Vitest 回归测试（模拟网关，仅使用虚构密钥，不连接真实服务）
 pnpm build      # 类型检查 + 产出 dist/（随仓库提交，网关直接读取）
 ```
 
